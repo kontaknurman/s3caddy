@@ -1,0 +1,37 @@
+{{define "content"}}
+
+<div class="login-wrap">
+  <div class="card login-card">
+    <h3>Masuk ke panel</h3>
+
+    {{with .LoginError}}
+    <div class="notice err" style="margin-bottom: 16px;">{{.}}</div>
+    {{end}}
+
+    <form method="post" action="/login" autocomplete="on">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="next" value="{{.Next}}">
+
+      <div class="field">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" required autofocus
+               autocomplete="username" spellcheck="false" style="width: 100%;">
+      </div>
+
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required
+               autocomplete="current-password" style="width: 100%;">
+      </div>
+
+      <button type="submit" class="primary" style="width: 100%;">Masuk</button>
+    </form>
+
+    <p class="small muted" style="margin: 16px 0 0;">
+      Setelah {{.MaxFailures}} kali gagal, percobaan login dari alamat yang sama
+      ditahan selama {{.Lockout}}.
+    </p>
+  </div>
+</div>
+
+{{end}}

@@ -1006,3 +1006,352 @@ func firstLines(s string) string {
 	}
 	return s
 }
+
+// --- login ----------------------------------------------------------------
+
+// testPasswordHash dihitung sekali saja: PBKDF2 600k iterasi memang mahal.
+var (
+	testHashOnce  sync.Once
+	testHashValue string
+)
+
+const testPassword = "password-panel-uji"
+
+func testPasswordHash(t *testing.T) string {
+	t.Helper()
+	testHashOnce.Do(func() {
+		h, err := HashPassword(testPassword)
+		if err != nil {
+			t.Fatal(err)
+		}
+		testHashValue = h
+	})
+	return testHashValue
+}
+
+func withLogin(t *testing.T) func(*Config) {
+	hash := testPasswordHash(t)
+	return func(c *Config) {
+		c.Username = "admin"
+		c.PasswordHash = hash
+	}
+}
+
+// login melakukan POST /login dan mengembalikan responsnya (tanpa mengikuti redirect).
+func (p *testPanel) login(t *testing.T, user, pass string) *http.Response {
+	t.Helper()
+	form := url.Values{"username": {user}, "password": {pass}, "csrf": {p.csrf(t)}}
+	resp, err := p.client.PostForm(p.srv.URL+"/login", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+func TestWithoutLoginConfiguredPanelStaysOpen(t *testing.T) {
+	p := newTestPanel(t) // tanpa PANEL_PASSWORD_HASH
+	resp, body := p.get(t, "/buckets")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if strings.Contains(body, "Masuk ke panel") {
+		t.Error("halaman login muncul padahal login tidak diaktifkan")
+	}
+}
+
+func TestLoginRequiredWhenHashConfigured(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+
+	resp, _ := p.get(t, "/buckets")
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 ke /login", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/login?next=") {
+		t.Errorf("Location = %q, want /login?next=…", loc)
+	}
+
+	// Halaman login sendiri harus bisa dibuka tanpa session.
+	resp, body := p.get(t, "/login")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("halaman login status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(body, "Masuk ke panel") || !strings.Contains(body, `name="password"`) {
+		t.Error("form login tidak dirender")
+	}
+	// Nav disembunyikan supaya tidak memancing klik yang pasti ditolak.
+	if strings.Contains(body, `href="/whitelist"`) {
+		t.Error("navigasi tidak boleh tampil di halaman login")
+	}
+}
+
+func TestLoginSuccessThenAccessThenLogout(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+	p.garage.addBucket("media", 1, 1024, true)
+
+	resp := p.login(t, "admin", testPassword)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want 303", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/buckets" {
+		t.Errorf("Location = %q, want /buckets", loc)
+	}
+	var sessionSet bool
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookieName && c.Value != "" {
+			sessionSet = true
+			if !c.HttpOnly {
+				t.Error("cookie session harus HttpOnly")
+			}
+		}
+	}
+	if !sessionSet {
+		t.Fatal("cookie session tidak dipasang")
+	}
+
+	// Sekarang panel bisa dipakai.
+	resp, body := p.get(t, "/buckets")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("setelah login status = %d", resp.StatusCode)
+	}
+	if !strings.Contains(body, "media") {
+		t.Error("daftar bucket tidak tampil setelah login")
+	}
+	if !strings.Contains(body, "Keluar") {
+		t.Error("tombol keluar tidak tampil")
+	}
+
+	// Logout mencabut session.
+	if p.app.sessions.count() != 1 {
+		t.Fatalf("jumlah session = %d, want 1", p.app.sessions.count())
+	}
+	resp = p.post(t, "/logout", url.Values{})
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("logout status = %d", resp.StatusCode)
+	}
+	if p.app.sessions.count() != 0 {
+		t.Error("session tidak dihapus saat logout")
+	}
+	resp, _ = p.get(t, "/buckets")
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("setelah logout harus diarahkan ke login, dapat %d", resp.StatusCode)
+	}
+}
+
+func TestLoginRejectsWrongCredentials(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+
+	for _, tc := range []struct{ user, pass string }{
+		{"admin", "salah"},
+		{"bukan-admin", testPassword},
+		{"admin", ""},
+	} {
+		resp := p.login(t, tc.user, tc.pass)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s/%s: status = %d, want 401", tc.user, tc.pass, resp.StatusCode)
+		}
+		if p.app.sessions.count() != 0 {
+			t.Fatal("session dibuat padahal kredensial salah")
+		}
+	}
+}
+
+func TestLoginRateLimited(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+
+	for i := 0; i < loginMaxFailures; i++ {
+		if resp := p.login(t, "admin", "salah"); resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("percobaan %d: status = %d, want 401", i+1, resp.StatusCode)
+		}
+	}
+	resp := p.login(t, "admin", "salah")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 setelah %d kegagalan", resp.StatusCode, loginMaxFailures)
+	}
+	// Password yang benar pun ditolak selama masih terkunci.
+	resp = p.login(t, "admin", testPassword)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 — penguncian harus berlaku juga untuk password benar", resp.StatusCode)
+	}
+}
+
+func TestUploadWithoutSessionReturnsJSON(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+	body, contentType := multipartBody(t, "media", "a.png", []byte("x"))
+	req, err := http.NewRequest(http.MethodPost, p.srv.URL+"/upload", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("X-CSRF-Token", p.csrf(t))
+	resp, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("content type = %q — JS pengunggah butuh JSON, bukan HTML login", ct)
+	}
+	var out uploadResult
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("jawaban bukan JSON: %v", err)
+	}
+	if out.Error == "" {
+		t.Error("pesan error kosong")
+	}
+}
+
+func TestPreviewRequiresLogin(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+	p.s3Store["a.png"] = []byte("rahasia")
+
+	resp, body := p.get(t, "/preview?bucket=media&key=a.png")
+	if resp.StatusCode == http.StatusOK && strings.Contains(body, "rahasia") {
+		t.Fatal("isi objek tersaji tanpa login")
+	}
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("status = %d, want 303 ke login", resp.StatusCode)
+	}
+}
+
+func TestLoginNextParameterCannotRedirectOffsite(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+	form := url.Values{
+		"username": {"admin"},
+		"password": {testPassword},
+		"csrf":     {p.csrf(t)},
+		"next":     {"https://evil.example.com/"},
+	}
+	resp, err := p.client.PostForm(p.srv.URL+"/login", form)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if loc := resp.Header.Get("Location"); loc != "/buckets" {
+		t.Errorf("Location = %q — redirect ke luar harus diblokir", loc)
+	}
+}
+
+func TestPanelDomainAcceptedInHostHeader(t *testing.T) {
+	p := newTestPanel(t, withLogin(t), func(c *Config) { c.PanelDomain = "panel.example.com" })
+
+	req, err := http.NewRequest(http.MethodGet, p.srv.URL+"/login", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "panel.example.com"
+	resp, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 — PANEL_DOMAIN harus diterima", resp.StatusCode)
+	}
+
+	// Domain lain tetap ditolak.
+	req, _ = http.NewRequest(http.MethodGet, p.srv.URL+"/login", nil)
+	req.Host = "lain.example.com"
+	resp2, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 untuk domain lain", resp2.StatusCode)
+	}
+}
+
+// Melayani sebuah domain tanpa login berarti membuka hak menulis config Caddy
+// ke internet. Panel harus menolak start.
+func TestPanelDomainWithoutPasswordRefusesToStart(t *testing.T) {
+	t.Setenv("GARAGE_ADMIN_TOKEN", "token")
+	t.Setenv("PANEL_DOMAIN", "panel.example.com")
+	t.Setenv("PANEL_PASSWORD_HASH", "")
+
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig harus gagal")
+	}
+	if !strings.Contains(err.Error(), "PANEL_PASSWORD_HASH") {
+		t.Errorf("pesan error tidak menyebut yang kurang: %v", err)
+	}
+}
+
+func TestMalformedPasswordHashRefusesToStart(t *testing.T) {
+	t.Setenv("GARAGE_ADMIN_TOKEN", "token")
+	t.Setenv("PANEL_PASSWORD_HASH", "bukan-hash-yang-benar")
+
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("loadConfig harus gagal pada hash yang rusak")
+	}
+	if !strings.Contains(err.Error(), "hash-password") {
+		t.Errorf("pesan error tidak menunjukkan cara memperbaiki: %v", err)
+	}
+}
+
+// Regresi: dengan Referrer-Policy: no-referrer, Chrome mengirim "Origin: null"
+// pada setiap submit form, dan cek origin dulu menolaknya — membuat SEMUA form
+// di panel jadi 403 di browser sungguhan. http.Client bawaan Go tidak pernah
+// mengirim header Origin, jadi tes lama tidak menangkapnya.
+func TestFormPostWithNullOriginIsAccepted(t *testing.T) {
+	p := newTestPanel(t)
+	p.garage.addBucket("media", 0, 0, true)
+
+	form := url.Values{"bucket": {"media"}, "enable": {"1"}, "csrf": {p.csrf(t)}}
+	req, err := http.NewRequest(http.MethodPost, p.srv.URL+"/buckets/website", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "null")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatal("Origin: null ditolak — semua form di browser akan gagal")
+	}
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("status = %d, want 303", resp.StatusCode)
+	}
+}
+
+// Origin dari situs lain tetap harus ditolak.
+func TestFormPostWithForeignOriginStillRejected(t *testing.T) {
+	p := newTestPanel(t)
+	form := url.Values{"bucket": {"media"}, "enable": {"1"}, "csrf": {p.csrf(t)}}
+	req, err := http.NewRequest(http.MethodPost, p.srv.URL+"/buckets/website", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "https://evil.example.com")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+}
+
+// Referrer-Policy harus tetap same-origin: no-referrer akan memicu Origin:null
+// lagi, dan kebijakan yang lebih longgar akan membocorkan URL panel keluar.
+func TestReferrerPolicyKeepsOriginUsable(t *testing.T) {
+	p := newTestPanel(t)
+	resp, _ := p.get(t, "/buckets")
+	if got := resp.Header.Get("Referrer-Policy"); got != "same-origin" {
+		t.Errorf("Referrer-Policy = %q, want same-origin", got)
+	}
+}

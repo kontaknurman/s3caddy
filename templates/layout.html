@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
+<meta name="referrer" content="same-origin">
 <title>{{.Title}} · Garage Panel</title>
 <style>
 :root {
@@ -89,7 +89,7 @@ button.danger:hover { background: rgba(239,107,107,.12); }
 button.small, .btn.small { padding: 4px 9px; font-size: 13px; }
 button[disabled] { opacity: .5; cursor: not-allowed; }
 
-input[type=text], input[type=search], select {
+input[type=text], input[type=search], input[type=password], select {
   font: inherit; padding: 8px 11px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--bg); color: var(--text);
   min-width: 0;
@@ -167,6 +167,11 @@ details.confirm .confirm-body {
 .pager { display: flex; gap: 10px; align-items: center; margin-top: 18px; flex-wrap: wrap; }
 .empty { text-align: center; color: var(--muted); padding: 36px 0; }
 .kv { font-size: 13px; color: var(--muted); }
+.session-box { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.login-wrap { display: flex; justify-content: center; padding-top: 4vh; }
+.login-card { width: 100%; max-width: 380px; margin-bottom: 0; }
+.login-card h3 { margin-bottom: 18px; }
+.login-card input { width: 100%; }
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
   background: var(--ok); color: #06130d; font-weight: 600; font-size: 14px;
@@ -182,16 +187,25 @@ details.confirm .confirm-body {
 <body>
 <header class="topbar">
   <div class="brand">Garage <span>Panel</span></div>
+  {{if not .HideNav}}
   <nav>
     <a href="/buckets" {{if eq .Page "buckets"}}class="active"{{end}}>Buckets</a>
     <a href="/domains" {{if eq .Page "domains"}}class="active"{{end}}>Domains</a>
     <a href="/objects" {{if eq .Page "objects"}}class="active"{{end}}>Objek</a>
     <a href="/whitelist" {{if eq .Page "whitelist"}}class="active"{{end}}>IP Whitelist</a>
   </nav>
+  {{end}}
+  {{if .User}}
+  <form method="post" action="/logout" class="session-box">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <span class="muted small">masuk sebagai <strong>{{.User}}</strong></span>
+    <button type="submit" class="small">Keluar</button>
+  </form>
+  {{end}}
 </header>
 
 <main>
-  <h1>{{.Title}}</h1>
+  {{if not .HideTitle}}<h1>{{.Title}}</h1>{{end}}
 
   {{with .Flash}}
   <div class="flash {{.Kind}}"><pre>{{.Msg}}</pre></div>

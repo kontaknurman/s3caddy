@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path"
 	"sort"
@@ -53,6 +55,11 @@ type Config struct {
 	Listen      string
 	ReloadCmd   []string
 
+	// Login bawaan panel. Login aktif begitu PasswordHash diisi.
+	Username     string
+	PasswordHash string
+	PanelDomain  string
+
 	webURL *url.URL
 	s3URL  *url.URL
 }
@@ -76,6 +83,10 @@ func loadConfig() (*Config, error) {
 		SitesDir:    env("CADDY_SITES_DIR", "/etc/caddy/sites"),
 		S3APIDomain: strings.TrimSpace(os.Getenv("S3_API_DOMAIN")),
 		Listen:      env("LISTEN", "127.0.0.1:8090"),
+
+		Username:     env("PANEL_USERNAME", "admin"),
+		PasswordHash: strings.TrimSpace(os.Getenv("PANEL_PASSWORD_HASH")),
+		PanelDomain:  strings.TrimSpace(os.Getenv("PANEL_DOMAIN")),
 	}
 
 	if strings.TrimSpace(cfg.AdminToken) == "" {
@@ -107,6 +118,31 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	if cfg.PasswordHash != "" {
+		if _, err := ParsePasswordHash(cfg.PasswordHash); err != nil {
+			return nil, fmt.Errorf("PANEL_PASSWORD_HASH tidak bisa dibaca: %w", err)
+		}
+		if err := ValidateLabel(cfg.Username); err != nil {
+			return nil, fmt.Errorf("PANEL_USERNAME tidak valid: %w", err)
+		}
+	}
+	if cfg.PanelDomain != "" {
+		if err := ValidateDomain(cfg.PanelDomain); err != nil {
+			return nil, fmt.Errorf("PANEL_DOMAIN tidak valid: %w", err)
+		}
+		// Menerima request dari sebuah domain berarti panel bisa dijangkau dari
+		// luar lewat reverse proxy. Tanpa login, itu sama saja menaruh hak
+		// menulis config Caddy dan reload systemd di internet terbuka.
+		if cfg.PasswordHash == "" {
+			return nil, errors.New("PANEL_DOMAIN diisi tapi PANEL_PASSWORD_HASH kosong.\n" +
+				"Panel menolak melayani sebuah domain tanpa login — itu akan membuka\n" +
+				"hak menulis config Caddy dan reload systemd ke siapa pun yang tahu alamatnya.\n" +
+				"Buat hash-nya dulu:\n" +
+				"  garagepanel -hash-password\n" +
+				"lalu isi PANEL_PASSWORD_HASH, atau kosongkan PANEL_DOMAIN dan pakai SSH tunnel.")
+		}
+	}
+
 	// The panel may only run this one command with elevated rights.
 	cfg.ReloadCmd = strings.Fields(env("CADDY_RELOAD_CMD", "sudo -n /bin/systemctl reload caddy"))
 	if len(cfg.ReloadCmd) == 0 {
@@ -115,6 +151,11 @@ func loadConfig() (*Config, error) {
 
 	return cfg, nil
 }
+
+// authEnabled melaporkan apakah halaman login dipasang. Tanpa
+// PANEL_PASSWORD_HASH panel berjalan seperti semula: loopback saja, SSH tunnel
+// yang jadi autentikasinya.
+func (c *Config) authEnabled() bool { return c.PasswordHash != "" }
 
 func parseEndpoint(name, raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
@@ -164,11 +205,32 @@ type App struct {
 	caddy   *CaddyManager
 	pages   map[string]*template.Template
 	flashes *flashStore
+
+	sessions *sessionStore
+	logins   *loginLimiter
+	// loginMu membuat verifikasi password berjalan satu per satu. PBKDF2 600k
+	// iterasi itu sengaja mahal, jadi request paralel tidak boleh dibiarkan
+	// menghabiskan CPU panel.
+	loginMu sync.Mutex
 }
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 	log.SetPrefix("garagepanel: ")
+
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "-hash-password", "--hash-password", "hash-password":
+			os.Exit(runHashPassword())
+		case "-h", "-help", "--help", "help":
+			printUsage(os.Stdout)
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "argumen tidak dikenal: %s\n\n", os.Args[1])
+			printUsage(os.Stderr)
+			os.Exit(2)
+		}
+	}
 
 	cfg, err := loadConfig()
 	if err != nil {
@@ -232,12 +294,114 @@ func main() {
 	<-idle
 }
 
+// --- perintah baris perintah ----------------------------------------------
+
+func printUsage(w io.Writer) {
+	fmt.Fprint(w, `garagepanel — panel admin Garage + Caddy
+
+Penggunaan:
+  garagepanel                 jalankan panel (konfigurasi lewat environment variable)
+  garagepanel -hash-password  buat nilai PANEL_PASSWORD_HASH untuk halaman login
+  garagepanel -help           tampilkan bantuan ini
+
+Environment variable wajib:
+  GARAGE_ADMIN_TOKEN          token Admin API Garage
+
+Selengkapnya ada di README.
+`)
+}
+
+// runHashPassword membaca password dari stdin lalu mencetak baris
+// PANEL_PASSWORD_HASH yang tinggal ditempel. Password tidak pernah dilewatkan
+// sebagai argumen supaya tidak muncul di "ps" maupun di riwayat shell.
+func runHashPassword() int {
+	in := bufio.NewReader(os.Stdin)
+	interactive := false
+	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		interactive = true
+	}
+
+	if interactive {
+		fmt.Fprintf(os.Stderr, "Password untuk login panel (minimal %d karakter).\n", minPasswordLen)
+	}
+
+	pass, err := readSecret(in, "Password: ", interactive)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tidak bisa membaca password: %v\n", err)
+		return 1
+	}
+
+	if interactive {
+		confirm, err := readSecret(in, "Ulangi   : ", interactive)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tidak bisa membaca password: %v\n", err)
+			return 1
+		}
+		if confirm != pass {
+			fmt.Fprintln(os.Stderr, "password tidak sama, tidak ada yang dibuat")
+			return 1
+		}
+	}
+
+	hash, err := HashPassword(pass)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
+	}
+
+	if interactive {
+		fmt.Fprintln(os.Stderr, "\nSalin baris di bawah ke /etc/garagepanel/garagepanel.env:")
+	}
+	fmt.Printf("PANEL_PASSWORD_HASH=%s\n", hash)
+	return 0
+}
+
+// readSecret membaca satu baris, dengan echo terminal dimatikan kalau bisa.
+// stty dipakai supaya tidak perlu paket termios dari luar maupun "unsafe".
+func readSecret(in *bufio.Reader, prompt string, interactive bool) (string, error) {
+	if !interactive {
+		line, err := in.ReadString('\n')
+		if err != nil && line == "" {
+			return "", err
+		}
+		return strings.TrimRight(line, "\r\n"), nil
+	}
+
+	fmt.Fprint(os.Stderr, prompt)
+	echoOff := setTerminalEcho(false) == nil
+	if !echoOff {
+		fmt.Fprint(os.Stderr, "(password akan terlihat saat diketik) ")
+	}
+
+	line, err := in.ReadString('\n')
+	if echoOff {
+		_ = setTerminalEcho(true)
+		fmt.Fprintln(os.Stderr)
+	}
+	if err != nil && line == "" {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func setTerminalEcho(on bool) error {
+	arg := "-echo"
+	if on {
+		arg = "echo"
+	}
+	cmd := exec.Command("stty", arg)
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
+}
+
 func newApp(cfg *Config) (*App, error) {
 	app := &App{
-		cfg:     cfg,
-		garage:  NewGarage(cfg.AdminURL, cfg.AdminToken),
-		caddy:   NewCaddyManager(cfg.SitesDir, cfg.webURL.Host, cfg.s3URL.Host, cfg.ReloadCmd),
-		flashes: newFlashStore(),
+		cfg:      cfg,
+		garage:   NewGarage(cfg.AdminURL, cfg.AdminToken),
+		caddy:    NewCaddyManager(cfg.SitesDir, cfg.webURL.Host, cfg.s3URL.Host, cfg.ReloadCmd),
+		flashes:  newFlashStore(),
+		sessions: newSessionStore(),
+		logins:   newLoginLimiter(),
 	}
 
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
@@ -258,7 +422,7 @@ func newApp(cfg *Config) (*App, error) {
 // shared layout. html/template is used throughout so every value is
 // contextually auto-escaped.
 func (a *App) parseTemplates() error {
-	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html"}
+	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html"}
 	a.pages = make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.New("layout.html").Funcs(templateFuncs()).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -301,6 +465,10 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /upload", a.handleUpload)
 	mux.HandleFunc("GET /preview", a.handlePreview)
 
+	mux.HandleFunc("GET /login", a.handleLoginPage)
+	mux.HandleFunc("POST /login", a.handleLogin)
+	mux.HandleFunc("POST /logout", a.handleLogout)
+
 	mux.HandleFunc("GET /whitelist", a.handleWhitelist)
 	mux.HandleFunc("POST /whitelist/add", a.handleWhitelistAdd)
 	mux.HandleFunc("POST /whitelist/delete", a.handleWhitelistDelete)
@@ -308,7 +476,7 @@ func (a *App) routes() http.Handler {
 
 	mux.HandleFunc("/", a.handleNotFound)
 
-	return a.recoverMW(a.logMW(a.loopbackMW(a.csrfMW(mux))))
+	return a.recoverMW(a.logMW(a.hostMW(a.csrfMW(a.authMW(mux)))))
 }
 
 func (a *App) handleNotFound(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +487,10 @@ func (a *App) handleNotFound(w http.ResponseWriter, r *http.Request) {
 
 type ctxKey string
 
-const csrfCtxKey ctxKey = "csrf"
+const (
+	csrfCtxKey ctxKey = "csrf"
+	userCtxKey ctxKey = "user"
+)
 
 func (a *App) recoverMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -354,24 +525,65 @@ func (a *App) logMW(next http.Handler) http.Handler {
 	})
 }
 
-// loopbackMW rejects requests whose Host header is not a loopback name. Even
-// though the listener is bound to 127.0.0.1, this blocks DNS-rebinding attempts
-// from a browser the user happens to have open.
-func (a *App) loopbackMW(next http.Handler) http.Handler {
+// hostMW menolak request yang header Host-nya bukan nama loopback atau
+// PANEL_DOMAIN. Listener-nya sendiri sudah terikat ke 127.0.0.1, tapi cek ini
+// yang menahan serangan DNS rebinding dari halaman lain yang kebetulan terbuka
+// di browser user.
+func (a *App) hostMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host := r.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
 		host = strings.Trim(host, "[]")
+
+		if a.cfg.PanelDomain != "" && strings.EqualFold(host, a.cfg.PanelDomain) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if host != "localhost" {
 			ip := net.ParseIP(host)
 			if ip == nil || !ip.IsLoopback() {
-				http.Error(w, "panel hanya melayani host loopback (127.0.0.1 / localhost)", http.StatusForbidden)
+				msg := "panel hanya melayani host loopback (127.0.0.1 / localhost)"
+				if a.cfg.PanelDomain != "" {
+					msg += " atau " + a.cfg.PanelDomain
+				}
+				http.Error(w, msg, http.StatusForbidden)
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// authMW menuntut session yang sah untuk semua rute selain halaman login.
+func (a *App) authMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !a.cfg.authEnabled() || r.URL.Path == "/login" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if c, err := r.Cookie(sessionCookieName); err == nil {
+			if sess, ok := a.sessions.get(c.Value); ok {
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userCtxKey, sess.user)))
+				return
+			}
+		}
+
+		a.clearSessionCookie(w, r)
+
+		// Endpoint upload dipanggil dari JavaScript: halaman login HTML tidak
+		// ada gunanya di sana, jadi jawab dengan JSON yang bisa ditampilkan.
+		if r.URL.Path == "/upload" || strings.Contains(r.Header.Get("Accept"), "application/json") {
+			writeJSON(w, http.StatusUnauthorized, uploadResult{Error: "session habis — muat ulang halaman lalu login lagi"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "session habis — muat ulang halaman lalu login lagi", http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, "/login?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusSeeOther)
 	})
 }
 
@@ -396,7 +608,12 @@ func (a *App) csrfMW(next http.Handler) http.Handler {
 		}
 
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+			// Origin "null" berarti browser sengaja tidak memberi tahu asalnya
+			// (misalnya dari iframe ber-sandbox, atau karena referrer policy
+			// yang ketat). Itu bukan bukti request lintas situs, jadi jangan
+			// ditolak mentah-mentah — token CSRF di bawah yang jadi
+			// penjaganya, dan token itu tidak bisa dibaca situs lain.
+			if origin := r.Header.Get("Origin"); origin != "" && origin != "null" && !sameOrigin(origin, r.Host) {
 				http.Error(w, "origin ditolak", http.StatusForbidden)
 				return
 			}
@@ -519,6 +736,8 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, page string, data m
 	data["Flash"] = a.flashes.take(r.URL.Query().Get("m"))
 	data["HasS3"] = a.s3 != nil
 	data["S3APIDomain"] = a.cfg.S3APIDomain
+	data["AuthEnabled"] = a.cfg.authEnabled()
+	data["User"] = currentUser(r)
 
 	// Render into a buffer so a mid-template error cannot emit half a page.
 	var buf strings.Builder
@@ -529,7 +748,11 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, page string, data m
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// same-origin, bukan no-referrer: dengan no-referrer Chrome mengirim
+	// "Origin: null" pada submit form, sehingga cek origin di atas tidak lagi
+	// bisa membedakan apa pun. same-origin tetap tidak membocorkan URL panel ke
+	// situs luar.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Cache-Control", "no-store")
 	if code, ok := data["StatusCode"].(int); ok {
 		w.WriteHeader(code)
@@ -601,6 +824,148 @@ func bucketNamesFrom(items []BucketListItem) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// --- login ----------------------------------------------------------------
+
+// currentUser mengembalikan user yang sedang login, atau "" kalau login mati.
+func currentUser(r *http.Request) string {
+	if v, ok := r.Context().Value(userCtxKey).(string); ok {
+		return v
+	}
+	return ""
+}
+
+func (a *App) setSessionCookie(w http.ResponseWriter, r *http.Request, id string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    id,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		// Lax, bukan Strict: navigasi biasa ke panel tetap membawa session,
+		// sementara POST lintas situs tetap tertahan token CSRF yang cookie-nya
+		// Strict.
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(sessionIdleTTL / time.Second),
+	})
+}
+
+func (a *App) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+// safeNext membersihkan parameter ?next= supaya tidak bisa dipakai sebagai
+// open redirect ke situs lain setelah login.
+func safeNext(raw string) string {
+	if raw == "" || !strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "//") {
+		return "/buckets"
+	}
+	if strings.ContainsAny(raw, "\r\n\\") {
+		return "/buckets"
+	}
+	if raw == "/login" || strings.HasPrefix(raw, "/login?") {
+		return "/buckets"
+	}
+	return raw
+}
+
+func (a *App) renderLogin(w http.ResponseWriter, r *http.Request, errMsg, next string, code int) {
+	a.render(w, r, "login.html", map[string]any{
+		"Title":       "Masuk",
+		"Page":        "",
+		"HideNav":     true,
+		"HideTitle":   true,
+		"LoginError":  errMsg,
+		"Next":        next,
+		"Username":    a.cfg.Username,
+		"MaxFailures": loginMaxFailures,
+		"Lockout":     fmt.Sprintf("%d menit", int(loginLockout.Minutes())),
+		"StatusCode":  code,
+	})
+}
+
+func (a *App) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	if !a.cfg.authEnabled() {
+		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
+		return
+	}
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		if _, ok := a.sessions.get(c.Value); ok {
+			http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusSeeOther)
+			return
+		}
+	}
+	a.renderLogin(w, r, "", safeNext(r.URL.Query().Get("next")), http.StatusOK)
+}
+
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if !a.cfg.authEnabled() {
+		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
+		return
+	}
+
+	next := safeNext(r.PostFormValue("next"))
+	key := loginKey(r)
+
+	if ok, wait := a.logins.allowed(key); !ok {
+		a.renderLogin(w, r, fmt.Sprintf("Terlalu banyak percobaan gagal. Coba lagi dalam %s.", wait), next, http.StatusTooManyRequests)
+		return
+	}
+
+	user := strings.TrimSpace(r.PostFormValue("username"))
+	pass := r.PostFormValue("password")
+
+	// Satu verifikasi pada satu waktu, dan username tetap dibandingkan dalam
+	// waktu konstan supaya tidak bocor lewat selisih waktu.
+	a.loginMu.Lock()
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(a.cfg.Username)) == 1
+	passOK := VerifyPassword(a.cfg.PasswordHash, pass)
+	a.loginMu.Unlock()
+
+	if !userOK || !passOK {
+		a.logins.fail(key)
+		// Username yang dicoba sengaja tidak ikut dicatat: kalau seseorang
+		// salah mengetik password ke kolom username, isinya akan mendarat di
+		// journal.
+		log.Printf("login gagal dari %s", key)
+		a.renderLogin(w, r, "Username atau password salah.", next, http.StatusUnauthorized)
+		return
+	}
+
+	a.logins.reset(key)
+	a.setSessionCookie(w, r, a.sessions.create(a.cfg.Username, key))
+	// Token CSRF diputar ulang saat privilege berubah.
+	http.SetCookie(w, &http.Cookie{
+		Name:     "garagepanel_csrf",
+		Value:    randomHex(32),
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteStrictMode,
+	})
+	log.Printf("login berhasil dari %s", key)
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookieName); err == nil {
+		a.sessions.delete(c.Value)
+	}
+	a.clearSessionCookie(w, r)
+	if !a.cfg.authEnabled() {
+		http.Redirect(w, r, "/buckets", http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 // --- page 1: buckets ------------------------------------------------------

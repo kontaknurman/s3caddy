@@ -33,6 +33,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Langkah 9 — Buka panel lewat SSH tunnel](#langkah-9--buka-panel-lewat-ssh-tunnel)
   - [Langkah 10 — Uji coba end-to-end](#langkah-10--uji-coba-end-to-end)
   - [Checklist instalasi](#checklist-instalasi)
+- [Login dan akses lewat domain](#login-dan-akses-lewat-domain)
 - [Update ke versi baru](#update-ke-versi-baru)
 - [Uninstall](#uninstall)
 - [Konfigurasi](#konfigurasi)
@@ -104,7 +105,8 @@ kalau belum ada.
 
 ### Go (di mesin build)
 
-Panel butuh **Go 1.22 atau lebih baru**. Paket bawaan distro (`apt install
+Panel butuh **Go 1.24 atau lebih baru** — hash password memakai `crypto/pbkdf2`
+yang baru masuk pustaka standar di 1.24. Paket bawaan distro (`apt install
 golang-go`) sering tertinggal jauh, jadi lebih aman pasang dari go.dev.
 
 **Linux.** Perintah ini mengambil versi stabil terkini secara otomatis:
@@ -148,7 +150,7 @@ terminal baru setelahnya.
 go version
 ```
 
-Harus keluar `go1.22` atau lebih baru. Kalau `command not found`, `PATH`-nya
+Harus keluar `go1.24` atau lebih baru. Kalau `command not found`, `PATH`-nya
 belum termuat — buka terminal baru, atau jalankan ulang `. /etc/profile.d/go.sh`.
 
 ### Caddy (di server)
@@ -237,7 +239,7 @@ dijelaskan, artinya di server).
 | Garage v2 sudah jalan | `garage status` | daftar node, tanpa error |
 | Caddy sudah jalan | `systemctl is-active caddy` | `active` |
 | Akses `sudo` di server | `sudo -v` | tidak error |
-| Go 1.22+ di mesin build | `go version` | `go1.22` atau lebih baru |
+| Go 1.24+ di mesin build | `go version` | `go1.24` atau lebih baru |
 
 Belum ada Go atau Caddy? Lihat [Memasang Go dan Caddy](#memasang-go-dan-caddy)
 di atas.
@@ -705,6 +707,136 @@ garage key delete uji-panel-key     # tambahkan --yes kalau diminta konfirmasi
 | 9 | Tunnel | buka `http://127.0.0.1:8090` | halaman Buckets |
 | 10 | Uji end-to-end | upload + thumbnail muncul | semua hijau |
 
+## Login dan akses lewat domain
+
+Secara bawaan panel tidak punya halaman login: ia hanya mendengarkan di loopback
+dan diakses lewat SSH tunnel, jadi **SSH-nya sendiri yang jadi autentikasi**.
+Untuk banyak pemakaian itu sudah cukup dan tidak perlu diubah.
+
+Aktifkan login kalau kamu ingin:
+
+- membuka panel lewat domain (`https://panel.domainmu.com`) tanpa tunnel, atau
+- menambah lapisan password walau tetap lewat tunnel, misalnya karena server itu
+  punya beberapa pemakai SSH.
+
+### 1. Buat hash password
+
+Password tidak pernah disimpan, yang disimpan hanya hash PBKDF2-HMAC-SHA256
+(600.000 iterasi, sesuai anjuran OWASP). Perhitungannya memakai `crypto/pbkdf2`
+dari pustaka standar Go — tidak ada dependency tambahan.
+
+```bash
+garagepanel -hash-password
+```
+
+Perintah ini meminta password dua kali dengan echo terminal dimatikan, lalu
+mencetak satu baris siap tempel:
+
+```
+PANEL_PASSWORD_HASH=pbkdf2-sha256.600000.zngcBfqApRZC243u9QU6eQ.Ca7BZ1yR2Zeq…
+```
+
+Password minimal 12 karakter. Ia tidak pernah dilewatkan sebagai argumen, jadi
+tidak muncul di `ps` maupun di riwayat shell. Untuk otomasi, password bisa
+dikirim lewat stdin:
+
+```bash
+printf '%s\n' "$PASSWORD" | garagepanel -hash-password
+```
+
+Hash-nya sengaja memakai titik sebagai pemisah, bukan `$` seperti format PHC:
+`$600000` akan hilang ditelan ekspansi variabel shell dan menghasilkan hash yang
+rusak tanpa peringatan apa pun.
+
+### 2. Isi environment
+
+Tambahkan ke `/etc/garagepanel/garagepanel.env`:
+
+```bash
+PANEL_USERNAME=admin
+PANEL_PASSWORD_HASH=pbkdf2-sha256.600000.…
+```
+
+Kalau panel mau diakses lewat domain, tambahkan juga:
+
+```bash
+PANEL_DOMAIN=panel.domainmu.com
+```
+
+```bash
+sudo systemctl restart garagepanel
+```
+
+Login aktif begitu `PANEL_PASSWORD_HASH` terisi. Tanpa itu, panel berjalan
+seperti semula.
+
+> Panel **menolak start** kalau `PANEL_DOMAIN` diisi tapi
+> `PANEL_PASSWORD_HASH` kosong. Melayani sebuah domain tanpa login berarti
+> menyerahkan hak menulis config Caddy dan reload systemd kepada siapa pun yang
+> tahu alamatnya.
+
+### 3. Pasang Caddy di depan panel
+
+`LISTEN` tetap `127.0.0.1:8090` — panel **tidak pernah** mengikat ke antarmuka
+publik. Caddy yang menerima dari luar lalu meneruskannya ke loopback.
+
+Tulis `/etc/caddy/sites/_panel.caddy` (awalan `_` supaya panel tidak menganggapnya
+domain bucket):
+
+```caddy
+panel.domainmu.com {
+	reverse_proxy 127.0.0.1:8090
+}
+```
+
+```bash
+sudo systemctl reload caddy
+```
+
+Caddy v2 sudah meneruskan header `Host` apa adanya dan menambahkan
+`X-Forwarded-Proto` serta `X-Forwarded-For`, dan ketiganya memang yang dipakai
+panel: `Host` dicocokkan dengan `PANEL_DOMAIN`, `X-Forwarded-Proto` menentukan
+apakah cookie ditandai `Secure`, dan `X-Forwarded-For` dipakai membedakan
+pelaku percobaan login.
+
+**Sangat disarankan menambah batasan IP** kalau memang hanya kamu yang akan
+mengaksesnya. Satu password saja yang berdiri antara internet dan hak istimewa
+panel itu tipis:
+
+```caddy
+panel.domainmu.com {
+	@luar not remote_ip 203.0.113.10 198.51.100.0/24
+	respond @luar "Forbidden" 403
+
+	reverse_proxy 127.0.0.1:8090
+}
+```
+
+Akses lewat SSH tunnel tetap bisa dipakai bersamaan — panel menerima Host
+loopback maupun `PANEL_DOMAIN`.
+
+### Yang dilakukan dan tidak dilakukan login ini
+
+| | |
+|---|---|
+| Hash password | PBKDF2-HMAC-SHA256, 600.000 iterasi, salt acak 16 byte, dibandingkan dalam waktu konstan |
+| Session | token acak 32 byte di cookie `HttpOnly`; disimpan di memori, jadi **restart panel = semua sesi berakhir** |
+| Masa berlaku | 12 jam sejak aktivitas terakhir, maksimal 7 hari sejak login |
+| Cookie | `SameSite=Lax`, `Secure` otomatis saat diakses lewat HTTPS |
+| Pembatas | 5 kali gagal dari alamat yang sama → ditahan 15 menit; verifikasi dijalankan satu per satu supaya banjir request tidak menghabiskan CPU |
+| Tidak ada | multi-user, reset password lewat email, 2FA. Satu username, satu password |
+
+Lupa password? Buat hash baru, ganti nilainya di env file, lalu restart:
+
+```bash
+garagepanel -hash-password
+sudo nano /etc/garagepanel/garagepanel.env
+sudo systemctl restart garagepanel
+```
+
+Mau memaksa semua orang logout? `sudo systemctl restart garagepanel` sudah cukup —
+session hanya ada di memori.
+
 ## Update ke versi baru
 
 Panel tidak punya state sendiri — tidak ada database, tidak ada file cache.
@@ -770,6 +902,9 @@ Semua lewat environment variable.
 | `S3_API_DOMAIN` | — | Domain S3 API. Kosong → halaman IP Whitelist nonaktif |
 | `LISTEN` | `127.0.0.1:8090` | **Wajib loopback.** Alamat non-loopback ditolak saat start |
 | `CADDY_RELOAD_CMD` | `sudo -n /bin/systemctl reload caddy` | Perintah reload. Dipecah per spasi, **tidak** lewat shell |
+| `PANEL_PASSWORD_HASH` | — | Hash password login. Kosong → tidak ada login (lihat [Login](#login-dan-akses-lewat-domain)) |
+| `PANEL_USERNAME` | `admin` | Username untuk login |
+| `PANEL_DOMAIN` | — | Domain yang boleh dipakai mengakses panel lewat reverse proxy. Wajib disertai `PANEL_PASSWORD_HASH` |
 
 ## Keamanan
 
@@ -823,13 +958,23 @@ persis satu perintah tanpa wildcard. Unit systemd sengaja memakai
 `NoNewPrivileges=no` (sudo butuh setuid) — ini dijelaskan di komentar unit
 supaya tidak "diperbaiki" jadi `yes` lalu reload rusak diam-diam.
 
-**Secret.** Token admin dan secret key tidak pernah ditulis ke log. Error dari
-transport pun dibersihkan dari URL lengkap sebelum ditampilkan. Access log hanya
-mencatat method, path, status, durasi — tanpa query string dan tanpa header.
+**Secret.** Token admin, secret key, dan password login tidak pernah ditulis ke
+log. Error dari transport pun dibersihkan dari URL lengkap sebelum ditampilkan.
+Access log hanya mencatat method, path, status, durasi — tanpa query string dan
+tanpa header. Percobaan login yang gagal dicatat beserta alamat asalnya, tapi
+username yang dicoba sengaja tidak ikut: kalau seseorang salah mengetik password
+ke kolom username, isinya akan mendarat di journal.
 
-**Yang tidak dilakukan panel ini:** tidak ada autentikasi user. Siapa pun yang
-bisa membuka port loopback di server itu (yaitu siapa pun yang punya akses SSH)
-punya kendali penuh atas panel. Itu memang modelnya — amankan akses SSH-nya.
+**Login** (opsional, lihat [Login dan akses lewat domain](#login-dan-akses-lewat-domain)).
+Tanpa `PANEL_PASSWORD_HASH` tidak ada autentikasi user sama sekali: siapa pun
+yang bisa membuka port loopback di server itu — yaitu siapa pun yang punya akses
+SSH — punya kendali penuh atas panel. Itu memang modelnya kalau aksesnya lewat
+tunnel; amankan akses SSH-nya. Begitu login diaktifkan, password disimpan
+sebagai hash PBKDF2-HMAC-SHA256 600.000 iterasi, session ada di memori dengan
+batas idle 12 jam, dan percobaan gagal dibatasi 5 kali per alamat.
+
+**Yang tidak dilakukan panel ini:** tidak ada multi-user, tidak ada 2FA, tidak
+ada reset password mandiri. Satu username, satu password, satu operator.
 
 ## Troubleshooting
 
@@ -858,6 +1003,29 @@ lalu reload lagi. Nama berawalan `_` diabaikan panel.
 **`Tidak bisa listen di 127.0.0.1:8090: address already in use`** — ada proses
 lain di port itu, sering kali instance panel lama. Cek dengan
 `sudo ss -lntp | grep 8090`, matikan, atau ganti `LISTEN` ke port lain.
+
+**`PANEL_DOMAIN diisi tapi PANEL_PASSWORD_HASH kosong`** — panel sengaja menolak
+start. Buat hash-nya (`garagepanel -hash-password`), atau kosongkan
+`PANEL_DOMAIN` dan pakai SSH tunnel.
+
+**`PANEL_PASSWORD_HASH tidak bisa dibaca`** — hash-nya rusak. Penyebab paling
+sering: hash lama yang memakai `$` lalu dipotong ekspansi shell. Buat ulang
+dengan `garagepanel -hash-password` dan tempel apa adanya, tanpa tanda kutip.
+
+**Login selalu ditolak padahal password benar** — kalau baru saja 5 kali gagal,
+alamatmu sedang ditahan 15 menit; penguncian berlaku juga untuk password yang
+benar. Tunggu, atau `sudo systemctl restart garagepanel` untuk mengosongkan
+catatannya.
+
+**Halaman login muncul terus setelah berhasil masuk** — cookie session tidak
+tersimpan. Kalau panel di belakang Caddy, pastikan diakses lewat `https://`:
+saat `X-Forwarded-Proto: https` diteruskan, cookie ditandai `Secure` dan browser
+tidak akan mengirimkannya kembali lewat `http://` biasa.
+
+**`panel hanya melayani host loopback … atau panel.domainmu.com`** — Host yang
+sampai ke panel bukan salah satu dari itu. Cocokkan alamat di blok Caddy dengan
+nilai `PANEL_DOMAIN`; Caddy v2 meneruskan `Host` apa adanya, jadi keduanya harus
+sama persis.
 
 **Reload Caddy gagal, pesannya cuma "Job for caddy.service failed"** — panel
 sudah mencoba membaca journal Caddy untuk menampilkan error aslinya. Kalau
@@ -896,6 +1064,7 @@ main.go               konfigurasi, routing, middleware, semua handler
 garage.go             client Garage Admin API v2
 s3.go                 SigV4, ListObjectsV2, PutObject, GetObject, StatObject, DeleteObject
 caddy.go              tulis/hapus file site + reload + rollback, file whitelist
+auth.go               hash password, session, pembatas percobaan login
 validate.go           semua validasi input
 templates/            *.html, di-embed dengan //go:embed
 garagepanel.service   unit systemd
