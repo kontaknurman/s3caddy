@@ -1106,6 +1106,8 @@ func (a *App) handleBucketCreate(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("bucket %q dibuat (id %s, public=%v)", name, bucket.ID, public)
 
+	publicURL, exposed := a.s3PublicEndpoint()
+
 	allOK := true
 	for _, s := range steps {
 		if !s.OK {
@@ -1123,9 +1125,28 @@ func (a *App) handleBucketCreate(w http.ResponseWriter, r *http.Request) {
 		"AllOK":     allOK,
 		"AccessKey": keyAccessID(key),
 		"SecretKey": key.Secret(),
-		"S3URL":     a.cfg.S3URL,
-		"Region":    a.cfg.S3Region,
+		// Endpoint yang dipakai aplikasi lain, bukan alamat loopback yang
+		// dipakai panel sendiri untuk bicara ke Garage.
+		"S3PublicURL":   publicURL,
+		"S3PublicReady": exposed,
+		"S3InternalURL": a.cfg.S3URL,
+		"Region":        a.cfg.S3Region,
 	})
+}
+
+// s3PublicEndpoint mengembalikan alamat S3 API yang bisa dipakai dari luar
+// server, beserta apakah Caddy memang sudah mengeksposnya.
+//
+// GARAGE_S3_URL hanya alamat loopback yang dipakai panel sendiri; menampilkan
+// itu sebagai "endpoint" akan menyesatkan siapa pun yang memakai key ini dari
+// mesin lain.
+func (a *App) s3PublicEndpoint() (endpoint string, exposed bool) {
+	if a.cfg.S3APIDomain == "" {
+		return "", false
+	}
+	endpoint = "https://" + a.cfg.S3APIDomain
+	wl, err := a.caddy.ReadWhitelist()
+	return endpoint, err == nil && wl.Exists && len(wl.Entries) > 0
 }
 
 func keyAccessID(k *KeyInfo) string {

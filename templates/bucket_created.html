@@ -39,11 +39,24 @@
       <span class="val mono">{{.SecretKey}}</span>
       <button type="button" class="small" data-copy="{{.SecretKey}}">Copy</button>
     </div>
+    {{if .S3PublicURL}}
     <div class="pair">
       <span class="key">Endpoint</span>
-      <span class="val mono">{{.S3URL}}</span>
-      <button type="button" class="small" data-copy="{{.S3URL}}">Copy</button>
+      <span class="val mono">{{.S3PublicURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3PublicURL}}">Copy</button>
     </div>
+    <div class="pair">
+      <span class="key">Endpoint (dari server ini)</span>
+      <span class="val mono">{{.S3InternalURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3InternalURL}}">Copy</button>
+    </div>
+    {{else}}
+    <div class="pair">
+      <span class="key">Endpoint</span>
+      <span class="val mono">{{.S3InternalURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3InternalURL}}">Copy</button>
+    </div>
+    {{end}}
     <div class="pair">
       <span class="key">Region</span>
       <span class="val mono">{{.Region}}</span>
@@ -53,6 +66,27 @@
   <p class="small muted" style="margin-top: 12px;">
     Key ini punya izin <strong>read + write</strong> pada bucket <strong>{{.Bucket}}</strong> saja.
   </p>
+
+  {{if .S3PublicURL}}
+    {{if not .S3PublicReady}}
+    <p class="small" style="color: var(--warn); margin: 10px 0 0;">
+      <strong>{{.S3PublicURL}}</strong> belum benar-benar dilayani Caddy: file
+      <code class="mono">_s3api.caddy</code> belum dibuat, jadi S3 API belum
+      diekspos ke luar. Tambahkan minimal satu IP di halaman
+      <a href="/whitelist">IP Whitelist</a> supaya endpoint itu hidup.
+    </p>
+    {{end}}
+  {{else}}
+    <p class="small" style="color: var(--warn); margin: 10px 0 0;">
+      Endpoint di atas adalah alamat <strong>loopback</strong> — hanya bisa
+      dipakai dari dalam server ini, atau lewat SSH tunnel. Aplikasi di mesin
+      lain tidak akan bisa menghubunginya.
+      Untuk memakai key ini dari luar, isi <code class="mono">S3_API_DOMAIN</code>
+      (contoh: <code class="mono">s3.domainmu.com</code>), restart panel, lalu
+      ekspos S3 API lewat halaman <a href="/whitelist">IP Whitelist</a>.
+      Perhatikan itu domain yang <em>berbeda</em> dari domain panel admin.
+    </p>
+  {{end}}
 </div>
 {{else}}
 <div class="notice err">

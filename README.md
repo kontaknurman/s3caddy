@@ -952,6 +952,13 @@ panel.domainmu.com {
 Akses lewat SSH tunnel tetap bisa dipakai bersamaan — panel menerima Host
 loopback maupun `PANEL_DOMAIN`.
 
+> **`PANEL_DOMAIN` dan `S3_API_DOMAIN` itu dua hal berbeda.** Yang pertama untuk
+> membuka UI panel di browser; yang kedua untuk aplikasimu berbicara ke S3 API.
+> Mengisi `PANEL_DOMAIN` saja tidak membuat endpoint S3 bisa diakses dari luar —
+> kartu kredensial akan tetap menampilkan `http://127.0.0.1:3900`, dan memang
+> begitu adanya sampai `S3_API_DOMAIN` diisi dan S3 API diekspos lewat halaman
+> IP Whitelist. Keduanya boleh dipasang bersamaan di satu server.
+
 ### Yang dilakukan dan tidak dilakukan login ini
 
 | | |
@@ -1083,12 +1090,12 @@ Semua lewat environment variable.
 | `GARAGE_S3_SECRET_KEY` | — | Secret key panel |
 | `GARAGE_S3_REGION` | `garage` | Region untuk signature SigV4 |
 | `CADDY_SITES_DIR` | `/etc/caddy/sites` | Direktori file `*.caddy` |
-| `S3_API_DOMAIN` | — | Domain S3 API. Kosong → halaman IP Whitelist nonaktif |
+| `S3_API_DOMAIN` | — | Domain untuk **S3 API** — yang dipakai aplikasimu. Kosong → halaman IP Whitelist nonaktif, dan kartu kredensial hanya bisa menampilkan alamat loopback |
 | `LISTEN` | `127.0.0.1:8090` | **Wajib loopback.** Alamat non-loopback ditolak saat start |
 | `CADDY_RELOAD_CMD` | `sudo -n /bin/systemctl reload caddy` | Perintah reload. Dipecah per spasi, **tidak** lewat shell |
 | `PANEL_PASSWORD_HASH` | — | Hash password login. Kosong → tidak ada login (lihat [Login](#login-dan-akses-lewat-domain)) |
 | `PANEL_USERNAME` | `admin` | Username untuk login |
-| `PANEL_DOMAIN` | — | Domain yang boleh dipakai mengakses panel lewat reverse proxy. Wajib disertai `PANEL_PASSWORD_HASH` |
+| `PANEL_DOMAIN` | — | Domain untuk **UI panel** — bukan untuk S3 API. Wajib disertai `PANEL_PASSWORD_HASH` |
 
 ## Keamanan
 
@@ -1206,6 +1213,15 @@ catatannya.
 tersimpan. Kalau panel di belakang Caddy, pastikan diakses lewat `https://`:
 saat `X-Forwarded-Proto: https` diteruskan, cookie ditandai `Secure` dan browser
 tidak akan mengirimkannya kembali lewat `http://` biasa.
+
+**Kartu kredensial masih menampilkan `http://127.0.0.1:3900` sebagai Endpoint** —
+itu alamat yang dipakai panel sendiri untuk bicara ke Garage, dan tidak berguna
+untuk aplikasi di mesin lain. Endpoint publik diambil dari `S3_API_DOMAIN`, bukan
+dari `PANEL_DOMAIN`. Isi `S3_API_DOMAIN`, restart panel, lalu tambahkan minimal
+satu IP di halaman IP Whitelist supaya Caddy benar-benar mengekspos S3 API.
+Setelah itu kartu kredensial menampilkan `https://<S3_API_DOMAIN>` sebagai
+endpoint utama, dengan alamat loopback tetap tercantum untuk aplikasi yang
+berjalan di server yang sama.
 
 **`panel hanya melayani host loopback … atau panel.domainmu.com`** — Host yang
 sampai ke panel bukan salah satu dari itu. Cocokkan alamat di blok Caddy dengan

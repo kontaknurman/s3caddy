@@ -1355,3 +1355,68 @@ func TestReferrerPolicyKeepsOriginUsable(t *testing.T) {
 		t.Errorf("Referrer-Policy = %q, want same-origin", got)
 	}
 }
+
+// Kolom "Endpoint" pada kartu kredensial itu untuk aplikasi orang lain, bukan
+// untuk panel. Menampilkan GARAGE_S3_URL (loopback) di sana menyesatkan siapa
+// pun yang memakai key ini dari mesin lain.
+func TestCredentialsShowReachableS3Endpoint(t *testing.T) {
+	createBucket := func(t *testing.T, p *testPanel, name string) string {
+		t.Helper()
+		resp, err := p.client.PostForm(p.srv.URL+"/buckets/create", url.Values{
+			"name": {name}, "csrf": {p.csrf(t)},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+
+	t.Run("tanpa S3_API_DOMAIN", func(t *testing.T) {
+		p := newTestPanel(t, func(c *Config) { c.S3APIDomain = "" })
+		page := createBucket(t, p, "tanpa-domain")
+
+		if !strings.Contains(page, p.app.cfg.S3URL) {
+			t.Error("endpoint internal harus tetap ditampilkan")
+		}
+		if !strings.Contains(page, "loopback") {
+			t.Errorf("halaman tidak memperingatkan bahwa alamatnya loopback: %s", firstLines(page))
+		}
+		if !strings.Contains(page, "S3_API_DOMAIN") {
+			t.Error("halaman tidak memberi tahu cara membuatnya bisa diakses dari luar")
+		}
+	})
+
+	t.Run("S3_API_DOMAIN diisi tapi belum diekspos", func(t *testing.T) {
+		p := newTestPanel(t) // S3APIDomain = s3.example.com, whitelist belum ada
+		page := createBucket(t, p, "belum-ekspos")
+
+		if !strings.Contains(page, "https://s3.example.com") {
+			t.Errorf("endpoint publik tidak ditampilkan: %s", firstLines(page))
+		}
+		if !strings.Contains(page, "_s3api.caddy") {
+			t.Error("halaman tidak memperingatkan bahwa endpoint itu belum dilayani Caddy")
+		}
+	})
+
+	t.Run("S3_API_DOMAIN diisi dan sudah diekspos", func(t *testing.T) {
+		p := newTestPanel(t)
+		if err := p.app.caddy.WriteWhitelist(t.Context(), "s3.example.com",
+			[]WhitelistEntry{{Value: "203.0.113.10", Label: "app"}}); err != nil {
+			t.Fatal(err)
+		}
+		page := createBucket(t, p, "sudah-ekspos")
+
+		if !strings.Contains(page, "https://s3.example.com") {
+			t.Errorf("endpoint publik tidak ditampilkan: %s", firstLines(page))
+		}
+		if strings.Contains(page, "belum benar-benar dilayani") {
+			t.Error("peringatan 'belum diekspos' muncul padahal whitelist sudah ada")
+		}
+		// Alamat internal tetap berguna untuk aplikasi di server yang sama.
+		if !strings.Contains(page, p.app.cfg.S3URL) {
+			t.Error("endpoint internal harus tetap tersedia sebagai alternatif")
+		}
+	})
+}
