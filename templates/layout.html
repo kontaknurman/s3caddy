@@ -20,6 +20,9 @@
   --radius: 10px;
 }
 * { box-sizing: border-box; }
+/* Elemen ber-atribut hidden harus benar-benar tersembunyi meski kelasnya
+   memberi display:flex (misalnya .check). */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   background: var(--bg);
@@ -127,12 +130,13 @@ details.confirm .confirm-body {
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(158px, 1fr)); gap: 14px; }
 .tile {
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
-  overflow: hidden; display: flex; flex-direction: column;
+  display: flex; flex-direction: column;
 }
 .tile .meta { flex: 1 1 auto; }
 .tile .thumb {
   display: block; width: 100%; aspect-ratio: 1 / 1; object-fit: cover;
   background: #0d1015; border-bottom: 1px solid var(--line);
+  border-radius: 10px 10px 0 0;
 }
 .tile .meta { padding: 8px 10px; font-size: 12px; }
 .tile .meta .name { word-break: break-all; margin-bottom: 4px; }
@@ -151,7 +155,12 @@ span.filetype.mini span { font-size: 10px; }
 .crumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 14px; }
 .objmenu { min-width: 320px; }
 .objmenu select { max-width: 160px; }
-.tile .actions details.inline .confirm-body { position: absolute; left: 6px; right: 6px; bottom: 44px; z-index: 3; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+.objmenu .row { flex-wrap: nowrap; }
+.objmenu input[type=text] { flex: 1 1 auto; }
+.tile .actions details.inline .confirm-body {
+  position: absolute; left: 0; bottom: 44px; z-index: 3; width: 460px; max-width: calc(100vw - 48px);
+  background: var(--panel); box-shadow: 0 8px 24px rgba(0,0,0,.45);
+}
 details.inline { display: inline-block; }
 details.inline > summary { list-style: none; display: inline-block; }
 details.inline > summary::-webkit-details-marker { display: none; }

@@ -220,11 +220,11 @@ func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
 	remoteSide := Endpoint{
 		Remote: strings.TrimSpace(r.PostFormValue("remote")),
 		Bucket: strings.TrimSpace(r.PostFormValue("remote_bucket")),
-		Prefix: strings.TrimSpace(r.PostFormValue("remote_prefix")),
+		Prefix: folderPrefix(r.PostFormValue("remote_prefix")),
 	}
 	garageSide := Endpoint{
 		Bucket: strings.TrimSpace(r.PostFormValue("garage_bucket")),
-		Prefix: strings.TrimSpace(r.PostFormValue("garage_prefix")),
+		Prefix: folderPrefix(r.PostFormValue("garage_prefix")),
 	}
 	spec := JobSpec{Kind: JobSync, Mode: strings.TrimSpace(r.PostFormValue("mode")), Transfers: transfers}
 	switch r.PostFormValue("direction") {
@@ -239,6 +239,24 @@ func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
 	a.startJob(w, r, spec, "/sync")
 }
 
+// jobSummary is "Impor src → dst" or "Hapus folder src", for messages.
+func jobSummary(s JobState) string {
+	if s.Kind == JobDeletePrefix {
+		return s.Direction() + " " + s.Src.String()
+	}
+	return s.Direction() + " " + s.Src.String() + " → " + s.Dst.String()
+}
+
+// folderPrefix normalises a typed prefix: trimmed, and with the trailing
+// slash people tend to leave out. Validation still happens in JobManager.
+func folderPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if s != "" && !strings.HasSuffix(s, "/") {
+		s += "/"
+	}
+	return s
+}
+
 // startJob creates a job and redirects with the outcome. Probing both sides
 // can take a while against a slow remote, so it gets its own deadline.
 func (a *App) startJob(w http.ResponseWriter, r *http.Request, spec JobSpec, back string) {
@@ -249,8 +267,8 @@ func (a *App) startJob(w http.ResponseWriter, r *http.Request, spec JobSpec, bac
 		a.redirectErr(w, r, back, fmt.Errorf("job tidak dimulai: %w", err))
 		return
 	}
-	a.redirectOK(w, r, "/sync", fmt.Sprintf("Job %s (%s %s → %s) dimulai. Halaman ini boleh ditutup; job jalan di server dan dilanjutkan otomatis setelah restart.",
-		state.ID, state.Direction(), state.Src, state.Dst))
+	a.redirectOK(w, r, "/sync", fmt.Sprintf("Job %s (%s) dimulai. Halaman ini boleh ditutup; job jalan di server dan dilanjutkan otomatis setelah restart.",
+		state.ID, jobSummary(state)))
 }
 
 // jobAction wraps the pause/resume/rerun/cancel/delete handlers.

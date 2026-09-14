@@ -218,10 +218,7 @@ func (a *App) handleFolderJob(w http.ResponseWriter, r *http.Request) {
 			a.redirectErr(w, r, back, fmt.Errorf("bucket tujuan: %w", err))
 			return
 		}
-		dstPrefix := strings.TrimSpace(r.PostFormValue("dst_prefix"))
-		if dstPrefix != "" && !strings.HasSuffix(dstPrefix, "/") {
-			dstPrefix += "/"
-		}
+		dstPrefix := folderPrefix(r.PostFormValue("dst_prefix"))
 		if err := ValidateJobPrefix(dstPrefix); err != nil {
 			a.redirectErr(w, r, back, fmt.Errorf("folder tujuan: %w", err))
 			return

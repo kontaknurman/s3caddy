@@ -233,10 +233,16 @@ func (h *jobHandle) snapshot() JobState {
 	defer h.mu.Unlock()
 	s := h.state
 	s.LastLog = append([]string(nil), h.state.LastLog...)
-	// Fold the run in progress into the counters the UI sees.
-	s.Counters.Transferred += h.live.Transfers + h.live.Deletes
+	// Fold the run in progress into the counters the UI sees. Failures are
+	// only counted for good once their chunk is committed, so an interrupted
+	// chunk (whose keys are examined again on resume) never counts twice.
+	if s.Kind == JobDeletePrefix {
+		s.Counters.Transferred += h.live.Deletes
+	} else {
+		s.Counters.Transferred += h.live.Transfers
+	}
 	s.Counters.Bytes += h.live.Bytes
-	s.Counters.Failed += int64(len(h.chunkFailed))
+	s.Counters.Failed += int64(len(h.chunkFailed) + len(h.pendingFailed))
 	return s
 }
 
@@ -488,6 +494,7 @@ func (m *JobManager) startLocked(h *jobHandle) {
 	h.cancel = cancel
 	h.live = rcloneStats{}
 	h.chunkFailed = nil
+	h.pendingFailed = nil
 	h.mu.Unlock()
 	m.wg.Add(1)
 	go m.run(ctx, h)
@@ -531,6 +538,7 @@ func (m *JobManager) finish(ctx context.Context, h *jobHandle, err error) {
 	h.cancel = nil
 	h.live = rcloneStats{}
 	h.chunkFailed = nil
+	h.pendingFailed = nil
 	h.mu.Unlock()
 
 	if perr := m.persist(h); perr != nil {
@@ -655,11 +663,23 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 				h.mu.Unlock()
 				return nil
 			}
-			h.mu.Lock()
-			for _, f := range failedNow {
-				h.addFailedLocked(f)
+			// Record in key order so the log reads like the listing.
+			failedKeys := make([]string, 0, len(failedNow))
+			for k := range failedNow {
+				failedKeys = append(failedKeys, k)
 			}
-			h.state.Counters.Transferred += live.Transfers + live.Deletes
+			sort.Strings(failedKeys)
+			// rclone counts a moved object as one transfer *and* one delete;
+			// a deleted one only as a delete. Count objects, not operations.
+			done := live.Transfers
+			if spec.Kind == JobDeletePrefix {
+				done = live.Deletes
+			}
+			h.mu.Lock()
+			for _, k := range failedKeys {
+				h.addFailedLocked(failedNow[k])
+			}
+			h.state.Counters.Transferred += done
 			h.state.Counters.Bytes += live.Bytes
 			h.mu.Unlock()
 		}
@@ -678,9 +698,10 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 			h.state.Counters.Chunks++
 		}
 		chunks := h.state.Counters.Chunks
-		failedTotal := h.state.Counters.Failed
 		pending := h.pendingFailed
 		h.pendingFailed = nil
+		h.state.Counters.Failed += int64(len(pending))
+		failedTotal := h.state.Counters.Failed
 		h.mu.Unlock()
 
 		if err := m.appendFailed(spec.ID, pending); err != nil {
@@ -782,9 +803,9 @@ func (h *jobHandle) onRcloneEvent(srcPrefix string, now func() time.Time) func(r
 	}
 }
 
-// addFailedLocked queues a failed key for the log and counts it.
+// addFailedLocked queues a failed key; it is counted and written to the log
+// when its chunk is committed.
 func (h *jobHandle) addFailedLocked(f FailedKey) {
-	h.state.Counters.Failed++
 	h.pendingFailed = append(h.pendingFailed, f)
 }
 

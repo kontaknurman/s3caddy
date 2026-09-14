@@ -671,3 +671,48 @@ func TestResumeInterruptedSettlesPausingAndCancelling(t *testing.T) {
 		t.Errorf("corrupt file should be skipped, got %d jobs", len(mgr.List()))
 	}
 }
+
+// A key that cannot be handed to rclone is counted once, even when the chunk
+// it belongs to is interrupted and examined again after a resume.
+func TestInterruptedChunkDoesNotCountInvalidKeysTwice(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	e.remote.put("backup", "in/nama\nsalah.txt", []byte("x"), "text/plain")
+	for i := 0; i < 4; i++ {
+		e.remote.put("backup", fmt.Sprintf("in/%02d.txt", i), []byte("x"), "text/plain")
+	}
+	e.knob(t, "sleep", "0.3")
+
+	st, err := e.mgr.Create(t.Context(), e.importSpec("skip-existing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	live, _ := e.mgr.Get(st.ID)
+	if live.Counters.Failed != 1 {
+		t.Errorf("while running, the invalid key should already show: failed = %d", live.Counters.Failed)
+	}
+	if err := e.mgr.Pause(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, func(s JobState) bool { return s.Status == JobPaused })
+	if s.Counters.Failed != 0 || s.Counters.Chunks != 0 {
+		t.Errorf("an interrupted chunk must not commit its failures: %+v", s.Counters)
+	}
+	if _, total, _ := e.mgr.FailedKeys(st.ID, 10); total != 0 {
+		t.Errorf("failed.jsonl has %d lines before any chunk finished", total)
+	}
+
+	e.knob(t, "sleep", "0")
+	if err := e.mgr.Resume(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	s = waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Failed != 1 || s.Counters.Transferred != 4 {
+		t.Errorf("after resume: status=%s counters=%+v", s.Status, s.Counters)
+	}
+	keys, total, _ := e.mgr.FailedKeys(st.ID, 10)
+	if total != 1 || len(keys) != 1 || !strings.Contains(keys[0].Error, "baris baru") {
+		t.Errorf("failed keys = %+v (total %d)", keys, total)
+	}
+}

@@ -34,6 +34,11 @@ func TestManualServe(t *testing.T) {
 	p.s3.put("media", "foto/catatan.txt", []byte("catatan"), "text/plain")
 	p.s3.put("media", "laporan.pdf", []byte("%PDF-1.4 fake"), "application/pdf")
 	p.s3.put("media", "arsip lama/data.csv", []byte("a,b\n1,2\n"), "text/csv")
+	for i := 0; i < 130; i++ {
+		p.s3.put("media", fmt.Sprintf("banyak/item-%03d.txt", i), []byte(fmt.Sprintf("%0*d", i%50+1, 0)), "text/plain")
+	}
+	// A key rclone cannot be handed (newline) and one only at the remote.
+	p.remote.put("backup", "in/nama\nsalah.txt", []byte("x"), "text/plain")
 	for i := 0; i < 2000; i++ {
 		p.remote.put("backup", fmt.Sprintf("in/file-%05d.txt", i), []byte(fmt.Sprintf("remote %d", i)), "text/plain")
 	}

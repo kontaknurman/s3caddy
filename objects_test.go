@@ -77,6 +77,12 @@ func TestObjectsPageBreadcrumbsSortAndView(t *testing.T) {
 	if strings.Index(body, "small.txt") > strings.Index(body, "big.pdf") {
 		t.Error("name desc order wrong")
 	}
+	// A prefix typed without its slash is normalised, not listed as a
+	// partial match.
+	resp, _ = p.get(t, "/objects?bucket=media&prefix=a%2Fb")
+	if loc := resp.Header.Get("Location"); resp.StatusCode != http.StatusSeeOther || !strings.Contains(loc, "prefix=a%2Fb%2F") {
+		t.Errorf("prefix without slash: status %d location %q", resp.StatusCode, loc)
+	}
 	// Unknown sort values fall back quietly.
 	if resp, _ := p.get(t, "/objects?bucket=media&sort=%3Cscript%3E&dir=up&view=x"); resp.StatusCode != http.StatusOK {
 		t.Errorf("bad sort params: status %d", resp.StatusCode)
@@ -374,7 +380,7 @@ func TestFolderJobsStartFromTheObjectsPage(t *testing.T) {
 		}
 	}
 	resp = p.post(t, "/objects/folder-job", url.Values{"bucket": {"media"}, "prefix": {"old/photos/"}, "action": {"delete"}, "confirm": {"photos"}})
-	if body = p.followFlash(t, resp); !strings.Contains(body, "Hapus folder garage:media/old/photos/") {
+	if body = p.followFlash(t, resp); !strings.Contains(body, "(Hapus folder garage:media/old/photos/)") {
 		t.Errorf("delete job flash: %s", firstLines(body))
 	}
 	p.waitJobs(t, func(js []jobView) bool {

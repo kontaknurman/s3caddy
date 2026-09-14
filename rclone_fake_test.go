@@ -228,6 +228,9 @@ func fakeRcloneMain(args []string) int {
 					stats.Bytes += int64(len(data))
 					if verb == "move" {
 						opErr = src.DeleteObject(ctx, srcBucket, srcKey)
+						if opErr == nil {
+							stats.Deletes++ // rclone counts a move as transfer + delete
+						}
 					}
 				}
 			}

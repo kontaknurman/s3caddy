@@ -1705,6 +1705,12 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 		a.renderError(w, r, http.StatusBadRequest, "Prefix tidak valid", err)
 		return
 	}
+	// A folder is always "name/"; a hand-typed prefix without the slash would
+	// list partial matches with empty folder names.
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		http.Redirect(w, r, listURL(bucket, prefix+"/", sortBy, dir, "", token), http.StatusSeeOther)
+		return
+	}
 	if a.s3 == nil {
 		data["Error"] = "GARAGE_S3_ACCESS_KEY dan GARAGE_S3_SECRET_KEY belum diatur, jadi panel tidak bisa membaca isi bucket. Isi keduanya di unit systemd lalu restart garagepanel."
 		a.render(w, r, "objects.html", data)
