@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -240,6 +241,9 @@ func main() {
 		switch os.Args[1] {
 		case "-hash-password", "--hash-password", "hash-password":
 			os.Exit(runHashPassword())
+		case "-version", "--version", "version":
+			fmt.Println(buildVersion())
+			return
 		case "-h", "-help", "--help", "help":
 			printUsage(os.Stdout)
 			return
@@ -255,6 +259,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\nKonfigurasi tidak lengkap:\n\n%v\n\n", err)
 		os.Exit(1)
 	}
+
+	log.Printf("versi %s", buildVersion())
 
 	app, err := newApp(cfg)
 	if err != nil {
@@ -314,12 +320,50 @@ func main() {
 
 // --- perintah baris perintah ----------------------------------------------
 
+// buildVersion melaporkan build mana yang sedang berjalan.
+//
+// Go menyetempel revisi git ke dalam binary secara otomatis, jadi tidak perlu
+// flag build khusus — "go build" biasa sudah cukup. Ini yang membuat hasil
+// update bisa diperiksa, bukan sekadar diasumsikan.
+func buildVersion() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "tidak diketahui"
+	}
+	var rev, when string
+	var modified bool
+	for _, setting := range bi.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			rev = setting.Value
+		case "vcs.time":
+			when = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if rev == "" {
+		return "tidak diketahui (dibuild di luar repo git)"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if modified {
+		rev += "-dirty"
+	}
+	if t, err := time.Parse(time.RFC3339, when); err == nil {
+		rev += " (" + t.Local().Format("2006-01-02 15:04") + ")"
+	}
+	return rev
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprint(w, `garagepanel — panel admin Garage + Caddy
 
 Penggunaan:
   garagepanel                 jalankan panel (konfigurasi lewat environment variable)
   garagepanel -hash-password  buat nilai PANEL_PASSWORD_HASH untuk halaman login
+  garagepanel -version        tampilkan build yang sedang dipakai
   garagepanel -help           tampilkan bantuan ini
 
 Environment variable wajib:
@@ -754,6 +798,7 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, page string, data m
 	data["Flash"] = a.flashes.take(r.URL.Query().Get("m"))
 	data["HasS3"] = a.s3 != nil
 	data["S3APIDomain"] = a.cfg.S3APIDomain
+	data["Version"] = buildVersion()
 	data["AuthEnabled"] = a.cfg.authEnabled()
 	data["User"] = currentUser(r)
 

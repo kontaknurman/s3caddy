@@ -172,6 +172,10 @@ details.confirm .confirm-body {
 .login-card { width: 100%; max-width: 380px; margin-bottom: 0; }
 .login-card h3 { margin-bottom: 18px; }
 .login-card input { width: 100%; }
+.buildinfo {
+  max-width: 1180px; margin: 0 auto; padding: 0 20px 28px;
+  color: var(--muted); font-size: 12px;
+}
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%);
   background: var(--ok); color: #06130d; font-weight: 600; font-size: 14px;
@@ -213,6 +217,10 @@ details.confirm .confirm-body {
 
   {{template "content" .}}
 </main>
+
+{{if .Version}}
+<footer class="buildinfo">garagepanel <span class="mono">{{.Version}}</span></footer>
+{{end}}
 
 <div class="toast" id="toast">Disalin</div>
 

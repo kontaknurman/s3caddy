@@ -37,6 +37,11 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 - [Diverifikasi di Ubuntu 24.04](#diverifikasi-di-ubuntu-2404)
 - [Login dan akses lewat domain](#login-dan-akses-lewat-domain)
 - [Update ke versi baru](#update-ke-versi-baru)
+  - [1. Catat versi yang sedang berjalan](#1-catat-versi-yang-sedang-berjalan)
+  - [2. Build versi baru](#2-build-versi-baru)
+  - [3. Simpan binary lama, lalu pasang yang baru](#3-simpan-binary-lama-lalu-pasang-yang-baru)
+  - [4. Pastikan updatenya benar-benar jalan](#4-pastikan-updatenya-benar-benar-jalan)
+  - [Kalau ada yang tidak beres](#kalau-ada-yang-tidak-beres)
 - [Backup dan pemulihan](#backup-dan-pemulihan)
 - [Uninstall](#uninstall)
 - [Konfigurasi](#konfigurasi)
@@ -984,37 +989,114 @@ session hanya ada di memori.
 ## Update ke versi baru
 
 Panel tidak punya state sendiri — tidak ada database, tidak ada file cache.
-Semua state ada di Garage dan di file `.caddy`. Jadi update cukup mengganti
-binary:
+Semua state ada di Garage dan di file `.caddy`. Update berarti mengganti satu
+file binary, tidak lebih.
+
+**File environment, file `.caddy`, bucket, objek, dan key tidak tersentuh.**
+
+### 1. Catat versi yang sedang berjalan
+
+Supaya nanti bisa dipastikan updatenya benar-benar terpasang:
 
 ```bash
-# di mesin lokal
-cd s3caddy && git pull
+garagepanel -version
+```
+
+Contoh keluaran: `9c9c631260fe (2026-09-14 07:26)` — itu commit git beserta
+tanggalnya. Versi yang sama juga tercetak di log saat start dan di pojok bawah
+setiap halaman panel.
+
+### 2. Build versi baru
+
+Di mesin build:
+
+```bash
+cd s3caddy
+git pull
 CGO_ENABLED=0 go build -ldflags="-s -w" -o garagepanel .
+./garagepanel -version      # harus beda dari langkah 1
+```
+
+Go menyetempel revisi git ke dalam binary secara otomatis, jadi tidak perlu
+flag khusus. Kalau muncul `-dirty`, berarti ada perubahan yang belum di-commit
+di direktori kerjamu.
+
+> Build gagal dengan `package crypto/pbkdf2 is not in std`? Go di mesin build
+> masih di bawah 1.24 — perbarui lewat [Go (di mesin build)](#go-di-mesin-build).
+
+```bash
 scp garagepanel user@server:/tmp/garagepanel
 ```
 
+### 3. Simpan binary lama, lalu pasang yang baru
+
+Menyimpan yang lama membuat rollback jadi satu perintah kalau ada yang tidak
+beres:
+
 ```bash
-# di server
+sudo cp /usr/local/bin/garagepanel /usr/local/bin/garagepanel.bak
 sudo install -o root -g root -m 0755 /tmp/garagepanel /usr/local/bin/garagepanel
 rm /tmp/garagepanel
 sudo systemctl restart garagepanel
-systemctl is-active garagepanel
 ```
 
-File environment, file `.caddy`, bucket, dan key tidak tersentuh. Kalau unit
-systemd-nya ikut berubah, salin ulang lalu `sudo systemctl daemon-reload`
-sebelum restart.
-
-> Kalau build gagal dengan `package crypto/pbkdf2 is not in std`, Go di mesin
-> build masih di bawah 1.24. Perbarui lewat [Go (di mesin build)](#go-di-mesin-build).
-
-Setelah restart, cek sekali bahwa panel benar-benar naik lagi — bukan gagal
-start karena konfigurasi yang berubah:
+### 4. Pastikan updatenya benar-benar jalan
 
 ```bash
-systemctl is-active garagepanel && journalctl -u garagepanel -n 5 --no-pager
+garagepanel -version                        # harus cocok dengan langkah 2
+systemctl is-active garagepanel             # active
+journalctl -u garagepanel -n 15 --no-pager
 ```
+
+Di log harus terlihat baris versi dan baris siap:
+
+```
+garagepanel: versi 9c9c631260fe (2026-09-14 07:26)
+garagepanel: terhubung ke Garage Admin API di http://127.0.0.1:3903
+garagepanel: siap di http://127.0.0.1:8090 (loopback saja — akses lewat SSH tunnel)
+```
+
+Terakhir, buka panelnya dan pastikan halaman Buckets memuat daftar seperti
+biasa. Versi yang sedang berjalan tertulis di pojok bawah halaman, jadi bisa
+dicek dari browser tanpa SSH.
+
+### Kalau ada yang tidak beres
+
+Kembali ke binary sebelumnya:
+
+```bash
+sudo cp /usr/local/bin/garagepanel.bak /usr/local/bin/garagepanel
+sudo systemctl restart garagepanel
+garagepanel -version
+```
+
+Rollback ini aman karena tidak ada migrasi data sama sekali — versi lama
+membaca file `.caddy` dan file environment yang sama persis.
+
+### Kalau unit systemd ikut berubah
+
+`garagepanel.service` jarang berubah, tapi kalau iya (misalnya baris hardening
+baru), salin ulang dan muat ulang systemd sebelum restart:
+
+```bash
+sudo install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
+sudo systemctl daemon-reload
+sudo systemctl restart garagepanel
+```
+
+Bandingkan dulu kalau ingin tahu apa yang berubah:
+
+```bash
+diff /etc/systemd/system/garagepanel.service garagepanel.service
+```
+
+### Kalau ada environment variable baru
+
+Panel selalu berjalan dengan setelan bawaan untuk variabel yang tidak diisi,
+jadi update tidak pernah memaksamu mengubah file environment. Kalau sebuah versi
+menambahkan variabel baru, itu bersifat opsional dan dicatat di
+[Konfigurasi](#konfigurasi). Panel menolak start dengan pesan yang jelas kalau
+ada yang benar-benar wajib.
 
 ## Backup dan pemulihan
 
