@@ -16,6 +16,9 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 
 - [Yang bisa dilakukan](#yang-bisa-dilakukan)
 - [Cara kerja](#cara-kerja)
+- [Memasang Go dan Caddy](#memasang-go-dan-caddy)
+  - [Go (di mesin build)](#go-di-mesin-build)
+  - [Caddy (di server)](#caddy-di-server)
 - [Instalasi](#instalasi)
   - [Prasyarat](#prasyarat)
   - [Langkah 0 — Periksa Garage dan Caddy](#langkah-0--periksa-garage-dan-caddy)
@@ -89,6 +92,136 @@ ditinggalkan dalam keadaan rusak.
 **SigV4 ditulis tangan** dengan `crypto/hmac` + `crypto/sha256`. Implementasinya
 diuji terhadap dua test vector resmi AWS (lihat `s3_test.go`).
 
+## Memasang Go dan Caddy
+
+Lewati bagian ini kalau keduanya sudah ada. Go hanya dibutuhkan di **mesin yang
+mem-build** — binary hasilnya statis, jadi server tidak perlu Go terpasang.
+Caddy dibutuhkan di **server**.
+
+Memasang Garage sendiri di luar cakupan dokumen ini; ikuti
+[panduan resminya](https://garagehq.deuxfleurs.fr/documentation/quick-start/)
+kalau belum ada.
+
+### Go (di mesin build)
+
+Panel butuh **Go 1.22 atau lebih baru**. Paket bawaan distro (`apt install
+golang-go`) sering tertinggal jauh, jadi lebih aman pasang dari go.dev.
+
+**Linux.** Perintah ini mengambil versi stabil terkini secara otomatis:
+
+```bash
+GO_VERSION=$(curl -sL 'https://go.dev/VERSION?m=text' | head -1)
+echo "akan memasang $GO_VERSION"
+
+curl -LO "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz"
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf "${GO_VERSION}.linux-amd64.tar.gz"
+rm "${GO_VERSION}.linux-amd64.tar.gz"
+```
+
+> Ganti `amd64` dengan `arm64` kalau mesinnya ARM. Cek dengan `uname -m`:
+> `x86_64` → `amd64`, `aarch64` → `arm64`.
+>
+> `rm -rf /usr/local/go` itu memang bagian dari prosedur resmi — menimpa
+> instalasi lama tanpa menghapusnya dulu bisa meninggalkan file campuran.
+
+Tambahkan ke `PATH` untuk semua user, lalu muat di shell yang sedang terbuka:
+
+```bash
+echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/go.sh
+. /etc/profile.d/go.sh
+```
+
+**macOS.** Paling ringkas lewat Homebrew:
+
+```bash
+brew install go
+```
+
+Tanpa Homebrew, unduh paket `.pkg` dari <https://go.dev/dl/> lalu jalankan —
+installer-nya memasang ke `/usr/local/go` dan mengatur `PATH` sendiri. Buka
+terminal baru setelahnya.
+
+**Verifikasi** (di shell baru):
+
+```bash
+go version
+```
+
+Harus keluar `go1.22` atau lebih baru. Kalau `command not found`, `PATH`-nya
+belum termuat — buka terminal baru, atau jalankan ulang `. /etc/profile.d/go.sh`.
+
+### Caddy (di server)
+
+Pakai repositori resmi, bukan paket bawaan distro — versi di repo distro
+biasanya tertinggal dan tidak punya HTTPS otomatis yang dikonfigurasi rapi.
+
+**Debian / Ubuntu / Raspbian:**
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update
+sudo apt install caddy
+```
+
+**Fedora:**
+
+```bash
+sudo dnf install dnf5-plugins
+sudo dnf copr enable @caddy/caddy
+sudo dnf install caddy
+```
+
+**RHEL / CentOS / Rocky / Alma:**
+
+```bash
+sudo dnf install dnf-plugins-core
+sudo dnf copr enable @caddy/caddy
+sudo dnf install caddy
+```
+
+**Distro lain:** unduh binary statis dari
+<https://github.com/caddyserver/caddy/releases>, taruh di `/usr/local/bin/caddy`,
+lalu pasang unit systemd-nya mengikuti
+[panduan resmi Caddy](https://caddyserver.com/docs/running#manual-installation).
+Yang penting untuk panel ini: service-nya harus berjalan sebagai user `caddy`
+dan membaca `/etc/caddy/Caddyfile`.
+
+**Verifikasi.** Paket apt dan dnf sudah sekalian memasang unit systemd-nya:
+
+```bash
+caddy version
+systemctl is-enabled caddy
+systemctl is-active caddy
+systemctl show caddy -p User --value    # harus: caddy
+```
+
+Kalau belum aktif:
+
+```bash
+sudo systemctl enable --now caddy
+```
+
+Setelah terpasang, Caddy melayani halaman selamat datang di port 80. Konfigurasinya
+ada di `/etc/caddy/Caddyfile`; baris `import` yang dibutuhkan panel ditambahkan
+nanti di [Langkah 4](#langkah-4--siapkan-direktori-sites-caddy).
+
+**Buka port 80 dan 443 di firewall.** Caddy butuh keduanya: 443 untuk melayani
+domain, dan 80 untuk verifikasi ACME saat menerbitkan sertifikat TLS. Panel
+sendiri tidak butuh port apa pun terbuka — aksesnya lewat SSH tunnel.
+
+```bash
+sudo ufw allow 80,443/tcp        # Debian/Ubuntu dengan ufw
+# atau
+sudo firewall-cmd --permanent --add-service={http,https} && sudo firewall-cmd --reload
+```
+
 ## Instalasi
 
 Tutorial dari nol sampai panel bisa dipakai. Sekitar 15 menit. Setiap langkah
@@ -105,6 +238,9 @@ dijelaskan, artinya di server).
 | Caddy sudah jalan | `systemctl is-active caddy` | `active` |
 | Akses `sudo` di server | `sudo -v` | tidak error |
 | Go 1.22+ di mesin build | `go version` | `go1.22` atau lebih baru |
+
+Belum ada Go atau Caddy? Lihat [Memasang Go dan Caddy](#memasang-go-dan-caddy)
+di atas.
 
 Panel **tidak** memasang atau mengubah Garage maupun Caddy. Keduanya harus sudah
 berjalan lebih dulu.
