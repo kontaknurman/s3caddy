@@ -16,6 +16,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 
 - [Yang bisa dilakukan](#yang-bisa-dilakukan)
 - [Cara kerja](#cara-kerja)
+- [Peta komponen](#peta-komponen)
 - [Memasang Go dan Caddy](#memasang-go-dan-caddy)
   - [Go (di mesin build)](#go-di-mesin-build)
   - [Caddy (di server)](#caddy-di-server)
@@ -35,6 +36,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Checklist instalasi](#checklist-instalasi)
 - [Login dan akses lewat domain](#login-dan-akses-lewat-domain)
 - [Update ke versi baru](#update-ke-versi-baru)
+- [Backup dan pemulihan](#backup-dan-pemulihan)
 - [Uninstall](#uninstall)
 - [Konfigurasi](#konfigurasi)
 - [Keamanan](#keamanan)
@@ -92,6 +94,51 @@ ditinggalkan dalam keadaan rusak.
 
 **SigV4 ditulis tangan** dengan `crypto/hmac` + `crypto/sha256`. Implementasinya
 diuji terhadap dua test vector resmi AWS (lihat `s3_test.go`).
+
+## Peta komponen
+
+Semua berjalan di satu server. Yang terekspos ke internet hanya Caddy; Garage dan
+panel seluruhnya di loopback.
+
+**Jalur admin — kamu memakai panel:**
+
+```
+  browser ──SSH tunnel──────────────▶ 127.0.0.1:8090  garagepanel
+  browser ──https──▶ Caddy ─────────▶ 127.0.0.1:8090  garagepanel
+                   (opsional, butuh login)     │
+                                               ├──▶ 127.0.0.1:3903  Garage admin
+                                               │       bucket, key, website access
+                                               ├──▶ 127.0.0.1:3900  Garage S3
+                                               │       daftar/unggah/hapus objek (SigV4)
+                                               ├──▶ 127.0.0.1:3902  Garage web
+                                               │       thumbnail lewat /preview
+                                               │
+                                               └──▶ tulis /etc/caddy/sites/*.caddy
+                                                       lalu `systemctl reload caddy`
+```
+
+**Jalur pengunjung — orang membuka domainmu:**
+
+```
+  browser ──https──▶ Caddy ──Host: <nama-bucket>──▶ 127.0.0.1:3902  Garage web
+```
+
+| Port | Komponen | Diikat ke | Dipakai untuk |
+|---|---|---|---|
+| 3900 | Garage S3 API | `127.0.0.1` | Panel: daftar, unggah, hapus objek (SigV4). Opsional diekspos Caddy lewat `_s3api.caddy` |
+| 3902 | Garage web | `127.0.0.1` | Caddy: melayani bucket per domain. Panel: thumbnail lewat `/preview` |
+| 3903 | Garage admin | `127.0.0.1` | Panel: bucket, key, website access |
+| 8090 | garagepanel | `127.0.0.1` | UI panel — lewat SSH tunnel, atau lewat Caddy kalau login diaktifkan |
+| 80, 443 | Caddy | publik | Domain bucket, sertifikat TLS otomatis |
+
+Yang perlu ada di mesin mana:
+
+| | Mesin build | Server |
+|---|---|---|
+| Go 1.24+ | ✔ | — (binary statis) |
+| Garage | — | ✔ |
+| Caddy | — | ✔ |
+| garagepanel | dibuat di sini | ✔ dijalankan di sini |
 
 ## Memasang Go dan Caddy
 
@@ -275,7 +322,15 @@ api_bind_addr = "127.0.0.1:3903"
 admin_token = "…"
 ```
 
-Kalau blok `[admin]` tidak ada, tambahkan lalu `sudo systemctl restart garage`.
+Kalau blok `[admin]` tidak ada, tambahkan lalu `sudo systemctl restart garage`:
+
+```toml
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+admin_token = "ganti-dengan-nilai-acak-panjang"
+```
+
+Nilai acak untuk `admin_token` bisa dibuat dengan `openssl rand -base64 32`.
 
 **0c. Siapkan token admin**
 
@@ -322,10 +377,33 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Host: bucket-yang-tidak-ada" http:/
 Jawaban `404` justru bagus: artinya endpoint hidup dan menolak bucket yang
 memang tidak ada. Yang salah adalah `000` / `Connection refused`.
 
+Kalau blok `[s3_web]` tidak ada, tambahkan lalu restart Garage:
+
+```toml
+[s3_web]
+bind_addr = "127.0.0.1:3902"
+```
+
+Itu saja yang dibutuhkan. Dokumen index (`index.html`) **bukan** setelan global —
+ia diatur per bucket, dan panel yang mengisinya lewat `UpdateBucket` setiap kali
+kamu mencentang "Public".
+
 `root_domain` di `[s3_web]` **tidak wajib** untuk panel ini. Garage melayani
 bucket kalau Host cocok dengan `<bucket>.<root_domain>` **atau** persis sama
 dengan nama bucket — yang kedua itulah yang dipakai panel lewat
 `header_up Host <bucket>`.
+
+**0d-2. Jam server harus akurat.** Panel menandatangani request S3 dengan SigV4,
+dan tanda tangan itu memuat stempel waktu. Kalau jam server meleset lebih dari
+sekitar 15 menit, Garage menolak semuanya dengan `RequestTimeTooSkewed` dan
+halaman Objek akan kosong tanpa sebab yang jelas.
+
+```bash
+timedatectl status | grep -E 'System clock|NTP service'
+```
+
+Harus `System clock synchronized: yes` dan `NTP service: active`. Kalau belum:
+`sudo timedatectl set-ntp true`.
 
 **0e. Caddy mengimpor direktori sites**
 
@@ -547,6 +625,12 @@ GARAGE_S3_REGION=garage
 CADDY_SITES_DIR=/etc/caddy/sites
 S3_API_DOMAIN=s3.domainmu.com
 LISTEN=127.0.0.1:8090
+
+# Login panel — opsional, lihat bagian "Login dan akses lewat domain".
+# Kosongkan kalau panel hanya diakses lewat SSH tunnel.
+#PANEL_USERNAME=admin
+#PANEL_PASSWORD_HASH=
+#PANEL_DOMAIN=
 EOF
 sudo chmod 0600 /etc/garagepanel/garagepanel.env
 ```
@@ -566,6 +650,10 @@ Catatan pengisian:
   pesan yang jelas.
 - Kalau `command -v systemctl` di Langkah 5 bukan `/bin/systemctl`, tambahkan
   satu baris: `CADDY_RELOAD_CMD=sudo -n /usr/bin/systemctl reload caddy`.
+- Baris `PANEL_*` boleh tetap dikomentari untuk sekarang. Panel berjalan tanpa
+  login dan hanya bisa dibuka lewat SSH tunnel — itu bawaannya. Aktifkan nanti
+  lewat [Login dan akses lewat domain](#login-dan-akses-lewat-domain) kalau
+  memang perlu.
 
 Kesalahan paling sering di file ini adalah tanda kutip yang tidak sengaja
 terbawa. Perintah ini harus tidak mengeluarkan hasil apa pun:
@@ -706,6 +794,7 @@ garage key delete uji-panel-key     # tambahkan --yes kalau diminta konfirmasi
 | 8 | Service | `systemctl is-active garagepanel` | `active` |
 | 9 | Tunnel | buka `http://127.0.0.1:8090` | halaman Buckets |
 | 10 | Uji end-to-end | upload + thumbnail muncul | semua hijau |
+| — | *(opsional)* [Login](#login-dan-akses-lewat-domain) | buka panel setelah restart | form login muncul |
 
 ## Login dan akses lewat domain
 
@@ -861,6 +950,53 @@ systemctl is-active garagepanel
 File environment, file `.caddy`, bucket, dan key tidak tersentuh. Kalau unit
 systemd-nya ikut berubah, salin ulang lalu `sudo systemctl daemon-reload`
 sebelum restart.
+
+> Kalau build gagal dengan `package crypto/pbkdf2 is not in std`, Go di mesin
+> build masih di bawah 1.24. Perbarui lewat [Go (di mesin build)](#go-di-mesin-build).
+
+Setelah restart, cek sekali bahwa panel benar-benar naik lagi — bukan gagal
+start karena konfigurasi yang berubah:
+
+```bash
+systemctl is-active garagepanel && journalctl -u garagepanel -n 5 --no-pager
+```
+
+## Backup dan pemulihan
+
+Panel tidak menyimpan state apa pun sendiri. Yang perlu di-backup hanya dua
+tempat, dan keduanya kecil:
+
+| Apa | Di mana | Isinya |
+|---|---|---|
+| Konfigurasi panel | `/etc/garagepanel/garagepanel.env` | token admin, key S3, hash password login |
+| Pemetaan domain | `/etc/caddy/sites/*.caddy` | domain → bucket, whitelist IP S3 API |
+
+```bash
+sudo tar czf garagepanel-backup-$(date +%F).tar.gz \
+  /etc/garagepanel/garagepanel.env \
+  /etc/caddy/sites \
+  /etc/sudoers.d/garagepanel \
+  /etc/systemd/system/garagepanel.service
+```
+
+Arsip ini memuat token admin Garage dan secret key S3 dalam bentuk terbaca.
+Simpan seperti kamu menyimpan kunci SSH — jangan ke object storage yang dikelola
+panel ini sendiri.
+
+Memulihkannya: pasang binary seperti di [Langkah 2](#langkah-2--kirim-binary-ke-server),
+buat user dan direktori seperti [Langkah 3](#langkah-3--buat-user-garagepanel)
+dan [Langkah 4](#langkah-4--siapkan-direktori-sites-caddy), bongkar arsipnya,
+lalu:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now garagepanel
+sudo systemctl reload caddy
+```
+
+**Bucket dan objeknya sendiri tidak ikut di sini** — itu ada di Garage, di atas
+ZFS. Backup data object storage adalah urusan terpisah; lihat
+[panduan backup Garage](https://garagehq.deuxfleurs.fr/documentation/operations/recovering/).
 
 ## Uninstall
 
@@ -1038,6 +1174,25 @@ dengan yang dipanggil panel. Bandingkan `command -v systemctl` dengan
 
 **`tidak bisa menulis di /etc/caddy/sites`** — cek kepemilikan direktori:
 `stat -c '%U %G %a' /etc/caddy/sites` harus `garagepanel caddy 2750`.
+
+**Permission ditolak padahal kepemilikan sudah benar (Fedora/RHEL/Rocky)** —
+SELinux kemungkinan memblokirnya. Periksa dulu apakah memang itu penyebabnya:
+
+```bash
+getenforce                                    # Enforcing?
+sudo ausearch -m AVC -ts recent | grep -i garagepanel
+```
+
+Kalau ada baris AVC yang cocok, buat kebijakan khusus dari catatan itu — jangan
+mematikan SELinux:
+
+```bash
+sudo ausearch -m AVC -ts recent | audit2allow -M garagepanel
+sudo semodule -i garagepanel.pp
+```
+
+Di Debian/Ubuntu dengan AppArmor, profil bawaan Caddy tidak membatasi panel
+(prosesnya terpisah), jadi biasanya bukan ini penyebabnya.
 
 **Halaman Objek bilang kredensial belum diatur** — `GARAGE_S3_ACCESS_KEY` /
 `GARAGE_S3_SECRET_KEY` kosong di env file.
