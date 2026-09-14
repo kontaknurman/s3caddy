@@ -1,0 +1,19 @@
+{{define "content"}}
+
+<div class="notice err">
+  <pre>{{.Detail}}</pre>
+</div>
+
+<div class="card">
+  <h3>Yang bisa dicek</h3>
+  <ul class="small muted" style="margin: 0; padding-left: 20px;">
+    <li>Garage jalan dan Admin API mendengarkan: <code class="mono">systemctl status garage</code></li>
+    <li><code>GARAGE_ADMIN_TOKEN</code> cocok dengan <code class="mono">admin.admin_token</code> di <code class="mono">/etc/garage.toml</code></li>
+    <li>Direktori <code>CADDY_SITES_DIR</code> ada dan bisa ditulis user <code class="mono">garagepanel</code></li>
+    <li>Log panel: <code class="mono">journalctl -u garagepanel -n 50</code></li>
+  </ul>
+</div>
+
+<a class="btn" href="/buckets">Kembali ke daftar bucket</a>
+
+{{end}}

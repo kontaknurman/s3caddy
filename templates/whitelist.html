@@ -1,0 +1,155 @@
+{{define "content"}}
+
+{{with .Disabled}}
+<div class="notice warn">{{.}}</div>
+{{else}}
+
+<div class="card">
+  <h3>Cara kerja</h3>
+  <p class="small muted">
+    Panel mengelola <code class="mono">{{.SitesDir}}/{{.FileName}}</code> — awalan garis bawah
+    supaya terpisah dari file domain per proyek. Request <strong>GET dan HEAD selalu terbuka</strong>;
+    semua metode lain (PUT, POST, DELETE, …) hanya dilayani kalau IP pemanggil ada di daftar
+    ini, sisanya dijawab <code>403 Forbidden</code>. Setelah itu request diteruskan ke
+    <code class="mono">{{.S3Target}}</code>.
+  </p>
+  <p class="small muted" style="margin: 0;">
+    Label disimpan sebagai komentar <code class="mono"># allow: &lt;ip&gt; | &lt;label&gt;</code>
+    di file yang sama, dan itulah satu-satunya sumber data saat halaman ini dirender.
+  </p>
+</div>
+
+{{if .DomainMismatch}}
+<div class="notice warn">
+  File yang ada sekarang memakai domain <strong>{{.FileDomain}}</strong>, sedangkan
+  <code>S3_API_DOMAIN</code> diisi <strong>{{.S3APIDomain}}</strong>.
+  Perubahan berikutnya akan menulis ulang file memakai <strong>{{.S3APIDomain}}</strong>.
+</div>
+{{end}}
+
+<div class="card">
+  <h3>IP kamu sekarang</h3>
+  <div class="row" style="align-items: center;">
+    <span class="mono val" style="background: var(--panel-2); padding: 7px 10px; border-radius: 6px;">{{.ClientIP}}</span>
+    <button type="button" class="small" data-fill-target="#wl-value" data-fill-value="{{.ClientIP}}">
+      Tambahkan IP saya
+    </button>
+    {{if .ForwardedIP}}
+      <span class="small muted">X-Forwarded-For: <span class="mono">{{.ForwardedIP}}</span></span>
+      <button type="button" class="small" data-fill-target="#wl-value" data-fill-value="{{.ForwardedIP}}">
+        Pakai IP X-Forwarded-For
+      </button>
+    {{end}}
+  </div>
+  {{if .ClientIsLoopback}}
+  <p class="small" style="color: var(--warn); margin: 12px 0 0;">
+    Ini alamat loopback karena kamu mengakses panel lewat SSH tunnel — panel melihat koneksi
+    datang dari server itu sendiri, bukan dari IP publik kamu. Yang perlu dimasukkan ke whitelist
+    adalah <strong>IP publik mesin yang akan menulis ke S3 API</strong> (server aplikasi, runner CI,
+    atau IP kantor), bukan <code>127.0.0.1</code>.
+  </p>
+  {{end}}
+</div>
+
+<div class="card">
+  <h3>Tambah IP atau CIDR</h3>
+  <form method="post" action="/whitelist/add">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <div class="field">
+        <label for="wl-value">IP atau CIDR</label>
+        <input type="text" id="wl-value" name="value" required autocomplete="off"
+               spellcheck="false" placeholder="203.0.113.10 atau 198.51.100.0/24">
+      </div>
+      <div class="field">
+        <label for="wl-label">Label</label>
+        <input type="text" id="wl-label" name="label" maxlength="40" autocomplete="off"
+               spellcheck="false" placeholder="server-app-jakarta">
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <label>&nbsp;</label>
+        <button type="submit" class="primary">Tambah &amp; reload Caddy</button>
+      </div>
+    </div>
+  </form>
+  <p class="small muted" style="margin: 10px 0 0;">
+    IPv4 dan IPv6 keduanya diterima. CIDR dinormalkan ke alamat jaringan
+    (<code>198.51.100.5/24</code> disimpan sebagai <code>198.51.100.0/24</code>).
+  </p>
+</div>
+
+<div class="card">
+  <h3>{{len .Entries}} entri · <span class="mono">{{.FileName}}</span>
+    {{if .Exists}}<span class="badge ok">ada</span>{{else}}<span class="badge warn">belum dibuat</span>{{end}}
+  </h3>
+
+  {{if not .Exists}}
+    <div class="empty">
+      File belum ada, jadi S3 API tidak diekspos lewat Caddy sama sekali.<br>
+      File akan dibuat otomatis begitu kamu menambahkan IP pertama.
+    </div>
+  {{else if not .Entries}}
+    <div class="notice err" style="margin: 0;">
+      File ada tapi tidak punya entri <code class="mono"># allow:</code> yang valid.
+      Dalam keadaan ini semua operasi tulis akan diblokir. Tambahkan minimal satu IP,
+      atau hapus filenya.
+    </div>
+  {{else}}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>IP / CIDR</th><th>Label</th><th>Aksi</th></tr>
+    </thead>
+    <tbody>
+      {{range .Entries}}
+      <tr>
+        <td class="mono">{{.Value}}</td>
+        <td>{{if .Label}}{{.Label}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>
+          <form method="post" action="/whitelist/delete" style="display:inline"
+                data-confirm="Hapus {{.Value}} dari whitelist S3 API?">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="value" value="{{.Value}}">
+            <button type="submit" class="danger small">Hapus</button>
+          </form>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  <p class="small muted" style="margin-top: 14px;">
+    Entri terakhir tidak bisa dihapus lewat tombol di atas: daftar kosong berarti semua
+    operasi tulis diblokir. Kalau memang S3 API tidak mau diekspos lewat Caddy, hapus filenya.
+  </p>
+  {{end}}
+</div>
+
+{{if .Exists}}
+<div class="card">
+  <h3>Hapus file <span class="mono">{{.FileName}}</span></h3>
+  <p class="small muted">
+    S3 API tidak lagi diekspos lewat Caddy. Garage tetap mendengarkan di
+    <code class="mono">{{.S3Target}}</code> untuk akses lokal dan lewat SSH tunnel.
+  </p>
+  <details class="confirm">
+    <summary>Hapus file ini</summary>
+    <div class="confirm-body">
+      <p class="small muted" style="margin-bottom: 8px;">
+        Ketik <strong>{{.FileName}}</strong> untuk konfirmasi.
+      </p>
+      <form method="post" action="/whitelist/remove-file">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <div class="row" style="gap: 6px;">
+          <input type="text" name="confirm" required autocomplete="off"
+                 spellcheck="false" placeholder="{{.FileName}}">
+          <button type="submit" class="danger small">Hapus &amp; reload</button>
+        </div>
+      </form>
+    </div>
+  </details>
+</div>
+{{end}}
+
+{{end}}
+{{end}}

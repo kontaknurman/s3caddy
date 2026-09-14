@@ -1,0 +1,144 @@
+{{define "content"}}
+
+{{with .SitesWarning}}
+<div class="notice warn">
+  Daftar domain tidak bisa dibaca, jadi kolom “Domain” kosong.
+  <pre>{{.}}</pre>
+</div>
+{{end}}
+
+<div class="card">
+  <h3>Tambah bucket</h3>
+  <p class="muted small">
+    Satu form menjalankan empat langkah berurutan: <code>CreateBucket</code> →
+    <code>CreateKey</code> (<code>&lt;nama&gt;-key</code>) → <code>AllowBucketKey</code> (read + write)
+    → aktifkan website access kalau dicentang. Access key dan secret hanya ditampilkan sekali.
+  </p>
+  <form method="post" action="/buckets/create">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <div class="field">
+        <label for="bucket-name">Nama bucket</label>
+        <input type="text" id="bucket-name" name="name" required
+               placeholder="media-produk" autocomplete="off" spellcheck="false"
+               pattern="[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"
+               title="3-63 karakter: huruf kecil, angka, tanda hubung; tidak diawali/diakhiri tanda hubung">
+      </div>
+      <div class="field" style="flex: 0 1 auto;">
+        <label>&nbsp;</label>
+        <label class="check">
+          <input type="checkbox" name="public"> Public (aktifkan website access, index <code>index.html</code>)
+        </label>
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <label>&nbsp;</label>
+        <button type="submit" class="primary">Buat bucket</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h3>
+    {{len .Buckets}} bucket ·
+    <span class="muted">{{humanBytes .TotalBytes}} · {{.TotalObjects}} objek</span>
+  </h3>
+
+  {{if not .Buckets}}
+    <div class="empty">Belum ada bucket.</div>
+  {{else}}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Nama</th>
+        <th class="num">Ukuran</th>
+        <th class="num">Objek</th>
+        <th>Website</th>
+        <th>Domain</th>
+        <th>Aksi</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Buckets}}
+      <tr>
+        <td>
+          {{if .Name}}
+            <strong>{{.Name}}</strong>
+          {{else}}
+            <span class="muted">(tanpa global alias)</span>
+          {{end}}
+          <div class="kv mono">{{.ID}}</div>
+          {{with .Err}}<div class="kv" style="color: var(--err)">{{.}}</div>{{end}}
+        </td>
+        <td class="num">{{humanBytes .Bytes}}</td>
+        <td class="num">{{.Objects}}</td>
+        <td>
+          {{if .Public}}
+            <span class="badge public">public</span>
+          {{else}}
+            <span class="badge private">private</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Domains}}
+            {{.DomainCount}}
+            <div class="kv">{{commaSep .Domains}}</div>
+          {{else}}
+            <span class="muted">0</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Name}}
+          <div class="row" style="gap: 6px; align-items: center;">
+            <a class="btn small" href="/objects?bucket={{.Name}}">Objek</a>
+
+            <form method="post" action="/buckets/website" style="display:inline">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="bucket" value="{{.Name}}">
+              {{if .Public}}
+                <input type="hidden" name="enable" value="0">
+                <button type="submit" class="small">Jadikan private</button>
+              {{else}}
+                <input type="hidden" name="enable" value="1">
+                <button type="submit" class="small">Jadikan public</button>
+              {{end}}
+            </form>
+
+            <details class="confirm">
+              <summary>Hapus</summary>
+              <div class="confirm-body">
+                {{if .Domains}}
+                  <p class="small" style="color: var(--err); margin-bottom: 8px;">
+                    Bucket ini masih dipakai {{.DomainCount}} domain:
+                    <strong>{{commaSep .Domains}}</strong>.
+                    Hapus domain itu dulu di halaman Domains.
+                  </p>
+                {{else}}
+                  <p class="small muted" style="margin-bottom: 8px;">
+                    Ketik <strong>{{.Name}}</strong> untuk konfirmasi. Bucket harus kosong.
+                  </p>
+                  <form method="post" action="/buckets/delete">
+                    <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                    <input type="hidden" name="bucket" value="{{.Name}}">
+                    <div class="row" style="gap: 6px;">
+                      <input type="text" name="confirm" required autocomplete="off"
+                             spellcheck="false" placeholder="{{.Name}}">
+                      <button type="submit" class="danger small">Hapus permanen</button>
+                    </div>
+                  </form>
+                {{end}}
+              </div>
+            </details>
+          </div>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+</div>
+
+{{end}}

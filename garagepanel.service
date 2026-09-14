@@ -1,0 +1,51 @@
+[Unit]
+Description=Garage + Caddy admin panel
+Documentation=https://garagehq.deuxfleurs.fr/documentation/reference-manual/admin-api/
+After=network-online.target garage.service caddy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=garagepanel
+Group=garagepanel
+ExecStart=/usr/local/bin/garagepanel
+
+# Token dan secret ada di file ini. Harus 0600 dan milik root (dibaca systemd
+# sebelum privilege di-drop), jangan pernah taruh di ExecStart atau di unit ini.
+EnvironmentFile=/etc/garagepanel/garagepanel.env
+
+Restart=on-failure
+RestartSec=5s
+
+# --- hardening ------------------------------------------------------------
+# CATATAN PENTING: NoNewPrivileges HARUS tetap "no". Panel menjalankan
+# "sudo systemctl reload caddy", dan sudo butuh setuid. Kalau baris ini diubah
+# ke "yes", reload akan selalu gagal dengan "sudo: effective uid is not 0".
+# Untuk alasan yang sama JANGAN menambahkan RestrictSUIDSGID=yes.
+NoNewPrivileges=no
+
+ProtectSystem=full
+# /etc read-only karena ProtectSystem=full, jadi direktori sites dibuka lagi:
+ReadWritePaths=/etc/caddy/sites
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# Panel hanya perlu loopback.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Batas wajar: panel menyangga file upload sampai 50 MB di memori.
+LimitNOFILE=4096
+MemoryMax=512M
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=garagepanel
+
+[Install]
+WantedBy=multi-user.target

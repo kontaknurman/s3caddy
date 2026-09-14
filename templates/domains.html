@@ -1,0 +1,123 @@
+{{define "content"}}
+
+{{with .BucketsWarning}}
+<div class="notice warn">
+  Daftar bucket tidak bisa diambil dari Garage, jadi dropdown di bawah kosong.
+  <pre>{{.}}</pre>
+</div>
+{{end}}
+
+<div class="card">
+  <h3>Tambah domain</h3>
+  <p class="muted small">
+    Satu bucket boleh punya banyak domain, tapi satu domain hanya menunjuk ke satu bucket.
+    Panel menulis <code>{{.SitesDir}}/&lt;domain&gt;.caddy</code> yang mem-proxy ke
+    <code>{{.WebTarget}}</code> sambil mengganti header <code>Host</code> menjadi nama bucket,
+    lalu menjalankan <code>systemctl reload caddy</code>. Kalau reload gagal, file dikembalikan
+    seperti semula dan pesan error Caddy ditampilkan di sini.
+  </p>
+  <form method="post" action="/domains/create">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <div class="field">
+        <label for="domain">Domain</label>
+        <input type="text" id="domain" name="domain" required
+               placeholder="cdn.example.com" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="bucket">Bucket tujuan</label>
+        <select id="bucket" name="bucket" required>
+          <option value="" disabled selected>— pilih bucket —</option>
+          {{range .Buckets}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <label>&nbsp;</label>
+        <button type="submit" class="primary">Tambah &amp; reload Caddy</button>
+      </div>
+    </div>
+  </form>
+  <p class="small muted" style="margin-top: 10px;">
+    Pastikan DNS domain sudah mengarah ke server ini sebelum menambah, supaya Caddy bisa
+    menerbitkan sertifikat TLS otomatis.
+  </p>
+</div>
+
+<div class="card">
+  <h3>{{len .Domains}} domain terdaftar</h3>
+  {{if not .Domains}}
+    <div class="empty">Belum ada file domain di <span class="mono">{{.SitesDir}}</span>.</div>
+  {{else}}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Domain</th>
+        <th>Bucket tujuan</th>
+        <th>File Caddy</th>
+        <th>Aksi</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Domains}}
+      <tr>
+        <td>
+          {{if .Managed}}
+            <a href="https://{{.Domain}}/" rel="noreferrer noopener" target="_blank">{{.Domain}}</a>
+          {{else}}
+            {{.Domain}}
+          {{end}}
+        </td>
+        <td>
+          {{if .Managed}}
+            <strong>{{.Bucket}}</strong>
+            {{if .BucketMsg}}<div class="kv" style="color: var(--err)">{{.BucketMsg}}</div>{{end}}
+          {{else}}
+            <span class="muted">—</span>
+          {{end}}
+        </td>
+        <td>
+          {{if .Managed}}
+            <span class="badge ok">ada</span>
+          {{else}}
+            <span class="badge warn">tidak dikelola</span>
+          {{end}}
+          <div class="kv mono">{{.FileName}}</div>
+          {{with .Problem}}<div class="kv" style="color: var(--warn)">{{.}}</div>{{end}}
+        </td>
+        <td>
+          {{if .Managed}}
+          <details class="confirm">
+            <summary>Hapus</summary>
+            <div class="confirm-body">
+              <p class="small muted" style="margin-bottom: 8px;">
+                Ketik <strong>{{.Domain}}</strong> untuk konfirmasi. File dihapus lalu Caddy di-reload.
+              </p>
+              <form method="post" action="/domains/delete">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="domain" value="{{.Domain}}">
+                <div class="row" style="gap: 6px;">
+                  <input type="text" name="confirm" required autocomplete="off"
+                         spellcheck="false" placeholder="{{.Domain}}">
+                  <button type="submit" class="danger small">Hapus &amp; reload</button>
+                </div>
+              </form>
+            </div>
+          </details>
+          {{else}}
+            <span class="muted small">panel tidak menyentuh file ini</span>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  <p class="small muted" style="margin-top: 14px;">
+    Pemetaan domain → bucket dibaca ulang dari baris <code># bucket: &lt;nama&gt;</code> di setiap
+    file setiap kali halaman ini dibuka. Tidak ada database.
+  </p>
+  {{end}}
+</div>
+
+{{end}}

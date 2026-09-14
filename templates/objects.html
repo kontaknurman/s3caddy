@@ -1,0 +1,315 @@
+{{define "content"}}
+
+{{with .BucketsWarning}}
+<div class="notice warn">Daftar bucket tidak bisa diambil dari Garage.<pre>{{.}}</pre></div>
+{{end}}
+
+<div class="card">
+  <form method="get" action="/objects">
+    <div class="row">
+      <div class="field">
+        <label for="bucket">Bucket</label>
+        <select id="bucket" name="bucket" onchange="this.form.submit()">
+          <option value="">— pilih bucket —</option>
+          {{range .Buckets}}
+            <option value="{{.}}" {{if eq . $.Bucket}}selected{{end}}>{{.}}</option>
+          {{end}}
+        </select>
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <label>&nbsp;</label>
+        <button type="submit">Buka</button>
+      </div>
+      {{if .Domain}}
+      <div class="field" style="flex: 1 1 auto;">
+        <label>Domain publik</label>
+        <a href="https://{{.Domain}}/" target="_blank" rel="noreferrer noopener">{{.Domain}}</a>
+      </div>
+      {{end}}
+    </div>
+  </form>
+</div>
+
+{{with .Error}}
+<div class="notice err"><pre>{{.}}</pre></div>
+{{end}}
+
+{{if not .Bucket}}
+  <div class="empty">Pilih bucket di atas untuk melihat isinya.</div>
+{{else if .Error}}
+{{else}}
+
+<div class="card" id="uploader" data-bucket="{{.Bucket}}" data-csrf="{{.CSRF}}">
+  <h3>Upload</h3>
+  <div class="dropzone" id="dropzone">
+    <p style="margin-bottom: 8px;"><strong>Tarik file ke sini</strong> atau
+      <label style="display:inline; color: var(--accent); cursor: pointer; text-decoration: underline;">
+        pilih file<input type="file" id="filepick" multiple hidden>
+      </label>
+    </p>
+    <p class="small" style="margin: 0;">
+      Maksimal {{.MaxUploadH}} per file. Nama objek dibuat dari isi file
+      (<code>sha256(isi)[:16] + ekstensi</code>), jadi file yang sama tidak akan terduplikasi.
+      File disimpan di akar bucket.
+    </p>
+    <p class="small muted" style="margin: 8px 0 0;">Ekstensi yang diizinkan: {{.AllowedExt}}</p>
+  </div>
+  <div id="uplist" style="margin-top: 14px;"></div>
+</div>
+
+<div class="card">
+  <div class="row" style="justify-content: space-between; align-items: center;">
+    <h3 style="margin: 0;">
+      <span class="mono">{{.Bucket}}/{{.Prefix}}</span>
+      <span class="muted">· {{.Count}} objek di halaman ini</span>
+    </h3>
+    {{if .HasParent}}
+      <a class="btn small" href="/objects?bucket={{.Bucket}}&amp;prefix={{.ParentPrefix}}">↑ Naik satu level</a>
+    {{end}}
+  </div>
+
+  {{if .Empty}}
+    <div class="empty">Bucket ini kosong.</div>
+  {{end}}
+
+  {{if .Folders}}
+  <h2>Folder</h2>
+  <div class="row" style="gap: 8px;">
+    {{range .Folders}}
+      <a class="btn small" href="/objects?bucket={{$.Bucket}}&amp;prefix={{.}}">📁 {{.}}</a>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{if .Images}}
+  <h2>Gambar ({{len .Images}})</h2>
+  <div class="grid">
+    {{range .Images}}
+    <div class="tile">
+      <a href="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}" target="_blank" rel="noreferrer noopener">
+        <img class="thumb" loading="lazy" decoding="async"
+             src="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}" alt="{{.Name}}">
+      </a>
+      <div class="meta">
+        <div class="name mono">{{.Name}}</div>
+        <div class="muted">{{humanBytes .Size}} · {{humanTime .Modified}}</div>
+      </div>
+      <div class="actions">
+        {{if .PublicURL}}
+          <button type="button" class="small" data-copy="{{.PublicURL}}">Copy URL</button>
+        {{else}}
+          <button type="button" class="small" disabled title="Bucket ini belum punya domain">Copy URL</button>
+        {{end}}
+        <form method="post" action="/objects/delete" style="display:inline"
+              data-confirm="Hapus {{.Key}} dari {{$.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="bucket" value="{{$.Bucket}}">
+          <input type="hidden" name="prefix" value="{{$.Prefix}}">
+          <input type="hidden" name="key" value="{{.Key}}">
+          <button type="submit" class="danger small">Hapus</button>
+        </form>
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+
+  {{if .Others}}
+  <h2>File lain ({{len .Others}})</h2>
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Nama</th>
+        <th class="num">Ukuran</th>
+        <th>Diubah</th>
+        <th>Aksi</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Others}}
+      <tr>
+        <td class="mono" style="word-break: break-all;">
+          <a href="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}">{{.Name}}</a>
+        </td>
+        <td class="num">{{humanBytes .Size}}</td>
+        <td>{{humanTime .Modified}}</td>
+        <td>
+          <div class="row" style="gap: 6px; align-items: center;">
+            {{if .PublicURL}}
+              <button type="button" class="small" data-copy="{{.PublicURL}}">Copy URL</button>
+            {{else}}
+              <button type="button" class="small" disabled title="Bucket ini belum punya domain">Copy URL</button>
+            {{end}}
+            <form method="post" action="/objects/delete" style="display:inline"
+                  data-confirm="Hapus {{.Key}} dari {{$.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="bucket" value="{{$.Bucket}}">
+              <input type="hidden" name="prefix" value="{{$.Prefix}}">
+              <input type="hidden" name="key" value="{{.Key}}">
+              <button type="submit" class="danger small">Hapus</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+
+  <div class="pager">
+    {{if .IsTruncated}}
+      <a class="btn" href="/objects?bucket={{.Bucket}}&amp;prefix={{.Prefix}}&amp;token={{.NextToken}}">Halaman berikutnya →</a>
+    {{end}}
+    <a class="btn" href="/objects?bucket={{.Bucket}}&amp;prefix={{.Prefix}}">Halaman pertama</a>
+    <span class="muted small">100 objek per halaman. Gunakan tombol back browser untuk mundur.</span>
+  </div>
+</div>
+
+<script>
+(function () {
+  var root = document.getElementById('uploader');
+  if (!root) { return; }
+  var bucket = root.getAttribute('data-bucket');
+  var csrf = root.getAttribute('data-csrf');
+  var zone = document.getElementById('dropzone');
+  var picker = document.getElementById('filepick');
+  var list = document.getElementById('uplist');
+  var queue = [];
+  var busy = false;
+
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    zone.addEventListener(ev, function (e) {
+      e.preventDefault(); e.stopPropagation(); zone.classList.add('over');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    zone.addEventListener(ev, function (e) {
+      e.preventDefault(); e.stopPropagation(); zone.classList.remove('over');
+    });
+  });
+  zone.addEventListener('drop', function (e) {
+    if (e.dataTransfer && e.dataTransfer.files) { enqueue(e.dataTransfer.files); }
+  });
+  picker.addEventListener('change', function () {
+    enqueue(picker.files);
+    picker.value = '';
+  });
+
+  function enqueue(files) {
+    for (var i = 0; i < files.length; i++) { queue.push(makeRow(files[i])); }
+    pump();
+  }
+
+  function makeRow(file) {
+    var row = document.createElement('div');
+    row.className = 'uprow';
+    var name = document.createElement('div');
+    name.className = 'name mono';
+    name.textContent = file.name + ' · ' + formatSize(file.size);
+    var status = document.createElement('div');
+    status.className = 'small muted';
+    status.textContent = 'menunggu…';
+    var bar = document.createElement('div');
+    bar.className = 'progress';
+    var fill = document.createElement('div');
+    bar.appendChild(fill);
+    row.appendChild(name);
+    row.appendChild(status);
+    row.appendChild(bar);
+    list.insertBefore(row, list.firstChild);
+    return { file: file, row: row, status: status, fill: fill, bar: bar };
+  }
+
+  function formatSize(n) {
+    if (n < 1024) { return n + ' B'; }
+    var units = ['KiB', 'MiB', 'GiB'];
+    var i = -1;
+    do { n = n / 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return n.toFixed(1) + ' ' + units[i];
+  }
+
+  function pump() {
+    if (busy) { return; }
+    var item = queue.shift();
+    if (!item) { return; }
+    busy = true;
+    send(item, function () { busy = false; pump(); });
+  }
+
+  function send(item, done) {
+    var data = new FormData();
+    data.append('bucket', bucket);
+    data.append('file', item.file);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload');
+    xhr.setRequestHeader('X-CSRF-Token', csrf);
+    xhr.upload.addEventListener('progress', function (e) {
+      if (e.lengthComputable) {
+        var pct = Math.round((e.loaded / e.total) * 100);
+        item.fill.style.width = pct + '%';
+        item.status.textContent = 'mengunggah ' + pct + '%';
+      }
+    });
+    xhr.addEventListener('load', function () {
+      var res = null;
+      try { res = JSON.parse(xhr.responseText); } catch (e) { /* handled below */ }
+      if (!res) {
+        fail(item, 'jawaban server tidak bisa dibaca (HTTP ' + xhr.status + ')');
+      } else if (!res.ok) {
+        fail(item, res.error || ('HTTP ' + xhr.status));
+      } else {
+        succeed(item, res);
+      }
+      done();
+    });
+    xhr.addEventListener('error', function () {
+      fail(item, 'koneksi ke panel terputus');
+      done();
+    });
+    xhr.send(data);
+  }
+
+  function fail(item, msg) {
+    item.fill.style.width = '100%';
+    item.fill.style.background = 'var(--err)';
+    item.status.style.color = 'var(--err)';
+    item.status.textContent = 'gagal: ' + msg;
+  }
+
+  function succeed(item, res) {
+    item.fill.style.width = '100%';
+    item.fill.style.background = 'var(--ok)';
+    item.status.style.color = 'var(--ok)';
+    item.status.textContent = res.deduped
+      ? 'sudah ada di bucket (isi identik) → ' + res.key
+      : 'selesai → ' + res.key;
+
+    var box = document.createElement('div');
+    box.className = 'urlbox';
+    var url = document.createElement('span');
+    url.className = 'u mono';
+    var target = res.publicUrl || res.preview;
+    url.textContent = target;
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'small';
+    btn.textContent = 'Copy';
+    btn.setAttribute('data-copy', target);
+    box.appendChild(url);
+    box.appendChild(btn);
+    if (!res.publicUrl) {
+      var note = document.createElement('span');
+      note.className = 'small muted';
+      note.textContent = 'bucket belum punya domain — ini URL preview panel';
+      box.appendChild(note);
+    }
+    item.row.appendChild(box);
+  }
+})();
+</script>
+
+{{end}}
+{{end}}

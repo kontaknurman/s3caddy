@@ -1,0 +1,71 @@
+{{define "content"}}
+
+{{if .AllOK}}
+<div class="flash ok"><pre>Bucket {{.Bucket}} berhasil dibuat.</pre></div>
+{{else}}
+<div class="flash error"><pre>Bucket {{.Bucket}} dibuat, tapi ada langkah yang gagal. Lihat rincian di bawah — perbaiki manual lewat CLI Garage atau hapus bucket lalu ulangi.</pre></div>
+{{end}}
+
+<div class="card">
+  <h3>Langkah yang dijalankan</h3>
+  <ul class="steps">
+    {{range .Steps}}
+    <li>
+      {{if .OK}}<span class="mark ok">✓</span>{{else}}<span class="mark bad">✗</span>{{end}}
+      {{.Name}}
+      {{with .Err}}<div class="kv" style="color: var(--err); margin-left: 20px;">{{.}}</div>{{end}}
+    </li>
+    {{end}}
+  </ul>
+  <p class="kv" style="margin-top: 12px;">Bucket ID: <span class="mono">{{.BucketID}}</span></p>
+</div>
+
+{{if .SecretKey}}
+<div class="card" style="border-color: rgba(224,179,65,.5);">
+  <h3>⚠ Secret key ditampilkan sekali saja</h3>
+  <p class="small">
+    Garage tidak akan pernah menunjukkan secret key ini lagi. Salin sekarang dan simpan di
+    tempat aman. Kalau hilang, satu-satunya jalan adalah membuat key baru.
+    <strong>Jangan refresh halaman ini.</strong>
+  </p>
+  <div class="creds">
+    <div class="pair">
+      <span class="key">Access Key ID</span>
+      <span class="val mono">{{.AccessKey}}</span>
+      <button type="button" class="small" data-copy="{{.AccessKey}}">Copy</button>
+    </div>
+    <div class="pair">
+      <span class="key">Secret Access Key</span>
+      <span class="val mono">{{.SecretKey}}</span>
+      <button type="button" class="small" data-copy="{{.SecretKey}}">Copy</button>
+    </div>
+    <div class="pair">
+      <span class="key">Endpoint</span>
+      <span class="val mono">{{.S3URL}}</span>
+      <button type="button" class="small" data-copy="{{.S3URL}}">Copy</button>
+    </div>
+    <div class="pair">
+      <span class="key">Region</span>
+      <span class="val mono">{{.Region}}</span>
+      <button type="button" class="small" data-copy="{{.Region}}">Copy</button>
+    </div>
+  </div>
+  <p class="small muted" style="margin-top: 12px;">
+    Key ini punya izin <strong>read + write</strong> pada bucket <strong>{{.Bucket}}</strong> saja.
+  </p>
+</div>
+{{else}}
+<div class="notice err">
+  Access key tidak berhasil dibuat, jadi tidak ada kredensial untuk ditampilkan.
+  Buat key-nya manual: <code class="mono">garage key create {{.Bucket}}-key</code> lalu
+  <code class="mono">garage bucket allow --read --write {{.Bucket}} --key {{.Bucket}}-key</code>.
+</div>
+{{end}}
+
+<div class="row">
+  <a class="btn" href="/buckets">Kembali ke daftar bucket</a>
+  <a class="btn" href="/objects?bucket={{.Bucket}}">Buka browser objek</a>
+  <a class="btn" href="/domains">Pasang domain untuk bucket ini</a>
+</div>
+
+{{end}}
