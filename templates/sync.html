@@ -11,74 +11,131 @@
 <div class="notice warn">Daftar bucket tidak bisa diambil dari Garage.<pre>{{.}}</pre></div>
 {{end}}
 
-<div class="card">
-  <div class="row" style="justify-content: space-between; align-items: center;">
-    <h3 style="margin: 0;">Remote S3</h3>
-    <span class="muted small">rclone v{{.RcloneVersion}} · kredensial disimpan di <span class="mono">{{.StateDir}}/remotes.json</span> (0600)</span>
+<div class="sync-strip">
+  <div><span class="k">Mesin transfer</span><span class="mono">rclone v{{.RcloneVersion}}</span></div>
+  <div><span class="k">Remote</span>{{len .Remotes}}</div>
+  <div><span class="k">Jadwal</span>{{len .Schedules}}</div>
+  <div><span class="k">Job berjalan</span>{{.ActiveCount}}</div>
+  <div><span class="k">State</span><span class="mono">{{.StateDir}}</span></div>
+  <div class="strip-nav"><a href="#remotes">Remote</a> · <a href="#new-job">Job baru</a> · <a href="#schedules">Jadwal</a> · <a href="#jobs">Job</a></div>
+</div>
+
+{{/* ---------------------------------------------------------------- remote */}}
+<div class="card" id="remotes">
+  <div class="card-head">
+    <div>
+      <h3>Remote S3</h3>
+      <p class="muted small">Layanan S3 lain yang jadi sumber impor atau tujuan ekspor. Kredensialnya disimpan di <span class="mono">{{.StateDir}}/remotes.json</span> (mode 0600) dan tidak pernah ditampilkan lagi.</p>
+    </div>
+    <a class="btn" href="#remote-add" data-open="remote-add">+ Tambah remote</a>
   </div>
 
   {{if .Remotes}}
-  <div class="table-wrap" style="margin-top: 12px;">
-  <table>
-    <thead>
-      <tr><th>Nama</th><th>Provider</th><th>Endpoint</th><th>Region</th><th>Access key</th><th>Aksi</th></tr>
-    </thead>
-    <tbody>
-      {{range .Remotes}}
-      <tr>
-        <td class="mono">{{.Name}}</td>
-        <td>{{.Provider}}</td>
-        <td class="mono">{{.Endpoint}} {{if .Insecure}}<span class="badge warn" title="Isi objek lewat jaringan tanpa enkripsi">tanpa TLS</span>{{end}}</td>
-        <td class="mono">{{.Region}}</td>
-        <td class="mono">{{.AccessKeyMasked}}</td>
-        <td>
-          <div class="row" style="gap: 6px; align-items: center;">
-            <form method="post" action="/sync/remotes/test" class="row" style="gap: 6px; align-items: center;">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="name" value="{{.Name}}">
-              <input type="text" name="bucket" placeholder="nama bucket" style="width: 160px;" required>
-              <button type="submit" class="small">Tes koneksi</button>
-            </form>
-            <form method="post" action="/sync/remotes/delete" data-confirm="Hapus remote {{.Name}}? Kredensialnya akan dihapus dari remotes.json.">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="name" value="{{.Name}}">
-              <button type="submit" class="danger small">Hapus</button>
-            </form>
-          </div>
-        </td>
-      </tr>
-      {{end}}
-    </tbody>
-  </table>
+  <div class="remote-grid">
+    {{range $r := .Remotes}}
+    <div class="remote-card" id="remote-{{$r.Name}}">
+      <div class="remote-head">
+        <div>
+          <div class="remote-name mono">{{$r.Name}}</div>
+          <div class="small muted">{{$r.ProviderLabel}}</div>
+        </div>
+        {{if $r.Insecure}}<span class="badge warn" title="Isi objek lewat jaringan tanpa enkripsi">tanpa TLS</span>{{end}}
+      </div>
+      <dl class="kv">
+        <dt>Endpoint</dt><dd class="mono">{{$r.Endpoint}}</dd>
+        <dt>Region</dt><dd class="mono">{{$r.Region}}</dd>
+        <dt>Access key</dt><dd class="mono">{{$r.AccessKeyMasked}}</dd>
+        <dt>Gaya alamat</dt><dd>{{$r.AddressingLabel}}{{if eq $r.Addressing "auto"}} <span class="muted">· otomatis</span>{{end}}</dd>
+      </dl>
+
+      <form method="post" action="/sync/remotes/test" class="remote-test">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="name" value="{{$r.Name}}">
+        <input type="text" name="bucket" placeholder="nama bucket di remote" aria-label="Nama bucket untuk tes" required>
+        <select name="write" aria-label="Jenis tes">
+          <option value="1">baca + tulis objek uji</option>
+          <option value="0">hanya baca</option>
+        </select>
+        <button type="submit" class="small">Tes koneksi</button>
+      </form>
+
+      <div class="remote-actions">
+        <details class="editor">
+          <summary><span class="btn small">Edit</span></summary>
+          <form method="post" action="/sync/remotes/update" class="editor-body" data-remote-form>
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="name" value="{{$r.Name}}">
+            <div class="field">
+              <label for="e-provider-{{$r.Name}}">Provider</label>
+              <select id="e-provider-{{$r.Name}}" name="provider">
+                {{range $.Providers}}<option value="{{.Name}}" data-endpoint="{{.Endpoint}}" data-region="{{.Region}}" data-note="{{.Note}}" data-virtual="{{if .Virtual}}1{{else}}0{{end}}"{{if eq .Name $r.Provider}} selected{{end}}>{{.Label}}</option>{{end}}
+              </select>
+            </div>
+            <div class="field">
+              <label for="e-endpoint-{{$r.Name}}">Endpoint</label>
+              <input type="text" id="e-endpoint-{{$r.Name}}" name="endpoint" value="{{$r.Endpoint}}" required>
+            </div>
+            <div class="field">
+              <label for="e-region-{{$r.Name}}">Region</label>
+              <input type="text" id="e-region-{{$r.Name}}" name="region" value="{{$r.Region}}" required>
+            </div>
+            <div class="field">
+              <label for="e-ak-{{$r.Name}}">Access key <span class="muted">(kosongkan = tetap {{$r.AccessKeyMasked}})</span></label>
+              <input type="text" id="e-ak-{{$r.Name}}" name="access_key" autocomplete="off" placeholder="{{$r.AccessKeyMasked}}">
+            </div>
+            <div class="field">
+              <label for="e-sk-{{$r.Name}}">Secret key <span class="muted">(kosongkan = tetap)</span></label>
+              <input type="password" id="e-sk-{{$r.Name}}" name="secret_key" autocomplete="new-password" placeholder="••••••••">
+            </div>
+            <div class="field">
+              <label for="e-addr-{{$r.Name}}">Gaya alamat <span class="muted">(bawaan provider ini: <span data-addr-default></span>)</span></label>
+              <select id="e-addr-{{$r.Name}}" name="addressing">
+                <option value="auto"{{if eq $r.Addressing "auto"}} selected{{end}}>Otomatis — coba bawaan provider, ganti kalau ditolak</option>
+                <option value="path"{{if eq $r.Addressing "path"}} selected{{end}}>Path-style — https://host/bucket/key</option>
+                <option value="virtual"{{if eq $r.Addressing "virtual"}} selected{{end}}>Virtual-host — https://bucket.host/key</option>
+              </select>
+            </div>
+            <p class="small muted" data-note></p>
+            <button type="submit" class="primary small">Simpan perubahan</button>
+          </form>
+        </details>
+        <form method="post" action="/sync/remotes/delete" data-confirm="Hapus remote {{$r.Name}}? Kredensialnya akan dihapus dari remotes.json.">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="name" value="{{$r.Name}}">
+          <button type="submit" class="danger small">Hapus</button>
+        </form>
+      </div>
+    </div>
+    {{end}}
   </div>
   {{else}}
-  <p class="muted" style="margin-top: 10px;">Belum ada remote. Tambahkan dulu Wasabi, AWS, MinIO, atau Garage lain di bawah.</p>
+  <div class="empty-hint">Belum ada remote. Tambahkan Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, atau layanan S3 lain di bawah, lalu klik <strong>Tes koneksi</strong> dengan nama bucket-nya.</div>
   {{end}}
 
-  <details style="margin-top: 14px;">
-    <summary style="cursor: pointer; color: var(--accent);">Tambah remote</summary>
-    <form method="post" action="/sync/remotes/add" style="margin-top: 12px;">
+  <details id="remote-add" class="panel-details">
+    <summary>Tambah remote</summary>
+    <form method="post" action="/sync/remotes/add" data-remote-form data-fill>
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <div class="row">
-        <div class="field">
-          <label for="r-name">Nama (huruf kecil, angka, tanda hubung)</label>
-          <input type="text" id="r-name" name="name" placeholder="wasabi-sg" required pattern="[a-z0-9][a-z0-9-]{0,31}">
-        </div>
-        <div class="field" style="flex: 0 0 160px;">
+        <div class="field" style="flex: 0 0 220px;">
           <label for="r-provider">Provider</label>
           <select id="r-provider" name="provider">
-            {{range .Providers}}<option value="{{.}}">{{.}}</option>{{end}}
+            {{range .Providers}}<option value="{{.Name}}" data-endpoint="{{.Endpoint}}" data-region="{{.Region}}" data-note="{{.Note}}" data-virtual="{{if .Virtual}}1{{else}}0{{end}}">{{.Label}}</option>{{end}}
           </select>
+        </div>
+        <div class="field">
+          <label for="r-name">Nama remote (huruf kecil, angka, tanda hubung)</label>
+          <input type="text" id="r-name" name="name" placeholder="wasabi-sg" required pattern="[a-z0-9][a-z0-9\-]{0,31}">
         </div>
       </div>
       <div class="row" style="margin-top: 12px;">
         <div class="field">
           <label for="r-endpoint">Endpoint (skema + host saja)</label>
-          <input type="text" id="r-endpoint" name="endpoint" placeholder="https://s3.ap-southeast-1.wasabisys.com" required>
+          <input type="text" id="r-endpoint" name="endpoint" required>
         </div>
         <div class="field" style="flex: 0 0 200px;">
           <label for="r-region">Region (untuk tanda tangan)</label>
-          <input type="text" id="r-region" name="region" placeholder="ap-southeast-1" required>
+          <input type="text" id="r-region" name="region" required>
         </div>
       </div>
       <div class="row" style="margin-top: 12px;">
@@ -88,122 +145,175 @@
         </div>
         <div class="field">
           <label for="r-sk">Secret key</label>
-          <input type="password" id="r-sk" name="secret_key" autocomplete="off" required>
+          <input type="password" id="r-sk" name="secret_key" autocomplete="new-password" required>
         </div>
-        <div class="field" style="flex: 0 0 auto;">
-          <label>&nbsp;</label>
-          <button type="submit" class="primary">Simpan remote</button>
+        <div class="field" style="flex: 0 0 300px;">
+          <label for="r-addr">Gaya alamat <span class="muted">(bawaan: <span data-addr-default></span>)</span></label>
+          <select id="r-addr" name="addressing">
+            <option value="auto">Otomatis — coba bawaan provider, ganti kalau ditolak</option>
+            <option value="path">Path-style — https://host/bucket/key</option>
+            <option value="virtual">Virtual-host — https://bucket.host/key</option>
+          </select>
         </div>
       </div>
-      <p class="small muted" style="margin: 10px 0 0;">
-        Wasabi: <span class="mono">us-east-1</span> → <span class="mono">https://s3.wasabisys.com</span>; region lain →
-        <span class="mono">https://s3.&lt;region&gt;.wasabisys.com</span> (contoh <span class="mono">ap-southeast-1</span>, <span class="mono">eu-central-1</span>).
-        AWS: <span class="mono">https://s3.&lt;region&gt;.amazonaws.com</span>. MinIO/Garage lain: alamat servernya, provider <span class="mono">Minio</span>/<span class="mono">Other</span>.
-        Region harus cocok dengan endpoint, kalau tidak tanda tangan ditolak.
-      </p>
+      <p class="small muted" style="margin: 10px 0 0;" data-note></p>
+      <p class="small muted" style="margin: 6px 0 12px;">Region harus cocok dengan endpoint, kalau tidak tanda tangan ditolak. Setelah disimpan, jalankan <strong>Tes koneksi</strong> dengan nama bucket: panel membaca bucket, menulis lalu menghapus satu objek uji, dan mengganti gaya alamat otomatis kalau provider hanya menerima salah satu.</p>
+      <button type="submit" class="primary">Simpan remote</button>
     </form>
   </details>
 </div>
 
-<div class="card">
-  <h3>Job baru: impor atau ekspor bucket</h3>
+{{/* -------------------------------------------------------------- job baru */}}
+<div class="card" id="new-job">
+  <div class="card-head">
+    <div>
+      <h3>Impor / ekspor bucket</h3>
+      <p class="muted small">Salin isi satu bucket (atau satu folder di dalamnya) dari remote ke Garage atau sebaliknya. Objek di tujuan tidak pernah dihapus.</p>
+    </div>
+  </div>
   {{if not .Remotes}}
-    <p class="muted">Tambah remote dulu di atas.</p>
+    <div class="empty-hint">Tambah remote dulu di atas; setelah itu form job muncul di sini.</div>
   {{else}}
-  <form method="post" action="/sync/jobs/create">
+  <form method="post" action="/sync/jobs/create" id="job-form">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
-    <div class="row">
-      <div class="field" style="flex: 0 0 auto;">
-        <label>Arah</label>
-        <label class="check"><input type="radio" name="direction" value="import" checked> Impor: remote → Garage</label>
-        <label class="check"><input type="radio" name="direction" value="export"> Ekspor: Garage → remote</label>
-      </div>
+
+    <div class="seg" role="radiogroup" aria-label="Arah">
+      <label class="seg-opt"><input type="radio" name="direction" value="import" checked><span>Impor<small>remote → Garage</small></span></label>
+      <label class="seg-opt"><input type="radio" name="direction" value="export"><span>Ekspor<small>Garage → remote</small></span></label>
     </div>
-    <div class="row" style="margin-top: 12px;">
-      <div class="field" style="flex: 0 0 180px;">
-        <label for="j-remote">Remote</label>
-        <select id="j-remote" name="remote">
-          {{range .Remotes}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
-        </select>
-      </div>
-      <div class="field">
-        <label for="j-rbucket">Bucket di remote</label>
-        <input type="text" id="j-rbucket" name="remote_bucket" placeholder="backup-2026" required>
-      </div>
-      <div class="field">
-        <label for="j-rprefix">Prefix di remote (opsional, akhiri dengan /)</label>
-        <input type="text" id="j-rprefix" name="remote_prefix" placeholder="foto/2026/">
-      </div>
+
+    <div class="flow">
+      <fieldset data-side="remote">
+        <legend><b data-role="remote">Sumber</b> · remote S3</legend>
+        <div class="field">
+          <label for="j-remote">Remote</label>
+          <select id="j-remote" name="remote">
+            {{range .Remotes}}<option value="{{.Name}}">{{.Name}} — {{.ProviderLabel}}</option>{{end}}
+          </select>
+        </div>
+        <div class="field">
+          <label for="j-rbucket">Bucket di remote</label>
+          <input type="text" id="j-rbucket" name="remote_bucket" placeholder="backup-2026" required>
+        </div>
+        <div class="field">
+          <label for="j-rprefix">Folder di remote (opsional)</label>
+          <input type="text" id="j-rprefix" name="remote_prefix" placeholder="foto/2026/">
+        </div>
+      </fieldset>
+      <div class="flow-arrow" aria-hidden="true">→</div>
+      <fieldset data-side="garage">
+        <legend><b data-role="garage">Tujuan</b> · Garage</legend>
+        <div class="field">
+          <label for="j-gbucket">Bucket di Garage</label>
+          <select id="j-gbucket" name="garage_bucket" required>
+            <option value="">— pilih —</option>
+            {{range .Buckets}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </div>
+        <div class="field">
+          <label for="j-gprefix">Folder di Garage (opsional)</label>
+          <input type="text" id="j-gprefix" name="garage_prefix" placeholder="arsip/">
+        </div>
+      </fieldset>
     </div>
-    <div class="row" style="margin-top: 12px;">
-      <div class="field" style="flex: 0 0 180px;">
-        <label for="j-gbucket">Bucket di Garage</label>
-        <select id="j-gbucket" name="garage_bucket" required>
-          <option value="">— pilih —</option>
-          {{range .Buckets}}<option value="{{.}}">{{.}}</option>{{end}}
-        </select>
-      </div>
-      <div class="field">
-        <label for="j-gprefix">Prefix di Garage (opsional, akhiri dengan /)</label>
-        <input type="text" id="j-gprefix" name="garage_prefix" placeholder="arsip/">
-      </div>
-      <div class="field" style="flex: 0 0 140px;">
-        <label for="j-transfers">Transfer paralel (1–{{.MaxTransfers}})</label>
-        <input type="text" id="j-transfers" name="transfers" value="4" inputmode="numeric">
-      </div>
-    </div>
-    <div class="field" style="margin-top: 12px;">
+
+    <div class="field">
       <label>Objek yang sudah ada di tujuan</label>
-      <label class="check"><input type="radio" name="mode" value="skip-existing" checked> <strong>Lewati</strong>&nbsp;— hanya salin yang belum ada (update saja)</label>
-      <label class="check"><input type="radio" name="mode" value="update-if-different"> <strong>Perbarui kalau beda</strong>&nbsp;— salin yang belum ada atau ukurannya beda</label>
-      <label class="check"><input type="radio" name="mode" value="overwrite"> <strong>Timpa semua</strong>&nbsp;— salin semua objek tanpa memeriksa tujuan</label>
+      <div class="choices">
+        <label class="choice"><input type="radio" name="mode" value="skip-existing" checked><span><strong>Lewati</strong><small>Hanya salin yang belum ada di tujuan (update saja). Paling hemat dan aman diulang.</small></span></label>
+        <label class="choice"><input type="radio" name="mode" value="update-if-different"><span><strong>Perbarui kalau beda</strong><small>Salin yang belum ada atau yang ukurannya beda dengan sumber.</small></span></label>
+        <label class="choice"><input type="radio" name="mode" value="overwrite"><span><strong>Timpa semua</strong><small>Salin semua objek tanpa memeriksa tujuan. Paling boros request.</small></span></label>
+      </div>
     </div>
-    <div class="row" style="margin-top: 12px; align-items: center;">
-      <button type="submit" class="primary">Mulai job</button>
-      <span class="small muted">Job jalan di server, per {{.ChunkKeys}} objek dicatat checkpoint. Tab boleh ditutup; setelah restart panel job lanjut sendiri. Objek di tujuan tidak pernah dihapus.</span>
+
+    <div class="row">
+      <div class="field" style="flex: 0 0 190px;">
+        <label for="j-transfers">Transfer paralel (1–{{.MaxTransfers}})</label>
+        <input type="number" id="j-transfers" name="transfers" value="4" min="1" max="{{.MaxTransfers}}" required>
+      </div>
+      <p class="small muted" style="flex: 1 1 280px; margin: 0 0 6px;">Tiap transfer memakai ±16 MiB buffer. Naikkan pelan-pelan; kalau provider melempar <span class="mono">SlowDown</span>/429, turunkan lagi.</p>
+    </div>
+
+    <div class="run-options">
+      <div class="run-now">
+        <button type="submit" class="primary">Mulai job sekarang</button>
+        <span class="small muted">Job jalan di server, checkpoint tiap {{.ChunkKeys}} objek. Tab boleh ditutup; setelah restart panel job lanjut sendiri. Kedua sisi diperiksa dulu (termasuk uji tulis di tujuan) sebelum transfer dimulai.</span>
+      </div>
+      <details class="sched-opt">
+        <summary>…atau jalankan berulang sesuai jadwal</summary>
+        <div class="row">
+          <div class="field" style="flex: 0 0 180px;">
+            <label for="s-every">Setiap</label>
+            <input type="text" id="s-every" name="every" list="every-presets" placeholder="6h" autocomplete="off">
+            <datalist id="every-presets">
+              <option value="30m">30 menit</option>
+              <option value="1h">1 jam</option>
+              <option value="6h">6 jam</option>
+              <option value="12h">12 jam</option>
+              <option value="1d">1 hari</option>
+              <option value="7d">7 hari</option>
+            </datalist>
+          </div>
+          <div class="field" style="flex: 0 0 240px;">
+            <label for="s-first">Run pertama (opsional)</label>
+            <input type="datetime-local" id="s-first" name="first_run">
+          </div>
+          <div class="field" style="flex: 0 0 auto;">
+            <label>&nbsp;</label>
+            <button type="submit" formaction="/sync/schedules/create">Simpan jadwal</button>
+          </div>
+        </div>
+        <p class="small muted" style="margin: 8px 0 0;">Tulis <span class="mono">30m</span>, <span class="mono">6h</span>, atau <span class="mono">2d</span> (minimal 15 menit, maksimal 30 hari). Tanpa run pertama, run pertama = sekarang + interval. Tiap run membuat job dengan setelan di atas; kalau bucket-nya masih dipakai job lain, run itu dilewati. Run yang terlewat saat panel mati tidak dirapel.</p>
+      </details>
     </div>
   </form>
   {{end}}
 </div>
 
-<div class="card" id="jobs" data-active="{{if .HasActive}}1{{else}}0{{end}}">
-  <h3>Job</h3>
-  {{if not .Jobs}}
-    <div class="empty">Belum ada job.</div>
+{{/* ---------------------------------------------------------------- jadwal */}}
+<div class="card" id="schedules">
+  <div class="card-head">
+    <div>
+      <h3>Jadwal</h3>
+      <p class="muted small">Job impor/ekspor yang dijalankan berulang. Mode "Lewati" membuat tiap run hanya menyalin objek baru.</p>
+    </div>
+  </div>
+  {{if not .Schedules}}
+    <div class="empty-hint">Belum ada jadwal. Isi form job di atas, buka "jalankan berulang sesuai jadwal", lalu klik <strong>Simpan jadwal</strong>.</div>
   {{else}}
   <div class="table-wrap">
-  <table>
+  <table class="sched-table">
     <thead>
-      <tr><th>Job</th><th>Sumber → Tujuan</th><th>Status</th><th>Progres</th><th>Aksi</th></tr>
+      <tr><th>Jadwal</th><th>Interval</th><th>Run berikutnya</th><th>Run terakhir</th><th>Aksi</th></tr>
     </thead>
     <tbody>
-      {{range .Jobs}}
-      <tr data-job="{{.ID}}" data-status="{{.Status}}">
+      {{range .Schedules}}
+      <tr data-schedule="{{.ID}}">
         <td>
-          <div><strong>{{.Direction}}</strong> <span class="muted small mono">{{.ID}}</span></div>
-          <div class="small muted">mulai {{.StartedH}}{{if .FinishedH}} · selesai {{.FinishedH}}{{end}} · run ke-{{.Runs}}</div>
-          {{if eq .Kind "sync"}}<div class="small muted">mode {{.Mode}} · {{.Transfers}} transfer paralel</div>{{end}}
+          <div><strong>{{.Direction}}</strong> <span class="mono small muted">{{.ID}}</span></div>
+          <div class="mono small">{{.SrcLabel}} → {{.DstLabel}}</div>
+          <div class="small muted">mode {{.Spec.Mode}} · {{.Spec.Transfers}} transfer paralel · dibuat {{humanTime .CreatedAt}}</div>
         </td>
-        <td class="mono small">{{.SrcLabel}}{{if .DstLabel}}<br>→ {{.DstLabel}}{{end}}</td>
+        <td>{{.EveryH}}</td>
         <td>
-          <span class="badge {{if .Active}}warn{{else if eq .Status "done"}}ok{{else}}bad{{end}}" data-field="statusLabel">{{.StatusLabel}}</span>
-          <div class="small muted">diperbarui <span data-field="updatedH">{{.UpdatedH}}</span></div>
+          {{if .Enabled}}{{.NextRunH}}{{if .Overdue}} <span class="badge warn" title="Sudah waktunya; dijalankan pada pemeriksaan berikutnya (≤ 30 detik)">segera</span>{{end}}
+          {{else}}<span class="badge private">dijeda</span>{{end}}
         </td>
         <td class="small">
-          <div>diperiksa <strong data-field="listed">{{.Counters.Listed}}</strong> · ditransfer <strong data-field="transferred">{{.Counters.Transferred}}</strong> · dilewati <strong data-field="skipped">{{.Counters.Skipped}}</strong> · gagal <strong data-field="failed">{{.Counters.Failed}}</strong></div>
-          <div class="muted"><span data-field="bytesH">{{.BytesH}}</span> <span data-field="speedH">{{.SpeedH}}</span> · chunk <span data-field="chunks">{{.Counters.Chunks}}</span> · checkpoint <span class="mono" data-field="checkpoint">{{if .Checkpoint}}{{.Checkpoint}}{{else}}—{{end}}</span></div>
-          {{if .Counters.Failed}}<div><a href="/sync/jobs/failed?id={{.ID}}">lihat key yang gagal</a></div>{{end}}
-          {{with .PauseReason}}<pre class="small" style="white-space: pre-wrap; margin: 6px 0 0; color: var(--warn);">{{.}}</pre>{{end}}
-          {{with .ErrorShort}}<pre class="small" style="white-space: pre-wrap; margin: 6px 0 0; color: var(--err);">{{.}}</pre>{{end}}
-          {{if .LastLogText}}<details class="small"><summary style="cursor: pointer;">log rclone terakhir</summary><pre style="white-space: pre-wrap;">{{.LastLogText}}</pre></details>{{end}}
+          {{with .LastRun}}
+            <div>{{humanTime .At}}</div>
+            <div class="{{if .OK}}ok-text{{else}}warn-text{{end}}">{{if .JobID}}<a href="#job-{{.JobID}}">{{.Result}}</a>{{else}}{{.Result}}{{end}}</div>
+          {{else}}<span class="muted">belum pernah</span>{{end}}
         </td>
         <td>
           <div class="row" style="gap: 6px;">
-            {{if .CanPause}}<form method="post" action="/sync/jobs/pause"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Jeda</button></form>{{end}}
-            {{if .CanResume}}<form method="post" action="/sync/jobs/resume"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small primary">Lanjutkan</button></form>{{end}}
-            {{if .CanCancel}}<form method="post" action="/sync/jobs/cancel" data-confirm="Batalkan job {{.ID}}? Objek yang sudah tersalin tetap ada."><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Batalkan</button></form>{{end}}
-            {{if .CanRerun}}<form method="post" action="/sync/jobs/rerun" data-confirm="Jalankan ulang job {{.ID}} dari awal?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Ulangi</button></form>{{end}}
-            {{if .CanDelete}}<form method="post" action="/sync/jobs/delete" data-confirm="Hapus catatan job {{.ID}} beserta daftar key gagalnya?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Hapus</button></form>{{end}}
+            <form method="post" action="/sync/schedules/run"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Jalankan sekarang</button></form>
+            {{if .Enabled}}
+            <form method="post" action="/sync/schedules/toggle"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="enabled" value="0"><button type="submit" class="small">Jeda</button></form>
+            {{else}}
+            <form method="post" action="/sync/schedules/toggle"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><input type="hidden" name="enabled" value="1"><button type="submit" class="small primary">Aktifkan</button></form>
+            {{end}}
+            <form method="post" action="/sync/schedules/delete" data-confirm="Hapus jadwal {{.ID}}? Job yang sudah dimulainya tetap ada."><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Hapus</button></form>
           </div>
         </td>
       </tr>
@@ -211,14 +321,159 @@
     </tbody>
   </table>
   </div>
-  <p class="small muted" style="margin: 12px 0 0;">
-    Angka diperbarui tiap 3 detik selama ada job berjalan. Setelah restart panel, job melanjutkan dari checkpoint chunk terakhir; objek di chunk yang terputus diperiksa ulang (di mode "lewati" tidak disalin dua kali). Log lengkap ada di <span class="mono">journalctl -u garagepanel</span>.
+  {{end}}
+</div>
+
+{{/* ------------------------------------------------------------------- job */}}
+<div class="card" id="jobs" data-active="{{if .HasActive}}1{{else}}0{{end}}">
+  <div class="card-head">
+    <div>
+      <h3>Job</h3>
+      <p class="muted small">Angka diperbarui tiap 3 detik selama ada job berjalan. Log lengkap: <span class="mono">journalctl -u garagepanel</span>.</p>
+    </div>
+    {{if .Jobs}}
+    <div class="tabs" data-tabs>
+      <button type="button" class="tab active" data-filter="all">Semua <span class="cnt"></span></button>
+      <button type="button" class="tab" data-filter="active">Berjalan <span class="cnt"></span></button>
+      <button type="button" class="tab" data-filter="done">Selesai <span class="cnt"></span></button>
+      <button type="button" class="tab" data-filter="problem">Gagal / dibatalkan <span class="cnt"></span></button>
+    </div>
+    {{end}}
+  </div>
+  {{if not .Jobs}}
+    <div class="empty">Belum ada job.</div>
+  {{else}}
+  <div class="job-list">
+    {{range .Jobs}}
+    <article class="job-card" id="job-{{.ID}}" data-job="{{.ID}}" data-status="{{.Status}}" data-group="{{if .Active}}active{{else if eq .Status "done"}}done{{else}}problem{{end}}">
+      <header class="job-head">
+        <div class="job-title">
+          <span class="badge {{if .Active}}warn{{else if eq .Status "done"}}ok{{else}}bad{{end}}" data-field="statusLabel">{{.StatusLabel}}</span>
+          <strong>{{.Direction}}</strong>
+          <span class="mono small">{{.SrcLabel}}{{if .DstLabel}} → {{.DstLabel}}{{end}}</span>
+        </div>
+        <div class="job-actions">
+          {{if .CanPause}}<form method="post" action="/sync/jobs/pause"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Jeda</button></form>{{end}}
+          {{if .CanResume}}<form method="post" action="/sync/jobs/resume"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small primary">Lanjutkan</button></form>{{end}}
+          {{if .CanCancel}}<form method="post" action="/sync/jobs/cancel" data-confirm="Batalkan job {{.ID}}? Objek yang sudah tersalin tetap ada."><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Batalkan</button></form>{{end}}
+          {{if .CanRerun}}<form method="post" action="/sync/jobs/rerun" data-confirm="Jalankan ulang job {{.ID}} dari awal?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Ulangi</button></form>{{end}}
+          {{if .CanDelete}}<form method="post" action="/sync/jobs/delete" data-confirm="Hapus catatan job {{.ID}} beserta daftar key gagalnya?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Hapus</button></form>{{end}}
+        </div>
+      </header>
+      {{if eq .Status "running"}}<div class="activity" aria-hidden="true"><div></div></div>{{end}}
+      <div class="stat-grid">
+        <div class="stat"><span class="k">diperiksa</span><strong data-field="listed">{{.Counters.Listed}}</strong></div>
+        <div class="stat"><span class="k">{{if eq .Kind "delete-prefix"}}dihapus{{else}}ditransfer{{end}}</span><strong data-field="transferred">{{.Counters.Transferred}}</strong></div>
+        <div class="stat"><span class="k">dilewati</span><strong data-field="skipped">{{.Counters.Skipped}}</strong></div>
+        <div class="stat{{if .Counters.Failed}} bad{{end}}" data-stat="failed"><span class="k">gagal</span><strong data-field="failed">{{.Counters.Failed}}</strong></div>
+        <div class="stat"><span class="k">data</span><strong data-field="bytesH">{{.BytesH}}</strong></div>
+        <div class="stat"><span class="k">laju</span><strong data-field="speedH">{{if .SpeedH}}{{.SpeedH}}{{else}}—{{end}}</strong></div>
+      </div>
+      <div class="job-meta small muted">
+        <span class="mono">{{.ID}}</span> · mulai {{.StartedH}}{{if .FinishedH}} · selesai {{.FinishedH}}{{end}} · run ke-{{.Runs}}{{if eq .Kind "sync"}} · mode {{.Mode}} · {{.Transfers}} transfer paralel{{end}}
+        · chunk <span data-field="chunks">{{.Counters.Chunks}}</span> · checkpoint <span class="mono" data-field="checkpoint">{{if .Checkpoint}}{{.Checkpoint}}{{else}}—{{end}}</span>
+        · diperbarui <span data-field="updatedH">{{.UpdatedH}}</span>
+      </div>
+      {{if .Counters.Failed}}<div class="small" style="margin-top: 4px;"><a href="/sync/jobs/failed?id={{.ID}}">lihat key yang gagal</a></div>{{end}}
+      {{with .PauseReason}}<pre class="job-note warn">{{.}}</pre>{{end}}
+      {{with .ErrorShort}}<pre class="job-note err">{{.}}</pre>{{end}}
+      {{if .LastLogText}}<details class="small" style="margin-top: 6px;"><summary style="cursor: pointer;">log rclone terakhir</summary><pre class="job-note">{{.LastLogText}}</pre></details>{{end}}
+    </article>
+    {{end}}
+  </div>
+  <div class="empty" id="jobs-empty-filter" hidden>Tidak ada job di kategori ini.</div>
+  <p class="small muted" style="margin: 14px 0 0;">
+    Setelah restart panel, job melanjutkan dari checkpoint chunk terakhir; objek di chunk yang terputus diperiksa ulang (di mode "Lewati" tidak disalin dua kali).
   </p>
   {{end}}
 </div>
 
 <script>
 (function () {
+  // Provider presets drive placeholders and the note under the remote forms.
+  // On the add form the example endpoint/region are filled in too, as long
+  // as the operator has not typed something else.
+  document.querySelectorAll('form[data-remote-form]').forEach(function (form) {
+    var sel = form.querySelector('select[name=provider]');
+    var endpoint = form.querySelector('input[name=endpoint]');
+    var region = form.querySelector('input[name=region]');
+    var note = form.querySelector('[data-note]');
+    var addr = form.querySelector('[data-addr-default]');
+    var fill = form.hasAttribute('data-fill');
+    var prev = { endpoint: '', region: '' };
+    function apply() {
+      var opt = sel.options[sel.selectedIndex];
+      if (!opt) { return; }
+      var d = opt.dataset;
+      if (fill) {
+        if (endpoint.value === '' || endpoint.value === prev.endpoint) { endpoint.value = d.endpoint.indexOf('<') >= 0 ? '' : d.endpoint; }
+        if (region.value === '' || region.value === prev.region) { region.value = d.region; }
+        prev.endpoint = endpoint.value; prev.region = region.value;
+      }
+      endpoint.placeholder = d.endpoint;
+      region.placeholder = d.region;
+      if (note) { note.textContent = d.note; }
+      if (addr) { addr.textContent = d.virtual === '1' ? 'virtual-host' : 'path-style'; }
+    }
+    sel.addEventListener('change', apply);
+    apply();
+  });
+
+  // "+ Tambah remote" opens the form instead of only jumping to it.
+  document.querySelectorAll('[data-open]').forEach(function (a) {
+    a.addEventListener('click', function (ev) {
+      var d = document.getElementById(a.getAttribute('data-open'));
+      if (!d) { return; }
+      ev.preventDefault();
+      d.open = true;
+      d.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      var first = d.querySelector('input[type=text]');
+      if (first) { first.focus(); }
+    });
+  });
+
+  // Direction toggle: the source panel always sits on the left.
+  var jobForm = document.getElementById('job-form');
+  if (jobForm) {
+    var flow = jobForm.querySelector('.flow');
+    var applyDir = function () {
+      var checked = jobForm.querySelector('input[name=direction]:checked');
+      var exp = !!checked && checked.value === 'export';
+      flow.classList.toggle('export', exp);
+      jobForm.querySelector('[data-role=remote]').textContent = exp ? 'Tujuan' : 'Sumber';
+      jobForm.querySelector('[data-role=garage]').textContent = exp ? 'Sumber' : 'Tujuan';
+    };
+    jobForm.querySelectorAll('input[name=direction]').forEach(function (r) { r.addEventListener('change', applyDir); });
+    applyDir();
+  }
+
+  // Job filter tabs.
+  var tabs = document.querySelector('[data-tabs]');
+  if (tabs) {
+    var cards = Array.prototype.slice.call(document.querySelectorAll('.job-card'));
+    var counts = { all: cards.length, active: 0, done: 0, problem: 0 };
+    cards.forEach(function (c) { counts[c.getAttribute('data-group')] += 1; });
+    var emptyNote = document.getElementById('jobs-empty-filter');
+    tabs.querySelectorAll('.tab').forEach(function (tab) {
+      var f = tab.getAttribute('data-filter');
+      var cnt = tab.querySelector('.cnt');
+      if (cnt) { cnt.textContent = String(counts[f] || 0); }
+      tab.addEventListener('click', function () {
+        tabs.querySelectorAll('.tab').forEach(function (o) { o.classList.toggle('active', o === tab); });
+        var shown = 0;
+        cards.forEach(function (c) {
+          var hide = f !== 'all' && c.getAttribute('data-group') !== f;
+          c.hidden = hide;
+          if (!hide) { shown += 1; }
+        });
+        if (emptyNote) { emptyNote.hidden = shown > 0; }
+      });
+    });
+  }
+
+  // Live counters while a job is running. Values go in via textContent, so
+  // the JSON never becomes markup; a status change reloads the page so the
+  // buttons match.
   var root = document.getElementById('jobs');
   if (!root || root.getAttribute('data-active') !== '1') { return; }
   var fields = ['statusLabel', 'updatedH', 'listed', 'transferred', 'skipped', 'failed', 'bytesH', 'speedH', 'chunks', 'checkpoint'];
@@ -243,10 +498,13 @@
               case 'failed': v = job.counters.failed; break;
               case 'chunks': v = job.counters.chunks; break;
               case 'checkpoint': v = job.checkpoint || '—'; break;
+              case 'speedH': v = job.speedH || '—'; break;
               default: v = job[f];
             }
             el.textContent = (v === undefined || v === null) ? '' : String(v);
           });
+          var failedStat = row.querySelector('[data-stat="failed"]');
+          if (failedStat) { failedStat.classList.toggle('bad', job.counters.failed > 0); }
         });
         if (stillActive) { setTimeout(tick, 3000); }
       })

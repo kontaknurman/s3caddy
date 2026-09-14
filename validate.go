@@ -58,9 +58,6 @@ var (
 	dnsLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
-// remoteProviders is the rclone "provider" whitelist offered in the UI.
-var remoteProviders = []string{"Wasabi", "AWS", "Minio", "Other"}
-
 // syncModes are the ways a sync job treats objects that already exist at the
 // destination.
 var syncModes = map[string]string{
@@ -388,16 +385,6 @@ func ValidateRegion(s string) error {
 		return fmt.Errorf("region %q tidak valid: huruf kecil, angka, dan tanda hubung saja", s)
 	}
 	return nil
-}
-
-// ValidateProvider checks the rclone provider name against the whitelist.
-func ValidateProvider(s string) error {
-	for _, p := range remoteProviders {
-		if s == p {
-			return nil
-		}
-	}
-	return fmt.Errorf("provider %q tidak dikenal; pilih salah satu dari %s", s, strings.Join(remoteProviders, ", "))
 }
 
 // ValidateRemoteBucketName checks a bucket name on another provider. AWS

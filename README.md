@@ -42,6 +42,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 - [Sync dengan S3 lain (Wasabi, dll.)](#sync-dengan-s3-lain-wasabi-dll)
   - [Menambah remote](#menambah-remote)
   - [Memulai impor atau ekspor](#memulai-impor-atau-ekspor)
+  - [Jadwal: jalankan berulang](#jadwal-jalankan-berulang)
   - [Cara kerja job](#cara-kerja-job)
   - [Restart, jeda, dan key yang gagal](#restart-jeda-dan-key-yang-gagal)
   - [Biaya request dan batasan](#biaya-request-dan-batasan)
@@ -66,7 +67,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 | **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi |
 | **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback |
 | **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
-| **Sync** | Impor/ekspor bucket dari/ke Wasabi, AWS, MinIO, atau Garage lain. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart. Transfer dikerjakan rclone |
+| **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
 
 ## Cara kerja
@@ -1078,43 +1079,69 @@ halaman Sync menampilkan alasannya beserta perintah perbaikannya.
 
 ### Menambah remote
 
-Remote = satu endpoint S3 beserta kredensialnya. Diisi di kartu **Remote S3**:
+Remote = satu endpoint S3 beserta kredensialnya. Klik **+ Tambah remote** di
+kartu **Remote S3**. Memilih provider mengisi contoh endpoint dan region serta
+menampilkan catatan khas penyedianya:
+
+| Provider | Endpoint | Region | Catatan |
+|---|---|---|---|
+| Wasabi | `https://s3.wasabisys.com` (us-east-1) atau `https://s3.<region>.wasabisys.com` | `us-east-1`, `ap-southeast-1`, `eu-central-1`, … | region harus cocok dengan endpoint |
+| Amazon S3 | `https://s3.<region>.amazonaws.com` | region bucket | IAM user dengan `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` |
+| Backblaze B2 | `https://s3.<region>.backblazeb2.com` — tertulis di halaman bucket B2 | `<region>` dari endpoint, misalnya `us-west-004` | access key = **keyID** dari *application key* yang dibuat sendiri di menu Application Keys. **Master application key tidak bisa dipakai di S3 API** — errornya `InvalidAccessKeyId: Malformed Access Key Id` |
+| Hetzner Object Storage | `https://<lokasi>.your-objectstorage.com` | lokasi: `fsn1`, `nbg1`, `hel1` | hanya melayani gaya alamat **virtual-host** (`bucket.fsn1.your-objectstorage.com`); kredensial berlaku per project, jadi bucket dan key harus dari project yang sama |
+| Cloudflare R2 | `https://<account-id>.r2.cloudflarestorage.com` | `auto` | token API R2 dengan izin Object Read & Write |
+| DigitalOcean Spaces | `https://<dc>.digitaloceanspaces.com` | `sgp1`, `nyc3`, `ams3`, … | |
+| Scaleway | `https://s3.<region>.scw.cloud` | `fr-par`, `nl-ams`, `pl-waw` | |
+| Ceph RGW | alamat servernya | nama zonegroup, sering `default` | kalau server hanya menerima virtual-host, biarkan gaya alamat otomatis |
+| MinIO | alamat servernya, boleh `http://` di LAN | `us-east-1` kecuali diubah di server | |
+| Lainnya (Garage lain, dll.) | alamat servernya | Garage: `s3_region` di `garage.toml`-nya | |
+
+Kolom lain:
 
 | Kolom | Isi |
 |---|---|
-| Nama | pengenal pendek, huruf kecil/angka/tanda hubung, misalnya `wasabi-sg` |
-| Provider | `Wasabi`, `AWS`, `Minio`, atau `Other` (Garage lain, Ceph, dll.) — ini nilai `provider` rclone |
-| Endpoint | skema + host saja, tanpa path: `https://s3.ap-southeast-1.wasabisys.com` |
-| Region | region untuk tanda tangan; **harus cocok dengan endpoint** |
+| Nama | pengenal pendek, huruf kecil/angka/tanda hubung, misalnya `wasabi-sg`; tidak bisa diubah setelah dibuat |
+| Endpoint | skema + host saja, tanpa path. `http://` boleh (LAN) — panel menandainya "tanpa TLS" karena isi objek lewat tanpa enkripsi; secret sendiri tidak pernah dikirim, SigV4 hanya mengirim tanda tangannya |
+| Region | region untuk tanda tangan SigV4; **harus cocok dengan endpoint** |
 | Access key / Secret key | dari penyedia. Spasi atau baris baru di ujung dipangkas otomatis |
+| Gaya alamat | `Otomatis` (bawaan), `Path-style` (`https://host/bucket/key`), atau `Virtual-host` (`https://bucket.host/key`) — lihat di bawah |
 
-Endpoint dan region Wasabi:
+**Gaya alamat.** Setiap request S3 menyebut bucket entah di path
+(`host/bucket/key`, *path-style*) atau di nama host (`bucket.host/key`,
+*virtual-host*). Kebanyakan penyedia menerima keduanya, tapi tidak semua:
+Hetzner dan sebagian Ceph hanya menerima virtual-host — dengan path-style,
+listing kadang masih jalan tapi `PutObject` dijawab `403 AccessDenied`. Pada
+setelan `Otomatis` panel memakai gaya bawaan provider itu; kalau ditolak, gaya
+satunya dicoba, dan gaya yang diterima disimpan di remote lalu diteruskan ke
+rclone (`force_path_style`). Kartu remote menampilkan gaya yang sedang dipakai.
 
-| Region | Endpoint |
-|---|---|
-| `us-east-1` | `https://s3.wasabisys.com` |
-| `us-east-2`, `us-central-1`, `us-west-1` | `https://s3.<region>.wasabisys.com` |
-| `eu-central-1`, `eu-central-2`, `eu-west-1`, `eu-west-2` | `https://s3.<region>.wasabisys.com` |
-| `ap-northeast-1`, `ap-northeast-2`, `ap-southeast-1`, `ap-southeast-2` | `https://s3.<region>.wasabisys.com` |
+**Tes koneksi.** Isi nama bucket lalu klik **Tes koneksi**: panel membaca satu
+key di bucket itu, lalu — kecuali kamu memilih "hanya baca" — menulis satu
+objek uji `.garagepanel-probe-<acak>` dan menghapusnya lagi. Kalau tesnya lulus,
+endpoint, region, kredensial, izin tulis, dan gaya alamat semuanya sudah benar.
+Pesan error yang muncul adalah pesan asli penyedianya, ditambah petunjuk
+penyebab yang lazim untuk provider itu (lihat
+[Troubleshooting](#troubleshooting)).
 
-AWS: `https://s3.<region>.amazonaws.com` dengan region bucket-nya. MinIO atau
-Garage lain: alamat servernya (boleh `http://` di LAN — panel menandainya
-"tanpa TLS" karena isi objek lewat tanpa enkripsi; secret sendiri tidak pernah
-dikirim, SigV4 hanya mengirim tanda tangannya).
+**Edit.** Tombol **Edit** di kartu remote membuka form yang sama. Kolom access
+key dan secret key boleh dikosongkan — artinya tetap memakai yang tersimpan;
+kalau access key diganti, secret-nya harus diisi juga. Remote yang sedang
+dipakai job berjalan tidak bisa diubah atau dihapus; remote yang dipakai sebuah
+jadwal tidak bisa dihapus sebelum jadwalnya dihapus.
 
 Kredensial disimpan di `/var/lib/garagepanel/remotes.json` mode 0600 dan tidak
-pernah ditampilkan lagi (access key disamarkan). Klik **Tes koneksi** dengan
-nama bucket untuk memastikan endpoint, region, dan kredensial benar — pesan
-error yang muncul adalah pesan asli penyedianya.
+pernah ditampilkan lagi (access key disamarkan, secret tidak pernah dirender).
 
 ### Memulai impor atau ekspor
 
-Di kartu **Job baru**:
+Di kartu **Impor / ekspor bucket**:
 
-1. **Arah**: Impor (remote → Garage) atau Ekspor (Garage → remote).
-2. Remote, bucket di remote, bucket di Garage, dan prefix opsional di
-   masing-masing sisi (`foto/2026/`, harus diakhiri `/`). Prefix sumber dan
-   tujuan boleh beda: `wasabi:backup/2024/` → `garage:arsip/`.
+1. **Arah**: Impor (remote → Garage) atau Ekspor (Garage → remote). Panel
+   sumber selalu tampil di kiri, tujuan di kanan.
+2. Remote, bucket di remote, bucket di Garage, dan folder opsional di
+   masing-masing sisi (`foto/2026/`; `/` di ujung ditambahkan otomatis).
+   Folder sumber dan tujuan boleh beda: `wasabi:backup/2024/` →
+   `garage:arsip/`.
 3. **Objek yang sudah ada di tujuan**:
    - **Lewati** (bawaan) — hanya salin yang belum ada. Ini mode "update saja":
      jalankan berulang, hanya objek baru yang disalin.
@@ -1123,13 +1150,52 @@ Di kartu **Job baru**:
      di-list sama sekali).
 4. **Transfer paralel** (1–16, bawaan 4): jumlah objek yang disalin
    bersamaan oleh rclone.
+5. **Mulai job sekarang** — atau buka *"…atau jalankan berulang sesuai
+   jadwal"* untuk menyimpan setelan yang sama sebagai
+   [jadwal](#jadwal-jalankan-berulang).
 
-Sebelum job dibuat, panel mencoba membaca satu key di kedua bucket; kalau
-gagal, job tidak dibuat dan pesannya ditampilkan. Setelah itu tab boleh
-ditutup. Angka di tabel job diperbarui tiap 3 detik selama ada job berjalan.
+Sebelum job dibuat, panel memeriksa kedua sisi: membaca satu key di sumber,
+lalu di tujuan membaca **dan** menulis-hapus satu objek uji
+(`.garagepanel-probe-<acak>`). Kalau salah satunya gagal, job tidak dibuat dan
+pesan asli penyedia ditampilkan — lebih baik tahu sekarang daripada setelah
+ribuan `PutObject` pertama ditolak. Setelah itu tab boleh ditutup. Angka di
+kartu job diperbarui tiap 3 detik selama ada job berjalan; tab **Semua /
+Berjalan / Selesai / Gagal** menyaring daftarnya.
 
 Batas: satu job belum-selesai per bucket, dan maksimal 2 job berjalan
 bersamaan (memori rclone).
+
+### Jadwal: jalankan berulang
+
+Untuk sinkronisasi rutin ("cronjob"): isi form job seperti biasa, buka
+**…atau jalankan berulang sesuai jadwal**, isi intervalnya, lalu klik
+**Simpan jadwal**.
+
+| Kolom | Isi |
+|---|---|
+| Setiap | `30m`, `6h`, `1d`, `7d` — atau angka polos = jam. Minimal 15 menit, maksimal 30 hari |
+| Run pertama | opsional; kosong = sekarang + interval. Run berikutnya = run sebelumnya + interval (bukan "selesai + interval"), jadi jam mulainya tetap |
+
+Tiap run membuat job biasa dengan setelan yang tersimpan di jadwal (arah,
+bucket, folder, mode, transfer). Job-nya muncul di daftar job dan bisa dijeda
+atau dibatalkan seperti yang lain. Dengan mode **Lewati**, run rutin hanya
+menyalin objek yang baru muncul sejak run sebelumnya.
+
+Aturannya:
+
+- Panel memeriksa jadwal tiap 30 detik. Kalau saat jatuh tempo bucket-nya
+  masih dipakai job lain (misalnya run sebelumnya belum selesai), sudah ada 2
+  job berjalan, atau tes koneksinya gagal, run itu **dilewati** dan alasannya
+  dicatat di kolom "Run terakhir"; jadwal tetap maju ke waktu berikutnya.
+- Run yang terlewat saat panel mati **tidak dirapel**: setelah start, run
+  berikutnya jatuh pada kelipatan interval pertama setelah sekarang.
+- **Jalankan sekarang** membuat job seketika tanpa menggeser jadwal.
+  **Jeda** menahan run baru; **Aktifkan** menjadwalkan ulang dari sekarang +
+  interval.
+- Jadwal disimpan di `/var/lib/garagepanel/schedules.json` (0600) bersama 20
+  riwayat run terakhirnya. Menghapus jadwal tidak menghapus job yang sudah
+  dibuatnya; menghapus remote yang dipakai jadwal ditolak.
+- Jadwal tidak memakai cron sistem: hanya jalan selama `garagepanel` jalan.
 
 ### Cara kerja job
 
@@ -1156,7 +1222,8 @@ rclone copy --files-from-raw <chunk> --no-traverse --use-json-log --stats 5s \
 ```
 
 Remote `src` dan `dst` didefinisikan lewat environment proses anak
-(`RCLONE_CONFIG_SRC_TYPE=s3`, `..._ENDPOINT`, `..._ACCESS_KEY_ID`,
+(`RCLONE_CONFIG_SRC_TYPE=s3`, `..._PROVIDER`, `..._ENDPOINT`, `..._REGION`,
+`..._FORCE_PATH_STYLE` sesuai gaya alamat remote, `..._ACCESS_KEY_ID`,
 `..._SECRET_ACCESS_KEY`, dst.) — tidak lewat argumen (terlihat di `ps`), tidak
 lewat file. Environment itu dibangun dari nol: `GARAGE_ADMIN_TOKEN` dan
 `PANEL_PASSWORD_HASH` milik panel tidak diwariskan ke rclone.
@@ -1396,7 +1463,7 @@ State panel kecil. Yang perlu di-backup:
 |---|---|---|
 | Konfigurasi panel | `/etc/garagepanel/garagepanel.env` | token admin, key S3, hash password login |
 | Pemetaan domain | `/etc/caddy/sites/*.caddy` | domain → bucket, whitelist IP S3 API |
-| Remote dan job Sync | `/var/lib/garagepanel/` | `remotes.json` (kredensial remote, 0600), `jobs/*.json` (checkpoint), `jobs/<id>/failed.jsonl` |
+| Remote, jadwal, dan job Sync | `/var/lib/garagepanel/` | `remotes.json` (kredensial remote, 0600), `schedules.json` (jadwal), `jobs/*.json` (checkpoint), `jobs/<id>/failed.jsonl` |
 
 ```bash
 sudo tar czf garagepanel-backup-$(date +%F).tar.gz \
@@ -1505,10 +1572,11 @@ divalidasi lebih dulu:
 | Object key | tolak yang diawali `/` atau memuat segmen `.`/`..` (dipisah `/`). `laporan..final.pdf` sah — bucket sungguhan memang punya key seperti itu — sedangkan `a/../b` ditolak |
 | Nama remote | `^[a-z0-9][a-z0-9-]{0,31}$` |
 | Endpoint remote | `http`/`https`, host + port saja: tanpa path, query, fragment, atau user:password; alamat link-local/metadata (`169.254.0.0/16`, `fe80::/10`) dan `0.0.0.0` ditolak |
-| Region | `^[a-z0-9-]{1,32}$`; provider dari whitelist `Wasabi`, `AWS`, `Minio`, `Other` |
+| Region | `^[a-z0-9-]{1,32}$`; provider dari whitelist (`Wasabi`, `AWS`, `Backblaze`, `Hetzner`, `Cloudflare`, `DigitalOcean`, `Scaleway`, `Ceph`, `Minio`, `Other`); gaya alamat `auto`/`path`/`virtual` |
 | Bucket remote | aturan AWS (3–63, boleh titik, bukan alamat IP) — tidak pernah jadi nama file |
 | Nama folder / nama file | satu komponen: tanpa `/` `\`, bukan `.`/`..`, tanpa karakter kontrol, maks 255 byte; nama file juga lewat whitelist ekstensi |
-| ID job | `^[0-9a-f]{16}$`, diperiksa sebelum dijadikan path di `STATE_DIR` |
+| ID job / ID jadwal | `^[0-9a-f]{16}$`, diperiksa sebelum dijadikan path di `STATE_DIR` |
+| Interval jadwal | `<angka>` + `m`/`h`/`d`, 15 menit sampai 30 hari; run pertama harus berbentuk `YYYY-MM-DDTHH:MM` |
 
 Semua nilai yang dipakai sebagai komponen nama file juga ditolak kalau
 mengandung `..`, `/`, `\`, diawali titik, atau berisi karakter kontrol.
@@ -1535,7 +1603,11 @@ job, tidak di log, tidak di halaman mana pun (access key disamarkan, secret
 tidak pernah dirender). Environment rclone dibangun dari nol, jadi token admin
 dan hash password panel tidak ikut. rclone tidak pernah men-list bucket dan
 tidak pernah diberi kredensial selain dua remote job itu. `RCLONE_EXTRA_ARGS`
-dipecah per spasi dan diberikan langsung ke `exec`, tanpa shell.
+dipecah per spasi dan diberikan langsung ke `exec`, tanpa shell. Objek uji
+yang ditulis Tes koneksi dan pemeriksaan sebelum job bernama
+`.garagepanel-probe-<8 hex acak>` dan dihapus di request berikutnya; kalau
+penghapusannya gagal, pesannya menyebut nama objek itu supaya bisa dihapus
+manual. Jadwal hanya menyimpan nama remote dan setelan job, tanpa kredensial.
 
 **File manager.** Ganti nama tidak bisa memperkenalkan ekstensi di luar
 whitelist (menghindari `.jpg` → `.html` yang lalu dilayani web endpoint).
@@ -1710,8 +1782,49 @@ diisi manual, pastikan file itu bisa dieksekusi oleh user `garagepanel`.
 
 **Tes koneksi remote: `SignatureDoesNotMatch`** — secret key salah, atau region
 tidak cocok dengan endpoint (Wasabi: `s3.wasabisys.com` → `us-east-1`,
-`s3.<region>.wasabisys.com` → `<region>`). Hapus remote, tambah lagi dengan
-nilai yang benar. Pesan errornya menyebut region yang sedang dipakai.
+`s3.<region>.wasabisys.com` → `<region>`). Klik **Edit** di kartu remote,
+betulkan, lalu tes lagi. Pesan errornya menyebut region yang sedang dipakai.
+
+**Tes koneksi remote: `InvalidAccessKeyId: Malformed Access Key Id`** —
+penyedia tidak mengenali *bentuk* access key-nya; ini bukan soal izin. Di
+**Backblaze B2** penyebabnya hampir selalu master application key (atau keyID
+akun) yang dipakai sebagai access key — S3 API B2 hanya menerima keyID dari
+*application key* yang dibuat sendiri di menu Application Keys. Buat satu
+dengan akses ke bucket itu, lalu **Edit** remote dan isi keyID +
+applicationKey-nya. Di **Hetzner**, pastikan kredensial S3-nya dibuat di
+project yang sama dengan bucket. Di penyedia lain: periksa access key tersalin
+utuh (tanpa spasi) dan endpoint memang milik akun/region itu.
+
+**Tes koneksi remote: bisa membaca, tapi menulis objek uji ditolak
+(`AccessDenied`)** — key hanya punya izin baca, bucket milik akun/project
+lain, atau penyedia hanya menerima gaya alamat virtual-host sementara remote
+memakai path-style (Hetzner, sebagian Ceph). Panel mencoba gaya satunya
+otomatis dan menyimpan yang diterima; kalau tetap ditolak, periksa izin key di
+penyedia. Job ekspor ke Hetzner yang gagal dengan `PutObject … 403
+AccessDenied: UnknownError` (HostID `…-ceph…`) adalah kasus ini: bucket-nya
+diakses path-style. Setelah update, jalankan Tes koneksi lagi — gaya alamatnya
+diganti ke virtual-host dan disimpan, lalu klik Lanjutkan di job-nya.
+
+**Tes koneksi remote: `PermanentRedirect` / `AuthorizationHeaderMalformed`** —
+bucket ada, tapi di region atau endpoint lain dari yang diisi. Pesannya
+menyebut region yang benar kalau penyedia mengirimkannya; Edit remote dan
+ganti endpoint + region sepasang.
+
+**Tes koneksi remote: `NoSuchBucket`** — nama bucket salah, atau bucket-nya ada
+di akun/region lain. Nama bucket Backblaze bersifat global dan harus persis;
+bucket Hetzner terikat project.
+
+**Job gagal dengan `PutObject … 403 AccessDenied` padahal tes koneksi lulus** —
+izin key atau kebijakan bucket tujuan berubah di tengah jalan. Jalankan Tes
+koneksi lagi (dengan uji tulis) untuk melihat pesan aslinya, lalu Lanjutkan.
+
+**Jadwal tidak menjalankan apa-apa** — lihat kolom "Run terakhir".
+`dilewati: bucket … sedang dipakai job` berarti run sebelumnya belum selesai
+(perbesar intervalnya atau biarkan); `dilewati: sumber/tujuan tidak bisa
+diakses` berarti tes koneksinya gagal saat itu — jalankan Tes koneksi di
+remote-nya untuk melihat pesan lengkapnya. Jadwal hanya jalan selama
+`garagepanel` jalan, run yang terlewat saat panel mati tidak dirapel, dan
+jadwal berstatus "dijeda" tidak pernah jalan sampai diaktifkan lagi.
 
 **Job dijeda otomatis "… dari … objek di chunk terakhir gagal"** — salah satu
 sisi tidak bisa dihubungi selama satu chunk. Periksa koneksi ke remote (atau
@@ -1753,11 +1866,13 @@ objects_ops.go        ganti nama, pindah, salin objek; operasi folder → job
 garage.go             client Garage Admin API v2
 s3.go                 SigV4, ListObjectsV2 (start-after), Put/Get/Head/Delete, CopyObject, DeleteObjects
 caddy.go              tulis/hapus file site + reload + rollback, file whitelist, writeFileAtomic
-remotes.go            daftar remote S3 (remotes.json), env rclone per remote, probe
+providers.go          preset provider S3 (endpoint, region, gaya alamat bawaan, catatan)
+remotes.go            daftar remote S3 (remotes.json), env rclone per remote, probe baca/tulis + deteksi gaya alamat
 rclone.go             deteksi versi rclone, menjalankan satu chunk, parser log JSON
 sync.go               iterator listing terurut, merge-join, penulis chunk
 jobs.go               job: state di disk, siklus hidup, resume saat start, shutdown
-sync_http.go          halaman Sync, jobs.json, handler remote dan job
+schedules.go          jadwal berulang (schedules.json), ticker 30 detik, riwayat run
+sync_http.go          halaman Sync, jobs.json, handler remote, job, dan jadwal
 auth.go               hash password, session, pembatas percobaan login
 validate.go           semua validasi input
 templates/            *.html, di-embed dengan //go:embed

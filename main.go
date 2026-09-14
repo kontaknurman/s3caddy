@@ -244,9 +244,10 @@ type App struct {
 	// menghabiskan CPU panel.
 	loginMu sync.Mutex
 
-	// Sync dengan S3 lain. Keduanya nil kalau syncDisabled terisi.
-	remotes *RemoteStore
-	jobs    *JobManager
+	// Sync dengan S3 lain. Semuanya nil kalau syncDisabled terisi.
+	remotes   *RemoteStore
+	jobs      *JobManager
+	schedules *Scheduler
 	// syncDisabled berisi alasan halaman Sync tidak aktif (STATE_DIR tidak
 	// bisa ditulis, rclone tidak ada, kredensial S3 kosong). Kosong = aktif.
 	syncDisabled string
@@ -329,8 +330,9 @@ func main() {
 
 	if app.jobs != nil {
 		// Job yang sedang berjalan saat panel terakhir berhenti dilanjutkan
-		// dari checkpoint-nya.
+		// dari checkpoint-nya, lalu jadwal mulai berdetak.
 		app.jobs.ResumeInterrupted()
+		app.schedules.Start()
 	}
 
 	idle := make(chan struct{})
@@ -346,6 +348,7 @@ func main() {
 		jobsDone := make(chan struct{})
 		go func() {
 			if app.jobs != nil {
+				app.schedules.Stop()
 				app.jobs.Shutdown(shutdownCtx)
 			}
 			close(jobsDone)
@@ -558,9 +561,16 @@ func (a *App) setupSync() {
 		log.Printf("PERINGATAN: %s", a.syncDisabled)
 		return
 	}
+	schedules, err := NewScheduler(filepath.Join(a.cfg.StateDir, schedulesFileName), jobs)
+	if err != nil {
+		a.syncDisabled = fmt.Sprintf("Daftar jadwal tidak bisa dibaca: %v.\nPerbaiki atau hapus file itu, lalu restart garagepanel.", err)
+		log.Printf("PERINGATAN: %s", strings.ReplaceAll(a.syncDisabled, "\n", " "))
+		return
+	}
 	a.remotes = remotes
 	a.jobs = jobs
-	log.Printf("sync aktif: rclone v%s, state di %s, %d remote, %d job tersimpan", rclone.version, a.cfg.StateDir, len(remotes.List()), len(jobs.List()))
+	a.schedules = schedules
+	log.Printf("sync aktif: rclone v%s, state di %s, %d remote, %d job tersimpan, %d jadwal", rclone.version, a.cfg.StateDir, len(remotes.List()), len(jobs.List()), len(schedules.List()))
 }
 
 // prepareStateDir membuat STATE_DIR beserta subdirektorinya dan memastikan
@@ -665,6 +675,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /sync/jobs.json", a.handleSyncJobsJSON)
 	mux.HandleFunc("GET /sync/jobs/failed", a.handleJobFailed)
 	mux.HandleFunc("POST /sync/remotes/add", a.handleRemoteAdd)
+	mux.HandleFunc("POST /sync/remotes/update", a.handleRemoteUpdate)
 	mux.HandleFunc("POST /sync/remotes/delete", a.handleRemoteDelete)
 	mux.HandleFunc("POST /sync/remotes/test", a.handleRemoteTest)
 	mux.HandleFunc("POST /sync/jobs/create", a.handleJobCreate)
@@ -673,6 +684,10 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /sync/jobs/rerun", a.jobAction("dijalankan ulang dari awal", func(id string) error { return a.jobs.Rerun(id) }))
 	mux.HandleFunc("POST /sync/jobs/cancel", a.jobAction("dibatalkan", func(id string) error { return a.jobs.Cancel(id) }))
 	mux.HandleFunc("POST /sync/jobs/delete", a.jobAction("catatan dihapus", func(id string) error { return a.jobs.Delete(id) }))
+	mux.HandleFunc("POST /sync/schedules/create", a.handleScheduleCreate)
+	mux.HandleFunc("POST /sync/schedules/toggle", a.handleScheduleToggle)
+	mux.HandleFunc("POST /sync/schedules/delete", a.handleScheduleDelete)
+	mux.HandleFunc("POST /sync/schedules/run", a.handleScheduleRun)
 
 	mux.HandleFunc("GET /whitelist", a.handleWhitelist)
 	mux.HandleFunc("POST /whitelist/add", a.handleWhitelistAdd)

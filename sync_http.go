@@ -88,7 +88,7 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"Title":        "Sync dengan S3 lain",
 		"Page":         "sync",
-		"Providers":    remoteProviders,
+		"Providers":    providers,
 		"MaxTransfers": MaxTransfers,
 		"StateDir":     a.cfg.StateDir,
 	}
@@ -102,16 +102,18 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 		data["BucketsWarning"] = bucketsErr.Error()
 	}
 	jobs := a.jobViews()
-	active := false
+	active := 0
 	for _, j := range jobs {
 		if j.Active {
-			active = true
+			active++
 		}
 	}
 	data["Buckets"] = bucketNamesFrom(buckets)
 	data["Remotes"] = a.remotes.List()
 	data["Jobs"] = jobs
-	data["HasActive"] = active
+	data["Schedules"] = a.scheduleViews()
+	data["HasActive"] = active > 0
+	data["ActiveCount"] = active
 	data["RcloneVersion"] = a.rcloneVersion()
 	data["ChunkKeys"] = syncChunkKeys
 	a.render(w, r, "sync.html", data)
@@ -146,28 +148,56 @@ func (a *App) syncGuard(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// remoteFromForm reads the add/edit form.
+func remoteFromForm(r *http.Request) Remote {
+	return Remote{
+		Name:       strings.TrimSpace(r.PostFormValue("name")),
+		Provider:   strings.TrimSpace(r.PostFormValue("provider")),
+		Endpoint:   strings.TrimSpace(r.PostFormValue("endpoint")),
+		Region:     strings.TrimSpace(r.PostFormValue("region")),
+		AccessKey:  r.PostFormValue("access_key"),
+		SecretKey:  r.PostFormValue("secret_key"),
+		Addressing: strings.TrimSpace(r.PostFormValue("addressing")),
+	}
+}
+
 func (a *App) handleRemoteAdd(w http.ResponseWriter, r *http.Request) {
 	if !a.syncGuard(w, r) {
 		return
 	}
-	remote := Remote{
-		Name:      strings.TrimSpace(r.PostFormValue("name")),
-		Provider:  strings.TrimSpace(r.PostFormValue("provider")),
-		Endpoint:  strings.TrimSpace(r.PostFormValue("endpoint")),
-		Region:    strings.TrimSpace(r.PostFormValue("region")),
-		AccessKey: r.PostFormValue("access_key"),
-		SecretKey: r.PostFormValue("secret_key"),
-	}
+	remote := remoteFromForm(r)
 	if err := a.remotes.Add(remote); err != nil {
 		a.redirectErr(w, r, "/sync", fmt.Errorf("remote tidak disimpan: %w", err))
 		return
 	}
 	log.Printf("remote %q ditambahkan (%s)", remote.Name, remote.Endpoint)
-	msg := fmt.Sprintf("Remote %q disimpan di %s (mode 0600). Klik \"Tes koneksi\" dengan nama bucket untuk memastikan kredensial dan region-nya benar.", remote.Name, filepath.Join(a.cfg.StateDir, remotesFileName))
+	msg := fmt.Sprintf("Remote %q disimpan di %s (mode 0600). Klik \"Tes koneksi\" dengan nama bucket untuk memastikan endpoint, region, kredensial, dan izin tulisnya benar.", remote.Name, filepath.Join(a.cfg.StateDir, remotesFileName))
 	if strings.HasPrefix(remote.Endpoint, "http://") {
 		msg += " Catatan: endpoint http tanpa TLS — isi objek lewat jaringan tanpa enkripsi."
 	}
 	a.redirectOK(w, r, "/sync", msg)
+}
+
+func (a *App) handleRemoteUpdate(w http.ResponseWriter, r *http.Request) {
+	if !a.syncGuard(w, r) {
+		return
+	}
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	if err := ValidateRemoteName(name); err != nil {
+		a.redirectErr(w, r, "/sync", err)
+		return
+	}
+	if a.jobs.UsesRemote(name) {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q sedang dipakai job yang belum selesai; jeda atau batalkan job itu dulu sebelum mengubah kredensialnya", name))
+		return
+	}
+	remote := remoteFromForm(r)
+	if err := a.remotes.Update(name, remote); err != nil {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("remote tidak diubah: %w", err))
+		return
+	}
+	log.Printf("remote %q diubah (%s)", name, remote.Endpoint)
+	a.redirectOK(w, r, "/sync", fmt.Sprintf("Remote %q diperbarui. Jalankan \"Tes koneksi\" lagi untuk memastikan setelan barunya bekerja.", name))
 }
 
 func (a *App) handleRemoteDelete(w http.ResponseWriter, r *http.Request) {
@@ -181,6 +211,10 @@ func (a *App) handleRemoteDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.jobs.UsesRemote(name) {
 		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q masih dipakai job yang belum selesai; batalkan atau tunggu job itu dulu", name))
+		return
+	}
+	if a.schedules.UsesRemote(name) {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q masih dipakai sebuah jadwal; hapus jadwalnya dulu", name))
 		return
 	}
 	if err := a.remotes.Delete(name); err != nil {
@@ -197,25 +231,37 @@ func (a *App) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 	}
 	name := strings.TrimSpace(r.PostFormValue("name"))
 	bucket := strings.TrimSpace(r.PostFormValue("bucket"))
+	write := r.PostFormValue("write") != "0"
 	if err := ValidateRemoteName(name); err != nil {
 		a.redirectErr(w, r, "/sync", err)
 		return
 	}
-	if err := a.remotes.Probe(r.Context(), name, bucket); err != nil {
-		a.redirectErr(w, r, "/sync", fmt.Errorf("tes koneksi gagal: %w", err))
+	report, err := a.remotes.Probe(r.Context(), name, bucket, write)
+	if err != nil {
+		msg := fmt.Errorf("tes koneksi gagal: %w", err)
+		if report.Switched {
+			msg = fmt.Errorf("tes koneksi gagal (gaya alamat remote diganti ke %s karena itu yang diterima): %w", addressingLabel(report.Virtual), err)
+		}
+		a.redirectErr(w, r, "/sync", msg)
 		return
 	}
-	a.redirectOK(w, r, "/sync", fmt.Sprintf("Remote %q bisa membaca bucket %q: endpoint, region, dan kredensialnya benar.", name, bucket))
+	var parts []string
+	parts = append(parts, fmt.Sprintf("Remote %q bisa membaca bucket %q", name, bucket))
+	if write {
+		parts = append(parts, "menulis dan menghapus objek uji juga berhasil")
+	}
+	msg := strings.Join(parts, "; ") + ". Endpoint, region, dan kredensialnya benar."
+	if report.Switched {
+		msg += fmt.Sprintf(" Gaya alamat yang diterima adalah %s — setelan remote sudah diganti ke situ.", addressingLabel(report.Virtual))
+	}
+	a.redirectOK(w, r, "/sync", msg)
 }
 
-func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
-	if !a.syncGuard(w, r) {
-		return
-	}
+// syncSpecFromForm reads the shared job/schedule form.
+func syncSpecFromForm(r *http.Request) (JobSpec, error) {
 	transfers, err := strconv.Atoi(strings.TrimSpace(r.PostFormValue("transfers")))
 	if err != nil {
-		a.redirectErr(w, r, "/sync", errors.New("jumlah transfer paralel harus angka"))
-		return
+		return JobSpec{}, errors.New("jumlah transfer paralel harus angka")
 	}
 	remoteSide := Endpoint{
 		Remote: strings.TrimSpace(r.PostFormValue("remote")),
@@ -233,10 +279,148 @@ func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
 	case "export":
 		spec.Src, spec.Dst = garageSide, remoteSide
 	default:
-		a.redirectErr(w, r, "/sync", errors.New("pilih arah: impor atau ekspor"))
+		return JobSpec{}, errors.New("pilih arah: impor atau ekspor")
+	}
+	return spec, nil
+}
+
+func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
+	if !a.syncGuard(w, r) {
+		return
+	}
+	spec, err := syncSpecFromForm(r)
+	if err != nil {
+		a.redirectErr(w, r, "/sync", err)
 		return
 	}
 	a.startJob(w, r, spec, "/sync")
+}
+
+// --- schedules ---------------------------------------------------------------
+
+// scheduleView is a Schedule dressed up for the template.
+type scheduleView struct {
+	Schedule
+	Direction string
+	SrcLabel  string
+	DstLabel  string
+	EveryH    string
+	NextRunH  string
+	Overdue   bool
+	LastRun   *ScheduleRun
+}
+
+func (a *App) scheduleViews() []scheduleView {
+	if a.schedules == nil {
+		return nil
+	}
+	items := a.schedules.List()
+	now := time.Now()
+	out := make([]scheduleView, 0, len(items))
+	for _, it := range items {
+		v := scheduleView{
+			Schedule:  it,
+			Direction: it.Spec.Direction(),
+			SrcLabel:  it.Spec.Src.String(),
+			DstLabel:  it.Spec.Dst.String(),
+			EveryH:    it.Every.Human(),
+			NextRunH:  humanTime(it.NextRun),
+			Overdue:   it.Enabled && it.NextRun.Before(now),
+		}
+		if len(it.Runs) > 0 {
+			run := it.Runs[0]
+			v.LastRun = &run
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func (a *App) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
+	if !a.syncGuard(w, r) {
+		return
+	}
+	spec, err := syncSpecFromForm(r)
+	if err != nil {
+		a.redirectErr(w, r, "/sync", err)
+		return
+	}
+	every, err := ParseEvery(r.PostFormValue("every"))
+	if err != nil {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("jadwal tidak dibuat: %w", err))
+		return
+	}
+	var first time.Time
+	if raw := strings.TrimSpace(r.PostFormValue("first_run")); raw != "" {
+		// <input type="datetime-local"> gives local wall time without a zone.
+		t, err := time.ParseInLocation("2006-01-02T15:04", raw, time.Local)
+		if err != nil {
+			a.redirectErr(w, r, "/sync", errors.New("waktu mulai pertama tidak bisa dibaca"))
+			return
+		}
+		first = t
+	}
+	item, err := a.schedules.Add(spec, every, first)
+	if err != nil {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("jadwal tidak dibuat: %w", err))
+		return
+	}
+	a.redirectOK(w, r, "/sync", fmt.Sprintf("Jadwal %s dibuat: %s, %s. Run pertama %s. Setiap run memeriksa kedua sisi dulu; kalau bucket-nya masih dipakai job lain, run itu dilewati dan dicoba lagi pada jadwal berikutnya.",
+		item.ID, jobSummary(JobState{JobSpec: item.Spec}), item.Every.Human(), humanTime(item.NextRun)))
+}
+
+func (a *App) scheduleAction(fn func(id string) (string, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.syncGuard(w, r) {
+			return
+		}
+		id := strings.TrimSpace(r.PostFormValue("id"))
+		if err := ValidateJobID(id); err != nil {
+			a.redirectErr(w, r, "/sync", err)
+			return
+		}
+		msg, err := fn(id)
+		if err != nil {
+			a.redirectErr(w, r, "/sync", err)
+			return
+		}
+		a.redirectOK(w, r, "/sync", msg)
+	}
+}
+
+func (a *App) handleScheduleToggle(w http.ResponseWriter, r *http.Request) {
+	enable := r.PostFormValue("enabled") == "1"
+	a.scheduleAction(func(id string) (string, error) {
+		if err := a.schedules.SetEnabled(id, enable); err != nil {
+			return "", err
+		}
+		if enable {
+			return fmt.Sprintf("Jadwal %s diaktifkan.", id), nil
+		}
+		return fmt.Sprintf("Jadwal %s dijeda; tidak ada run baru sampai diaktifkan lagi.", id), nil
+	})(w, r)
+}
+
+func (a *App) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
+	a.scheduleAction(func(id string) (string, error) {
+		if err := a.schedules.Delete(id); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("Jadwal %s dihapus. Job yang sudah dimulainya tetap ada di daftar job.", id), nil
+	})(w, r)
+}
+
+func (a *App) handleScheduleRun(w http.ResponseWriter, r *http.Request) {
+	a.scheduleAction(func(id string) (string, error) {
+		run, err := a.schedules.RunNow(r.Context(), id)
+		if err != nil {
+			return "", err
+		}
+		if !run.OK {
+			return "", fmt.Errorf("jadwal %s tidak bisa dijalankan sekarang: %s", id, strings.TrimPrefix(run.Result, "dilewati: "))
+		}
+		return fmt.Sprintf("Jadwal %s dijalankan: %s.", id, run.Result), nil
+	})(w, r)
 }
 
 // jobSummary is "Impor src → dst" or "Hapus folder src", for messages.

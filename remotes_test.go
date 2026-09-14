@@ -189,8 +189,11 @@ func TestRemoteProbeSurfacesProviderErrorWithRemoteHint(t *testing.T) {
 	if err := store.Add(good); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Probe(t.Context(), "wasabi", "backup"); err != nil {
+	if _, err := store.Probe(t.Context(), "wasabi", "backup", true); err != nil {
 		t.Errorf("probe with correct credentials failed: %v", err)
+	}
+	if fake.count("backup") != 1 {
+		t.Errorf("the write probe must clean up its test object: %d objects", fake.count("backup"))
 	}
 
 	bad := good
@@ -199,7 +202,7 @@ func TestRemoteProbeSurfacesProviderErrorWithRemoteHint(t *testing.T) {
 	if err := store.Add(bad); err != nil {
 		t.Fatal(err)
 	}
-	err = store.Probe(t.Context(), "wasabi-bad", "backup")
+	_, err = store.Probe(t.Context(), "wasabi-bad", "backup", false)
 	if err == nil {
 		t.Fatal("probe with a wrong secret must fail")
 	}
@@ -213,10 +216,10 @@ func TestRemoteProbeSurfacesProviderErrorWithRemoteHint(t *testing.T) {
 	if strings.Contains(msg, "WRONG") {
 		t.Error("the secret must never appear in an error")
 	}
-	if err := store.Probe(t.Context(), "nope", "backup"); err == nil {
+	if _, err := store.Probe(t.Context(), "nope", "backup", false); err == nil {
 		t.Error("unknown remote must fail")
 	}
-	if err := store.Probe(t.Context(), "wasabi", "Bad Bucket"); err == nil {
+	if _, err := store.Probe(t.Context(), "wasabi", "Bad Bucket", false); err == nil {
 		t.Error("invalid bucket name must fail before any request")
 	}
 }

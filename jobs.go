@@ -214,6 +214,10 @@ type jobHandle struct {
 	state  JobState
 	cancel context.CancelFunc // non-nil while a runner goroutine is alive
 	live   rcloneStats        // the rclone run in progress
+	// liveListed and liveSkipped are the listing numbers of the chunk in
+	// progress. They are shown while rclone works on it and folded into the
+	// counters for good once the chunk is committed.
+	liveListed, liveSkipped int64
 	// chunkFailed collects the per-object errors of the run in progress,
 	// keyed by relative key so a retried object is counted once.
 	chunkFailed map[string]FailedKey
@@ -242,6 +246,8 @@ func (h *jobHandle) snapshot() JobState {
 		s.Counters.Transferred += h.live.Transfers
 	}
 	s.Counters.Bytes += h.live.Bytes
+	s.Counters.Listed += h.liveListed
+	s.Counters.Skipped += h.liveSkipped
 	s.Counters.Failed += int64(len(h.chunkFailed) + len(h.pendingFailed))
 	return s
 }
@@ -417,11 +423,14 @@ func (m *JobManager) Create(ctx context.Context, spec JobSpec) (JobState, error)
 	if err != nil {
 		return JobState{}, err
 	}
-	if err := probeRemote(ctx, src, spec.Src.Bucket); err != nil {
+	// The source only has to be readable; the destination is also written
+	// to and deleted from, so a read-only key is found out here, not after
+	// a chunk of failed transfers.
+	if _, err := probeRemote(ctx, src, spec.Src.Bucket, spec.Kind == JobDeletePrefix || spec.Kind == JobMovePrefix); err != nil {
 		return JobState{}, fmt.Errorf("sumber tidak bisa diakses: %w", err)
 	}
 	if spec.Kind != JobDeletePrefix {
-		if err := probeRemote(ctx, dst, spec.Dst.Bucket); err != nil {
+		if _, err := probeRemote(ctx, dst, spec.Dst.Bucket, true); err != nil {
 			return JobState{}, fmt.Errorf("tujuan tidak bisa diakses: %w", err)
 		}
 	}
@@ -493,6 +502,7 @@ func (m *JobManager) startLocked(h *jobHandle) {
 	h.mu.Lock()
 	h.cancel = cancel
 	h.live = rcloneStats{}
+	h.liveListed, h.liveSkipped = 0, 0
 	h.chunkFailed = nil
 	h.pendingFailed = nil
 	h.mu.Unlock()
@@ -537,6 +547,7 @@ func (m *JobManager) finish(ctx context.Context, h *jobHandle, err error) {
 	reason := h.state.PauseReason
 	h.cancel = nil
 	h.live = rcloneStats{}
+	h.liveListed, h.liveSkipped = 0, 0
 	h.chunkFailed = nil
 	h.pendingFailed = nil
 	h.mu.Unlock()
@@ -627,6 +638,11 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 			}
 			return err
 		}
+		// Show what the listing found right away; the first chunk of a big
+		// bucket can take a while to transfer.
+		h.mu.Lock()
+		h.liveListed, h.liveSkipped = res.Listed, res.Skipped
+		h.mu.Unlock()
 
 		if res.Keys > 0 {
 			code, last, err := m.rclone.run(ctx, rcloneRun{
@@ -691,6 +707,7 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		h.mu.Lock()
 		h.state.Counters.Listed += res.Listed
 		h.state.Counters.Skipped += res.Skipped
+		h.liveListed, h.liveSkipped = 0, 0
 		if res.Last != "" {
 			h.state.Checkpoint = res.Last
 		}

@@ -35,7 +35,12 @@ type fakeS3 struct {
 	scrambleListing  bool           // emit one page out of order
 	awsStyleEncoding bool           // "+" for space under encoding-type=url
 	undeletable      map[string]bool
-	pageLimit        int // caps max-keys, to force paging in tests
+	pageLimit        int    // caps max-keys, to force paging in tests
+	denyWrites       bool   // PUT/DELETE/COPY answer 403 AccessDenied (read-only key)
+	virtualOnly      bool   // path-style requests answer 403, like Hetzner
+	badKeyBody       string // when set, every request answers 403 with this body (InvalidAccessKeyId)
+	lastHost         string // Host header of the last request, for assertions
+	virtualBase      string // extra base host under which <bucket>.<base> is virtual-hosted
 
 	calls map[string]int
 	srv   *httptest.Server
@@ -71,6 +76,10 @@ func newFakeS3(t *testing.T, accessKey, secretKey, region string) *fakeS3 {
 }
 
 func (f *fakeS3) URL() string { return f.srv.URL }
+
+// hostOnly is the server's host:port, what a virtual-host request appends
+// the bucket to.
+func (f *fakeS3) hostOnly() string { return strings.TrimPrefix(f.srv.URL, "http://") }
 
 func (f *fakeS3) put(bucket, key string, data []byte, contentType string) {
 	f.mu.Lock()
@@ -151,10 +160,40 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bucket, key := splitBucketKey(r.URL.Path)
+	// Virtual-hosted requests carry the bucket in the Host header:
+	// <bucket>.<server host>; path-style ones put it in the path.
+	f.lastHost = r.Host
+	var bucket, key string
+	virtual := false
+	for _, base := range []string{f.hostOnly(), f.virtualBase} {
+		if base == "" {
+			continue
+		}
+		if suffix := "." + base; strings.HasSuffix(r.Host, suffix) {
+			bucket = strings.TrimSuffix(r.Host, suffix)
+			key = strings.TrimPrefix(r.URL.Path, "/")
+			virtual = true
+			break
+		}
+	}
+	if !virtual {
+		bucket, key = splitBucketKey(r.URL.Path)
+	}
 	q := r.URL.Query()
 	op := f.classify(r, key, q)
 	f.calls[op]++
+	if virtual {
+		f.calls[op+".virtual"]++
+	}
+	if f.badKeyBody != "" {
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, f.badKeyBody)
+		return
+	}
+	if f.virtualOnly && !virtual {
+		s3Fail(w, http.StatusForbidden, "AccessDenied", "")
+		return
+	}
 	if op == "ListObjectsV2" && q.Get("start-after") != "" {
 		f.calls["ListObjectsV2.start-after"]++
 	}
@@ -167,6 +206,13 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 		f.failOps[op] = n - 1
 		s3Fail(w, http.StatusInternalServerError, "InternalError", "injected failure for "+op)
 		return
+	}
+	if f.denyWrites {
+		switch op {
+		case "PutObject", "DeleteObject", "DeleteObjects", "CopyObject", "CreateMultipartUpload", "UploadPart", "CompleteMultipartUpload":
+			s3Fail(w, http.StatusForbidden, "AccessDenied", "")
+			return
+		}
 	}
 
 	switch op {

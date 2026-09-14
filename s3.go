@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -52,12 +53,23 @@ type S3 struct {
 	label string
 	// garage selects the Garage-specific troubleshooting text.
 	garage bool
+	// provider is the preset name, for provider-specific hints.
+	provider string
+	// virtualHost addresses buckets as <bucket>.<host> instead of
+	// <host>/<bucket>. Hetzner only accepts the former; Garage, Wasabi, MinIO
+	// and AWS accept both.
+	virtualHost bool
 }
 
 // S3Options tunes a client for an endpoint other than the panel's own Garage.
 type S3Options struct {
-	Label  string
-	Garage bool
+	Label       string
+	Garage      bool
+	Provider    string
+	VirtualHost bool
+	// dialAddr, when set, makes every connection go to this address whatever
+	// the URL's host says. Tests use it so <bucket>.127.0.0.1 resolves.
+	dialAddr string
 }
 
 // NewS3 builds a client for the panel's own Garage. It returns an error when
@@ -86,21 +98,35 @@ func NewS3With(endpoint, accessKey, secretKey, region string, o S3Options) (*S3,
 	if label == "" {
 		label = u.Host
 	}
+	client := &http.Client{
+		Timeout: 5 * time.Minute, // uploads of up to 50 MB
+	}
+	if o.dialAddr != "" {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		client.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, o.dialAddr)
+			},
+		}
+	}
 	return &S3{
-		endpoint:  u,
-		accessKey: accessKey,
-		secretKey: secretKey,
-		region:    region,
-		label:     label,
-		garage:    o.Garage,
-		http: &http.Client{
-			Timeout: 5 * time.Minute, // uploads of up to 50 MB
-		},
+		endpoint:    u,
+		accessKey:   accessKey,
+		secretKey:   secretKey,
+		region:      region,
+		label:       label,
+		garage:      o.Garage,
+		provider:    o.Provider,
+		virtualHost: o.VirtualHost,
+		http:        client,
 	}, nil
 }
 
 // Label reports the human name of the endpoint.
 func (c *S3) Label() string { return c.label }
+
+// VirtualHost reports the addressing style in use.
+func (c *S3) VirtualHost() bool { return c.virtualHost }
 
 // S3Error is a parsed S3 error document.
 type S3Error struct {
@@ -339,16 +365,24 @@ func (c *S3) newRequest(ctx context.Context, method, bucket, key string, params 
 // zero-length payload with Content-Length: 0, which is how folder markers and
 // other empty objects are created.
 func (c *S3) newRequestWith(ctx context.Context, method, bucket, key string, params [][2]string, body []byte, contentType string, extra map[string]string) (*http.Request, error) {
-	rawPath := "/" + bucket
-	if key != "" {
-		rawPath += "/" + key
+	u := *c.endpoint
+	rawPath := "/"
+	if c.virtualHost && bucket != "" {
+		u.Host = bucket + "." + c.endpoint.Host
+		if key != "" {
+			rawPath += key
+		}
+	} else {
+		rawPath += bucket
+		if key != "" {
+			rawPath += "/" + key
+		}
 	}
 	// The wire path and the signed canonical path must be byte-identical, so
 	// set RawPath explicitly instead of letting net/url pick its own escaping.
 	encodedPath := awsURIEncode(rawPath, false)
 	cq := canonicalQuery(params)
 
-	u := *c.endpoint
 	u.Path = rawPath
 	u.RawPath = encodedPath
 	u.RawQuery = cq
@@ -408,8 +442,55 @@ func (c *S3) errorFromBody(op string, status int, raw []byte) *S3Error {
 	if len(s3err.Body) > 500 {
 		s3err.Body = s3err.Body[:500] + "…"
 	}
-	s3err.Hint = c.forbiddenHint(s3err)
+	s3err.Hint = c.hintFor(s3err)
 	return s3err
+}
+
+// hintFor turns the answers that are easy to misread into next steps.
+func (c *S3) hintFor(e *S3Error) string {
+	code := e.Code
+	blob := strings.ToLower(e.Message + " " + e.Body)
+	switch {
+	case code == "InvalidAccessKeyId" || strings.Contains(blob, "malformed access key"):
+		hint := "Access key ini tidak dikenal oleh " + c.label + " — ini soal access key ID, bukan secret atau izin.\n"
+		switch c.provider {
+		case "Backblaze":
+			hint += "Backblaze B2: pakai keyID dari application key yang dibuat manual (Application Keys → Add a New Application Key).\n" +
+				"Master application key tidak bisa dipakai di S3 API, dan yang dimasukkan harus keyID-nya, bukan nama key."
+		case "Hetzner":
+			hint += "Hetzner: buat kredensial S3 di Cloud Console → Object Storage → Manage credentials, lalu masukkan Access Key-nya (32 karakter hex)."
+		default:
+			hint += "Periksa access key ID-nya (bukan nama key atau secret), dan pastikan key itu dibuat di akun/project yang sama dengan bucket."
+		}
+		return hint
+	case code == "AuthorizationHeaderMalformed" || code == "PermanentRedirect" || code == "TemporaryRedirect":
+		return "Endpoint atau region tidak cocok dengan lokasi bucket. Pesan di atas biasanya menyebut region yang benar;\n" +
+			"ubah endpoint dan region remote ini sesuai region bucket (region yang dipakai sekarang: " + strconv.Quote(c.region) + ")."
+	case code == "NoSuchBucket":
+		return "Bucket tidak ada di endpoint ini. Periksa ejaannya, dan pastikan endpoint/region sesuai lokasi bucket — bucket di region lain tidak terlihat dari sini."
+	case e.StatusCode == http.StatusForbidden:
+		return c.forbiddenHint(e)
+	}
+	return ""
+}
+
+// writeDeniedHint explains a write that was refused although reading works.
+func (c *S3) writeDeniedHint() string {
+	hint := "Bucket bisa dibaca, tapi menulis ke sana ditolak. Penyebab yang paling sering:\n" +
+		"  1. Key hanya punya izin baca (read-only) — cek izin/policy key di penyedia.\n" +
+		"  2. Bucket milik akun/project lain: bucket public bisa di-list siapa saja, tapi hanya pemiliknya yang boleh menulis."
+	switch c.provider {
+	case "Hetzner":
+		hint += "\n  3. Hetzner: kredensial S3 berlaku per project — bucket dan kredensial harus dari project yang sama,\n" +
+			"     dan alamatnya harus virtual-host (panel mencoba kedua gaya alamat saat tes koneksi)."
+	case "Backblaze":
+		hint += "\n  3. Backblaze: application key perlu capability writeFiles dan deleteFiles, dan kalau dibatasi ke bucket, harus bucket ini."
+	case "Garage", "Other":
+		if c.garage {
+			hint += "\n  3. Garage: beri izin dengan  garage bucket allow --read --write <bucket> --key <nama-key-panel>"
+		}
+	}
+	return hint
 }
 
 // decodeXMLResult reads a 2xx response body into out. CopyObject and a few

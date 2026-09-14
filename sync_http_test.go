@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -271,7 +272,7 @@ func TestSyncPagesRequireLoginAndCSRF(t *testing.T) {
 		t.Errorf("/sync without login: %d", resp.StatusCode)
 	}
 	p.login(t, "admin", testPassword)
-	for _, path := range []string{"/sync/remotes/add", "/sync/remotes/delete", "/sync/remotes/test", "/sync/jobs/create", "/sync/jobs/pause", "/sync/jobs/resume", "/sync/jobs/rerun", "/sync/jobs/cancel", "/sync/jobs/delete"} {
+	for _, path := range []string{"/sync/remotes/add", "/sync/remotes/update", "/sync/remotes/delete", "/sync/remotes/test", "/sync/jobs/create", "/sync/jobs/pause", "/sync/jobs/resume", "/sync/jobs/rerun", "/sync/jobs/cancel", "/sync/jobs/delete", "/sync/schedules/create", "/sync/schedules/toggle", "/sync/schedules/delete", "/sync/schedules/run"} {
 		resp, err := p.client.PostForm(p.srv.URL+path, url.Values{"name": {"x"}, "id": {"0123456789abcdef"}})
 		if err != nil {
 			t.Fatal(err)
@@ -280,5 +281,120 @@ func TestSyncPagesRequireLoginAndCSRF(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Errorf("%s without CSRF token: %d", path, resp.StatusCode)
 		}
+	}
+}
+
+func TestSchedulesThroughTheUI(t *testing.T) {
+	p := newTestPanel(t)
+	p.addTestRemote(t)
+	p.garage.addBucket("arsip", 0, 0, false)
+	p.remote.put("backup", "a.txt", []byte("a"), "text/plain")
+	form := url.Values{
+		"direction": {"import"}, "remote": {"wasabi"}, "remote_bucket": {"backup"},
+		"garage_bucket": {"arsip"}, "mode": {"skip-existing"}, "transfers": {"2"},
+	}
+
+	// Too short an interval is refused with the limit spelled out.
+	form.Set("every", "5m")
+	resp := p.post(t, "/sync/schedules/create", form)
+	if body := p.followFlash(t, resp); !strings.Contains(body, "interval minimal 15 menit") {
+		t.Errorf("short interval: %s", firstLines(body))
+	}
+	if n := len(p.app.schedules.List()); n != 0 {
+		t.Fatalf("schedule saved despite the error: %d", n)
+	}
+
+	// A valid one, with the first run picked on the form.
+	first := time.Now().Add(2 * time.Hour)
+	form.Set("every", "6h")
+	form.Set("first_run", first.Format("2006-01-02T15:04"))
+	resp = p.post(t, "/sync/schedules/create", form)
+	if body := p.followFlash(t, resp); !strings.Contains(body, "setiap 6 jam") || !strings.Contains(body, "Impor wasabi:backup/ → garage:arsip/") {
+		t.Errorf("create: %s", firstLines(body))
+	}
+	items := p.app.schedules.List()
+	if len(items) != 1 || !items[0].Enabled || items[0].NextRun.Sub(first).Abs() > time.Minute {
+		t.Fatalf("stored schedule: %+v", items)
+	}
+	id := items[0].ID
+	_, body := p.get(t, "/sync")
+	for _, want := range []string{`data-schedule="` + id + `"`, "setiap 6 jam", "Jalankan sekarang", `action="/sync/schedules/toggle"`, "belum pernah"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sync page missing %q: %s", want, firstLines(body))
+		}
+	}
+
+	// Pause and re-enable.
+	resp = p.post(t, "/sync/schedules/toggle", url.Values{"id": {id}, "enabled": {"0"}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "dijeda") || !strings.Contains(body, "Aktifkan") {
+		t.Errorf("pause: %s", firstLines(body))
+	}
+	if it, _ := p.app.schedules.Get(id); it.Enabled {
+		t.Error("still enabled after pause")
+	}
+	resp = p.post(t, "/sync/schedules/toggle", url.Values{"id": {id}, "enabled": {"1"}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "diaktifkan") {
+		t.Errorf("enable: %s", firstLines(body))
+	}
+
+	// "Jalankan sekarang" starts a job immediately and records the run.
+	resp = p.post(t, "/sync/schedules/run", url.Values{"id": {id}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "dijalankan") {
+		t.Errorf("run now: %s", firstLines(body))
+	}
+	p.waitJobs(t, func(js []jobView) bool { return len(js) == 1 && !js[0].Active })
+	it, _ := p.app.schedules.Get(id)
+	if len(it.Runs) != 1 || !it.Runs[0].OK || it.Runs[0].JobID == "" {
+		t.Fatalf("run history: %+v", it.Runs)
+	}
+	_, body = p.get(t, "/sync")
+	if !strings.Contains(body, `href="#job-`+it.Runs[0].JobID+`"`) || !strings.Contains(body, "job "+it.Runs[0].JobID+" dimulai") {
+		t.Errorf("last run not shown: %s", firstLines(body))
+	}
+	if p.s3.count("arsip") != 1 {
+		t.Errorf("scheduled job copied %d objects, want 1", p.s3.count("arsip"))
+	}
+
+	// The remote stays while a schedule refers to it.
+	resp = p.post(t, "/sync/remotes/delete", url.Values{"name": {"wasabi"}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "dipakai sebuah jadwal") {
+		t.Errorf("delete remote in use by schedule: %s", firstLines(body))
+	}
+
+	resp = p.post(t, "/sync/schedules/delete", url.Values{"id": {id}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "dihapus") {
+		t.Errorf("delete: %s", firstLines(body))
+	}
+	if n := len(p.app.schedules.List()); n != 0 {
+		t.Errorf("schedule still listed after delete: %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(p.app.cfg.StateDir, schedulesFileName)); err != nil {
+		t.Errorf("schedules.json: %v", err)
+	}
+}
+
+func TestJobCountersShowTheListingWhileRcloneWorks(t *testing.T) {
+	p := newTestPanel(t)
+	p.addTestRemote(t)
+	p.garage.addBucket("arsip", 0, 0, false)
+	for i := 0; i < 3; i++ {
+		p.remote.put("backup", fmt.Sprintf("f%d.txt", i), []byte("x"), "text/plain")
+	}
+	p.s3.put("arsip", "f0.txt", []byte("x"), "text/plain")
+	if err := os.WriteFile(filepath.Join(p.rcDir, "sleep"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.post(t, "/sync/jobs/create", url.Values{"direction": {"import"}, "remote": {"wasabi"}, "remote_bucket": {"backup"}, "garage_bucket": {"arsip"}, "mode": {"skip-existing"}, "transfers": {"1"}})
+	// While the (slow) fake rclone works on the first chunk, the listing
+	// numbers are already visible.
+	js := p.waitJobs(t, func(js []jobView) bool {
+		return len(js) == 1 && js[0].Status == JobRunning && js[0].Counters.Listed == 3
+	})
+	if js[0].Counters.Skipped != 1 || js[0].Counters.Chunks != 0 {
+		t.Errorf("mid-chunk counters: %+v", js[0].Counters)
+	}
+	js = p.waitJobs(t, func(js []jobView) bool { return len(js) == 1 && !js[0].Active })
+	if c := js[0].Counters; c.Listed != 3 || c.Skipped != 1 || c.Transferred != 2 || c.Chunks != 1 {
+		t.Errorf("final counters: %+v", c)
 	}
 }

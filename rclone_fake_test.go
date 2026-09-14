@@ -124,7 +124,9 @@ func fakeRcloneMain(args []string) int {
 
 	remote := func(alias string) (Remote, error) {
 		prefix := "RCLONE_CONFIG_" + strings.ToUpper(alias) + "_"
-		r := Remote{Name: alias}
+		// The fake always talks path-style: <bucket>.127.0.0.1 would not
+		// resolve. FORCE_PATH_STYLE is still recorded for assertions.
+		r := Remote{Name: alias, Addressing: AddressingPath}
 		for _, kv := range os.Environ() {
 			k, v, _ := strings.Cut(kv, "=")
 			switch strings.TrimPrefix(k, prefix) {
