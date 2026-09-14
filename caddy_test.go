@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,8 +86,10 @@ func TestAddDomainRollsBackOnReloadFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "Error during parsing") {
 		t.Errorf("Caddy stderr not surfaced: %v", err)
 	}
-	if !strings.Contains(err.Error(), "rollback") {
-		t.Errorf("rollback not reported: %v", err)
+	// The stub fails every reload, so the reload after the rollback fails too.
+	// The message must still make clear the change itself was undone.
+	if !strings.Contains(err.Error(), "SUDAH dibatalkan") {
+		t.Errorf("undo not reported to the user: %v", err)
 	}
 	entries, _ := os.ReadDir(c.dir)
 	if len(entries) != 0 {
@@ -269,5 +272,48 @@ func TestDeleteWhitelist(t *testing.T) {
 	}
 	if err := c.DeleteWhitelist(ctx); err == nil {
 		t.Error("deleting a missing whitelist should report that it is not there")
+	}
+}
+
+// Kalau ada file lain di direktori sites yang sudah rusak lebih dulu, reload
+// akan gagal terus. Panel tetap harus membatalkan perubahannya sendiri, dan
+// pesannya tidak boleh menuduh rollback-nya yang gagal — file panel memang
+// sudah bersih. Ditemukan saat menguji dengan Caddy sungguhan.
+func TestPreExistingBreakageIsNotReportedAsFailedRollback(t *testing.T) {
+	c := newTestCaddy(t, reloadFail)
+
+	err := c.AddDomain(context.Background(), "cdn.example.com", "media")
+	if err == nil {
+		t.Fatal("reload seharusnya gagal")
+	}
+
+	// File panel harus sudah hilang lagi.
+	if _, statErr := os.Stat(filepath.Join(c.dir, "cdn.example.com.caddy")); !os.IsNotExist(statErr) {
+		t.Error("file panel tidak dibatalkan")
+	}
+
+	var re *ReloadError
+	if !errors.As(err, &re) {
+		t.Fatalf("tipe error tidak terduga: %T", err)
+	}
+	if re.RollbackErr != nil {
+		t.Errorf("RollbackErr terisi padahal file berhasil dikembalikan: %v", re.RollbackErr)
+	}
+	if !re.RolledBack {
+		t.Error("RolledBack harus true")
+	}
+	if re.StillBroken == nil {
+		t.Error("StillBroken harus terisi karena reload kedua juga gagal")
+	}
+
+	msg := err.Error()
+	if strings.Contains(msg, "rollback gagal") {
+		t.Errorf("pesan menuduh rollback gagal padahal tidak:\n%s", msg)
+	}
+	if !strings.Contains(msg, "SUDAH dibatalkan") {
+		t.Errorf("pesan tidak menjelaskan bahwa perubahan sudah dibatalkan:\n%s", msg)
+	}
+	if !strings.Contains(msg, "di luar perubahan ini") {
+		t.Errorf("pesan tidak mengarahkan ke penyebab sebenarnya:\n%s", msg)
 	}
 }

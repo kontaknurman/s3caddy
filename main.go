@@ -1487,7 +1487,13 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 
 	// Hard cap on the whole request so a huge body can never be buffered.
 	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize+(1<<20))
-	if err := r.ParseMultipartForm(MaxUploadSize + (1 << 20)); err != nil {
+	// maxMemory sengaja kecil. Isi file tetap dibaca seluruhnya nanti untuk
+	// menghitung sha256, jadi kalau multipart juga menahannya di memori,
+	// puncak pemakaian jadi dua kali ukuran file. Dengan batas kecil ini file
+	// besar tumpah ke temp file (PrivateTmp di unit systemd) dan hanya
+	// tersalin sekali.
+	const multipartMemory = 4 << 20
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		writeJSON(w, http.StatusBadRequest, uploadResult{
 			Error: fmt.Sprintf("upload ditolak (maksimal %s per file): %v", humanBytes(MaxUploadSize), err),
 		})

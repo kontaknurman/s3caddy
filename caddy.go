@@ -69,6 +69,11 @@ type ReloadError struct {
 	Journal     string
 	RolledBack  bool
 	RollbackErr error
+	// StillBroken diisi kalau file sudah berhasil dikembalikan tapi Caddy tetap
+	// menolak config-nya. Itu berarti kerusakannya ada di luar perubahan ini —
+	// misalnya file lain yang diedit manual — jadi jangan dilaporkan seolah
+	// rollback-nya yang gagal.
+	StillBroken error
 }
 
 func (e *ReloadError) Error() string {
@@ -88,7 +93,11 @@ func (e *ReloadError) Error() string {
 	}
 	switch {
 	case e.RollbackErr != nil:
-		fmt.Fprintf(&b, "\n\nPERINGATAN: rollback gagal: %v — periksa %s secara manual.", e.RollbackErr, "direktori sites Caddy")
+		fmt.Fprintf(&b, "\n\nPERINGATAN: rollback gagal: %v — periksa direktori sites Caddy secara manual.", e.RollbackErr)
+	case e.StillBroken != nil:
+		b.WriteString("\n\nPerubahanmu SUDAH dibatalkan — file yang tadi ditulis panel sudah dihapus lagi. " +
+			"Tapi Caddy tetap menolak memuat config-nya, jadi ada yang rusak di luar perubahan ini " +
+			"(kemungkinan file lain di direktori sites yang diedit manual). Lihat pesan Caddy di atas.")
 	case e.RolledBack:
 		b.WriteString("\n\nPerubahan sudah dibatalkan (rollback), config Caddy kembali seperti semula.")
 	}
@@ -330,11 +339,12 @@ func (c *CaddyManager) applyLocked(ctx context.Context, path string, newContent 
 		reloadErr.RollbackErr = err
 		return reloadErr
 	}
-	if err := c.reload(ctx); err != nil {
-		reloadErr.RollbackErr = fmt.Errorf("reload setelah rollback juga gagal: %w", err)
-		return reloadErr
-	}
+	// File sudah kembali seperti semula. Kalau reload berikutnya masih gagal,
+	// yang rusak bukan perubahan ini.
 	reloadErr.RolledBack = true
+	if err := c.reload(ctx); err != nil {
+		reloadErr.StillBroken = err
+	}
 	return reloadErr
 }
 

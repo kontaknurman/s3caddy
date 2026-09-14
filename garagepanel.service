@@ -22,7 +22,18 @@ RestartSec=5s
 # "sudo systemctl reload caddy", dan sudo butuh setuid. Kalau baris ini diubah
 # ke "yes", reload akan selalu gagal dengan "sudo: effective uid is not 0".
 # Untuk alasan yang sama JANGAN menambahkan RestrictSUIDSGID=yes.
+#
+# JANGAN pula menambahkan SystemCallFilter=. systemd mendokumentasikan bahwa
+# daftar filter yang tidak kosong mengimplikasikan NoNewPrivileges=yes, dan itu
+# mematikan sudo. Skor "systemd-analyze security" memang akan menyebut baris ini
+# sebagai kekurangan — itu memang harga yang dibayar supaya reload Caddy jalan.
 NoNewPrivileges=no
+
+# Default umask 0022 membuat file baru bisa dibaca siapa saja. 0077 aman di sini
+# karena file site di-chmod 0640 secara eksplisit oleh panel (chmod mengabaikan
+# umask) — sudah diuji: hasilnya tetap garagepanel:caddy 0640 dan Caddy tetap
+# bisa membacanya. Sisanya, termasuk file sementara upload, jadi 0600.
+UMask=0077
 
 ProtectSystem=full
 # /etc read-only karena ProtectSystem=full, jadi direktori sites dibuka lagi:
@@ -36,8 +47,11 @@ ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-# Panel hanya perlu loopback.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_PACKET dan keluarga soket eksotis diblokir, tapi AF_NETLINK harus tetap
+# diizinkan: diukur dengan strace, satu kali "sudo systemctl reload caddy"
+# membuka 14 soket netlink (sebagian besar NETLINK_AUDIT dari libaudit di dalam
+# PAM). Memblokirnya berisiko membuat satu-satunya operasi istimewa panel gagal.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 # Batas wajar: panel menyangga file upload sampai 50 MB di memori.
 LimitNOFILE=4096

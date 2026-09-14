@@ -34,6 +34,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Langkah 9 — Buka panel lewat SSH tunnel](#langkah-9--buka-panel-lewat-ssh-tunnel)
   - [Langkah 10 — Uji coba end-to-end](#langkah-10--uji-coba-end-to-end)
   - [Checklist instalasi](#checklist-instalasi)
+- [Diverifikasi di Ubuntu 24.04](#diverifikasi-di-ubuntu-2404)
 - [Login dan akses lewat domain](#login-dan-akses-lewat-domain)
 - [Update ke versi baru](#update-ke-versi-baru)
 - [Backup dan pemulihan](#backup-dan-pemulihan)
@@ -556,6 +557,11 @@ Isi — pakai **path hasil perintah di atas**:
 garagepanel ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy
 ```
 
+> **Di Ubuntu, `/bin/systemctl` sudah benar** walaupun `command -v systemctl`
+> menjawab `/usr/bin/systemctl`: `/bin` adalah symlink ke `/usr/bin` dan sudo
+> mencocokkannya. Sudah diuji di Ubuntu 24.04 — lihat
+> [Diverifikasi di Ubuntu 24.04](#diverifikasi-di-ubuntu-2404).
+
 Kalau tidak yakin, daftarkan dua-duanya:
 
 ```sudoers
@@ -795,6 +801,48 @@ garage key delete uji-panel-key     # tambahkan --yes kalau diminta konfirmasi
 | 9 | Tunnel | buka `http://127.0.0.1:8090` | halaman Buckets |
 | 10 | Uji end-to-end | upload + thumbnail muncul | semua hijau |
 | — | *(opsional)* [Login](#login-dan-akses-lewat-domain) | buka panel setelah restart | form login muncul |
+
+## Diverifikasi di Ubuntu 24.04
+
+Seluruh prosedur di atas dijalankan di Ubuntu 24.04.4 LTS dengan systemd 255 dan
+Caddy 2.11.4 dari repositori resmi. Yang diuji bukan sekadar "perintahnya jalan",
+tapi klaim-klaim yang jadi dasar desainnya:
+
+| Yang diklaim | Cara membuktikan | Hasil |
+|---|---|---|
+| Caddyfile buatan panel sah | `caddy validate` atas config lengkap termasuk `import` | `Valid configuration` |
+| `header_up Host <bucket>` benar-benar mengganti Host | upstream tiruan menggemakan header yang diterima | `Host diterima upstream: media` |
+| Whitelist membuka baca, menutup tulis | request dari IP tak terdaftar | GET/HEAD `200`; PUT/POST/DELETE/PATCH `403` |
+| Whitelist meloloskan IP terdaftar | IP dimasukkan ke daftar | PUT/DELETE `200` |
+| Caddy bisa membaca file buatan panel | `sudo -u caddy caddy validate` | `Valid configuration` |
+| Caddy **tidak** bisa menulis di sana | `sudo -u caddy` menulis file | `Permission denied` |
+| Reload gagal terdeteksi | file site sengaja dirusak lalu reload | exit `1` + nama file dan nomor baris |
+| Rollback bekerja | reload dipaksa gagal saat menambah domain | file panel terhapus lagi, pesan Caddy tampil di UI |
+| sudoers hanya mengizinkan satu perintah | `sudo -n -l` untuk perintah lain | `restart caddy` dan perintah lain ditolak |
+| Unit systemd sah | `systemd-analyze verify` | tanpa keluhan |
+
+### Hal khas Ubuntu
+
+**`systemctl` ada di `/usr/bin`, bukan `/bin`.** Default panel memanggil
+`/bin/systemctl`, dan itu **tetap benar di Ubuntu**: `/bin` adalah symlink ke
+`/usr/bin` (usrmerge), dan sudo mencocokkannya. Sudah diuji dua arah — entri
+sudoers `/bin/systemctl` mengizinkan pemanggilan lewat `/bin` maupun `/usr/bin`,
+sementara `systemctl restart caddy` tetap ditolak. Jadi baris sudoers di
+[Langkah 5](#langkah-5--pasang-sudoers) bisa dipakai apa adanya.
+
+**AppArmor bukan penghalang.** Paket Caddy dari repositori resmi tidak memasang
+profil AppArmor sama sekali (`dpkg -L caddy | grep apparmor` kosong), dan tidak
+ada profil untuk panel. Bagian SELinux di [Troubleshooting](#troubleshooting)
+hanya berlaku untuk Fedora/RHEL — Ubuntu tidak memakainya.
+
+**Paket Caddy memakai `ExecReload=caddy reload --config … --force`,** yang
+memvalidasi config dan mengembalikan exit code bukan 0 kalau gagal. Itulah yang
+membuat rollback panel bisa bekerja; sudah dibuktikan dengan merusak satu file
+site dan memeriksa exit code-nya.
+
+**`ss`** (dipakai di satu perintah troubleshooting) berasal dari paket
+`iproute2`, yang biasanya sudah ada di instalasi Ubuntu Server. Kalau tidak:
+`sudo apt install iproute2`.
 
 ## Login dan akses lewat domain
 
@@ -1138,7 +1186,8 @@ lalu reload lagi. Nama berawalan `_` diabaikan panel.
 
 **`Tidak bisa listen di 127.0.0.1:8090: address already in use`** — ada proses
 lain di port itu, sering kali instance panel lama. Cek dengan
-`sudo ss -lntp | grep 8090`, matikan, atau ganti `LISTEN` ke port lain.
+`sudo ss -lntp | grep 8090` (paket `iproute2`), matikan, atau ganti `LISTEN` ke
+port lain.
 
 **`PANEL_DOMAIN diisi tapi PANEL_PASSWORD_HASH kosong`** — panel sengaja menolak
 start. Buat hash-nya (`garagepanel -hash-password`), atau kosongkan
@@ -1175,8 +1224,10 @@ dengan yang dipanggil panel. Bandingkan `command -v systemctl` dengan
 **`tidak bisa menulis di /etc/caddy/sites`** — cek kepemilikan direktori:
 `stat -c '%U %G %a' /etc/caddy/sites` harus `garagepanel caddy 2750`.
 
-**Permission ditolak padahal kepemilikan sudah benar (Fedora/RHEL/Rocky)** —
-SELinux kemungkinan memblokirnya. Periksa dulu apakah memang itu penyebabnya:
+**Permission ditolak padahal kepemilikan sudah benar (Fedora/RHEL/Rocky —
+BUKAN Ubuntu)** — SELinux kemungkinan memblokirnya. Ubuntu memakai AppArmor dan
+paket Caddy resminya tidak memasang profil apa pun, jadi di Ubuntu penyebabnya
+hampir pasti kepemilikan direktori, bukan LSM. Periksa dulu apakah memang itu penyebabnya:
 
 ```bash
 getenforce                                    # Enforcing?
