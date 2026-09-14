@@ -71,14 +71,32 @@ func env(key, def string) string {
 	return def
 }
 
+// secretEnv membaca kredensial dan memangkas spasi di ujungnya.
+//
+// systemd tidak membuang "\r" dari EnvironmentFile yang berakhiran CRLF, dan
+// satu spasi yang tak sengaja terbawa saat menempel juga ikut masuk. Keduanya
+// menghasilkan kegagalan yang sangat membingungkan: tanda tangan SigV4 tidak
+// cocok ("Invalid signature") padahal Access Key ID terlihat benar. Panel
+// memberi peringatan supaya penyebabnya kelihatan, tapi tidak pernah mencetak
+// nilainya.
+func secretEnv(key string) string {
+	raw := os.Getenv(key)
+	trimmed := strings.Trim(raw, " \t\r\n")
+	if raw != trimmed && trimmed != "" {
+		log.Printf("PERINGATAN: %s punya spasi/baris baru di ujungnya dan sudah dipangkas. "+
+			"Periksa /etc/garagepanel/garagepanel.env — file berakhiran CRLF adalah penyebab yang paling sering.", key)
+	}
+	return trimmed
+}
+
 func loadConfig() (*Config, error) {
 	cfg := &Config{
-		AdminToken:  os.Getenv("GARAGE_ADMIN_TOKEN"),
+		AdminToken:  secretEnv("GARAGE_ADMIN_TOKEN"),
 		AdminURL:    env("GARAGE_ADMIN_URL", "http://127.0.0.1:3903"),
 		S3URL:       env("GARAGE_S3_URL", "http://127.0.0.1:3900"),
 		WebURL:      env("GARAGE_WEB_URL", "http://127.0.0.1:3902"),
-		S3AccessKey: os.Getenv("GARAGE_S3_ACCESS_KEY"),
-		S3SecretKey: os.Getenv("GARAGE_S3_SECRET_KEY"),
+		S3AccessKey: secretEnv("GARAGE_S3_ACCESS_KEY"),
+		S3SecretKey: secretEnv("GARAGE_S3_SECRET_KEY"),
 		S3Region:    env("GARAGE_S3_REGION", "garage"),
 		SitesDir:    env("CADDY_SITES_DIR", "/etc/caddy/sites"),
 		S3APIDomain: strings.TrimSpace(os.Getenv("S3_API_DOMAIN")),

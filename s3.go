@@ -69,6 +69,9 @@ type S3Error struct {
 	Code       string
 	Message    string
 	Body       string
+	// Hint menerjemahkan penolakan yang mudah disalahartikan menjadi langkah
+	// yang bisa ditindaklanjuti.
+	Hint string
 }
 
 func (e *S3Error) Error() string {
@@ -82,7 +85,47 @@ func (e *S3Error) Error() string {
 	case e.Body != "":
 		fmt.Fprintf(&b, ": %s", e.Body)
 	}
+	if e.Hint != "" {
+		fmt.Fprintf(&b, "\n\n%s", e.Hint)
+	}
 	return b.String()
+}
+
+// forbiddenHint menjelaskan penolakan 403, yang punya dua sebab yang sangat
+// berbeda dan gampang tertukar: tanda tangan yang tidak cocok, versus key yang
+// memang belum diberi izin.
+func (c *S3) forbiddenHint(e *S3Error) string {
+	if e.StatusCode != http.StatusForbidden {
+		return ""
+	}
+	blob := strings.ToLower(e.Message + " " + e.Code + " " + e.Body)
+
+	if strings.Contains(blob, "signature") {
+		return "Tanda tangan SigV4 ditolak — ini BUKAN soal izin bucket, dan tidak ada\n" +
+			"hubungannya dengan status public/private bucket. Yang perlu dicek:\n" +
+			"\n" +
+			"  1. GARAGE_S3_SECRET_KEY salah ketik atau terpotong. Spasi atau carriage\n" +
+			"     return yang ikut terbawa juga menyebabkan ini — file env berakhiran\n" +
+			"     CRLF adalah penyebab tersering. Cek dengan:\n" +
+			"       sudo cat -A /etc/garagepanel/garagepanel.env | grep SECRET\n" +
+			"     Kalau ujung barisnya bukan hanya tanda dolar, ubah ke LF:\n" +
+			"       sudo sed -i 's/\\r$//' /etc/garagepanel/garagepanel.env\n" +
+			"\n" +
+			"  2. Region tidak cocok. Panel menandatangani dengan region " + strconv.Quote(c.region) + ";\n" +
+			"     itu harus sama persis dengan s3_region di /etc/garage.toml:\n" +
+			"       sudo grep s3_region /etc/garage.toml\n" +
+			"\n" +
+			"  3. Jam server meleset jauh — tanda tangan memuat stempel waktu:\n" +
+			"       timedatectl status | grep 'System clock'\n" +
+			"\n" +
+			"Setelah diperbaiki: sudo systemctl restart garagepanel"
+	}
+
+	return "Kredensialnya diterima, tapi aksinya ditolak — kemungkinan besar key panel\n" +
+		"belum diberi izin pada bucket ini. Status public/private bucket tidak\n" +
+		"berpengaruh di sini: halaman Objek selalu lewat S3 API, bukan lewat web\n" +
+		"endpoint. Beri izin dengan:\n" +
+		"  garage bucket allow --read --write <bucket> --key <nama-key-panel>"
 }
 
 // NotFound reports whether the object or bucket does not exist.
@@ -260,9 +303,7 @@ func (c *S3) do(req *http.Request, op string) (*http.Response, error) {
 		if len(s3err.Body) > 500 {
 			s3err.Body = s3err.Body[:500] + "…"
 		}
-		if resp.StatusCode == http.StatusForbidden && s3err.Message == "" {
-			s3err.Message = "akses ditolak — periksa GARAGE_S3_ACCESS_KEY/GARAGE_S3_SECRET_KEY dan izin key pada bucket ini"
-		}
+		s3err.Hint = c.forbiddenHint(s3err)
 		return nil, s3err
 	}
 	return resp, nil

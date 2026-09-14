@@ -324,3 +324,92 @@ func TestPublicURLEscapesKey(t *testing.T) {
 		t.Errorf("publicURL is not parseable: %v", err)
 	}
 }
+
+// Garage menjawab 403 untuk dua hal yang sangat berbeda: tanda tangan yang
+// tidak cocok, dan key yang belum diberi izin. Pesannya harus membedakannya —
+// menyuruh orang memeriksa izin bucket saat masalahnya secret key yang salah
+// akan membuang waktu berjam-jam.
+func TestForbiddenHintDistinguishesSignatureFromPermission(t *testing.T) {
+	c := newTestS3(t, "http://127.0.0.1:3900")
+
+	sig := c.forbiddenHint(&S3Error{
+		StatusCode: http.StatusForbidden,
+		Code:       "AccessDenied",
+		Message:    "Forbidden: Invalid signature",
+	})
+	for _, want := range []string{
+		"BUKAN soal izin bucket",
+		"GARAGE_S3_SECRET_KEY",
+		"CRLF",
+		`"garage"`, // region yang sedang dipakai panel
+		"s3_region",
+		"timedatectl",
+	} {
+		if !strings.Contains(sig, want) {
+			t.Errorf("hint tanda tangan tidak menyebut %q:\n%s", want, sig)
+		}
+	}
+
+	perm := c.forbiddenHint(&S3Error{
+		StatusCode: http.StatusForbidden,
+		Code:       "AccessDenied",
+		Message:    "Access denied for this key",
+	})
+	if !strings.Contains(perm, "garage bucket allow") {
+		t.Errorf("hint izin tidak memberi perintahnya:\n%s", perm)
+	}
+	if strings.Contains(perm, "GARAGE_S3_SECRET_KEY") {
+		t.Error("hint izin tidak boleh mengarahkan ke secret key")
+	}
+
+	if got := c.forbiddenHint(&S3Error{StatusCode: http.StatusNotFound}); got != "" {
+		t.Errorf("hint hanya untuk 403, dapat: %q", got)
+	}
+}
+
+// Region yang sedang dipakai harus ikut disebut, karena itu justru yang perlu
+// dibandingkan dengan garage.toml.
+func TestForbiddenHintNamesTheConfiguredRegion(t *testing.T) {
+	c, err := NewS3("http://127.0.0.1:3900", "GK", "rahasia", "id-jakarta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hint := c.forbiddenHint(&S3Error{StatusCode: http.StatusForbidden, Message: "Invalid signature"})
+	if !strings.Contains(hint, `"id-jakarta"`) {
+		t.Errorf("hint tidak menyebut region yang dipakai:\n%s", hint)
+	}
+}
+
+// Secret key dengan carriage return di ujungnya menghasilkan tanda tangan yang
+// berbeda — persis kegagalan yang dilaporkan. Ini memastikan pemangkasan di
+// secretEnv memang menyelesaikannya.
+func TestTrailingCarriageReturnChangesTheSignature(t *testing.T) {
+	const secret = "b1946ac92492d2347c6235b4d2611184"
+	fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	sign := func(sec string) string {
+		c := &S3{accessKey: "GK", secretKey: sec, region: "garage"}
+		req, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:3900/media", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.sign(req, "/media", "", emptyPayloadHash, fixed)
+		return signatureFrom(req.Header.Get("Authorization"))
+	}
+
+	clean := sign(secret)
+	if withCR := sign(secret + "\r"); withCR == clean {
+		t.Fatal("carriage return tidak mengubah tanda tangan — tes ini tidak membuktikan apa pun")
+	}
+	if withSpace := sign(secret + " "); withSpace == clean {
+		t.Fatal("spasi di ujung tidak mengubah tanda tangan")
+	}
+
+	// secretEnv harus memangkas keduanya sehingga tanda tangannya kembali sama.
+	for _, dirty := range []string{secret + "\r", secret + " ", secret + "\r\n", "\t" + secret + " "} {
+		t.Setenv("UJI_SECRET", dirty)
+		if got := secretEnv("UJI_SECRET"); got != secret {
+			t.Errorf("secretEnv(%q) = %q, want %q", dirty, got, secret)
+		}
+	}
+}

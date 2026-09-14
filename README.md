@@ -1272,9 +1272,36 @@ Di Debian/Ubuntu dengan AppArmor, profil bawaan Caddy tidak membatasi panel
 **Halaman Objek bilang kredensial belum diatur** — `GARAGE_S3_ACCESS_KEY` /
 `GARAGE_S3_SECRET_KEY` kosong di env file.
 
-**Bucket muncul di daftar tapi objeknya kosong / `AccessDenied`** — key panel
-belum diberi izin pada bucket lama:
-`garage bucket allow --read --write <bucket> --key garagepanel`.
+**`AccessDenied: Forbidden: Invalid signature` di halaman Objek** — ini **bukan**
+soal izin, dan tidak ada hubungannya dengan status public/private bucket:
+halaman Objek selalu lewat S3 API (SigV4), bukan lewat web endpoint. Tanda
+tangannya yang tidak cocok. Tiga penyebab, berurutan dari yang paling sering:
+
+1. **`GARAGE_S3_SECRET_KEY` membawa spasi atau carriage return.** systemd tidak
+   membuang `\r` dari EnvironmentFile berakhiran CRLF, dan hasilnya secret yang
+   berbeda satu byte — Access Key ID tetap terlihat benar, jadi penyebabnya
+   nyaris tak terlihat. Panel sekarang memangkasnya sendiri dan memberi
+   peringatan di log, tapi periksa filenya:
+
+   ```bash
+   sudo cat -A /etc/garagepanel/garagepanel.env | grep SECRET
+   ```
+
+   Setiap baris harus berakhir `$` saja. Kalau ada `^M$`:
+   `sudo sed -i 's/\r$//' /etc/garagepanel/garagepanel.env`
+
+2. **Region tidak cocok.** `GARAGE_S3_REGION` harus sama persis dengan
+   `s3_region` di `/etc/garage.toml`: `sudo grep s3_region /etc/garage.toml`.
+
+3. **Jam server meleset** lebih dari ~15 menit — lihat
+   [Langkah 0](#langkah-0--periksa-garage-dan-caddy).
+
+Pesan errornya sendiri sudah memuat ketiga langkah ini beserta region yang
+sedang dipakai panel.
+
+**Bucket muncul di daftar tapi objeknya kosong / `AccessDenied` tanpa menyebut
+signature** — kredensialnya benar, tapi key panel belum diberi izin pada bucket
+itu: `garage bucket allow --read --write <bucket> --key garagepanel`.
 
 **Domain sudah ditambah tapi masih 404** — pastikan DNS-nya sudah mengarah ke
 server ini (Caddy butuh itu untuk menerbitkan sertifikat), dan bucket-nya
