@@ -16,15 +16,22 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 
 - [Yang bisa dilakukan](#yang-bisa-dilakukan)
 - [Cara kerja](#cara-kerja)
-- [Build](#build)
-- [Deploy](#deploy)
-  - [1. User `garagepanel`](#1-user-garagepanel)
-  - [2. Direktori sites Caddy](#2-direktori-sites-caddy)
-  - [3. Sudoers](#3-sudoers)
-  - [4. Key S3 untuk panel](#4-key-s3-untuk-panel)
-  - [5. File environment](#5-file-environment)
-  - [6. Unit systemd](#6-unit-systemd)
-- [Akses lewat SSH tunnel](#akses-lewat-ssh-tunnel)
+- [Instalasi](#instalasi)
+  - [Prasyarat](#prasyarat)
+  - [Langkah 0 — Periksa Garage dan Caddy](#langkah-0--periksa-garage-dan-caddy)
+  - [Langkah 1 — Build binary](#langkah-1--build-binary)
+  - [Langkah 2 — Kirim binary ke server](#langkah-2--kirim-binary-ke-server)
+  - [Langkah 3 — Buat user `garagepanel`](#langkah-3--buat-user-garagepanel)
+  - [Langkah 4 — Siapkan direktori sites Caddy](#langkah-4--siapkan-direktori-sites-caddy)
+  - [Langkah 5 — Pasang sudoers](#langkah-5--pasang-sudoers)
+  - [Langkah 6 — Buat key S3 untuk panel](#langkah-6--buat-key-s3-untuk-panel)
+  - [Langkah 7 — Tulis file environment](#langkah-7--tulis-file-environment)
+  - [Langkah 8 — Pasang unit systemd](#langkah-8--pasang-unit-systemd)
+  - [Langkah 9 — Buka panel lewat SSH tunnel](#langkah-9--buka-panel-lewat-ssh-tunnel)
+  - [Langkah 10 — Uji coba end-to-end](#langkah-10--uji-coba-end-to-end)
+  - [Checklist instalasi](#checklist-instalasi)
+- [Update ke versi baru](#update-ke-versi-baru)
+- [Uninstall](#uninstall)
 - [Konfigurasi](#konfigurasi)
 - [Keamanan](#keamanan)
 - [Troubleshooting](#troubleshooting)
@@ -82,118 +89,284 @@ ditinggalkan dalam keadaan rusak.
 **SigV4 ditulis tangan** dengan `crypto/hmac` + `crypto/sha256`. Implementasinya
 diuji terhadap dua test vector resmi AWS (lihat `s3_test.go`).
 
-## Build
+## Instalasi
+
+Tutorial dari nol sampai panel bisa dipakai. Sekitar 15 menit. Setiap langkah
+punya perintah verifikasi — jangan lanjut kalau hasilnya tidak sesuai.
+
+Perintah dengan `sudo` dijalankan di server; sisanya di mesin lokal (kalau tidak
+dijelaskan, artinya di server).
+
+### Prasyarat
+
+| Kebutuhan | Cara cek | Hasil yang benar |
+|---|---|---|
+| Garage v2 sudah jalan | `garage status` | daftar node, tanpa error |
+| Caddy sudah jalan | `systemctl is-active caddy` | `active` |
+| Akses `sudo` di server | `sudo -v` | tidak error |
+| Go 1.22+ di mesin build | `go version` | `go1.22` atau lebih baru |
+
+Panel **tidak** memasang atau mengubah Garage maupun Caddy. Keduanya harus sudah
+berjalan lebih dulu.
+
+Kalau di mesin lokal tidak ada Go, semua langkah build bisa dikerjakan langsung
+di server — lihat catatan di [Langkah 1](#langkah-1--build-binary).
+
+### Langkah 0 — Periksa Garage dan Caddy
+
+Langkah ini tidak mengubah apa pun, hanya memastikan yang dibutuhkan panel sudah
+menyala. Lewati kalau kamu sudah yakin.
+
+**0a. Garage hidup**
 
 ```bash
+systemctl is-active garage && garage status
+```
+
+**0b. Admin API menyala**
+
+```bash
+sudo grep -A5 '^\[admin\]' /etc/garage.toml
+```
+
+Yang dicari:
+
+```toml
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+admin_token = "…"
+```
+
+Kalau blok `[admin]` tidak ada, tambahkan lalu `sudo systemctl restart garage`.
+
+**0c. Siapkan token admin**
+
+Ada dua pilihan.
+
+*Pilihan A — pakai `admin_token` dari config.* Paling cepat. Token ini punya
+scope penuh dan tidak pernah kedaluwarsa:
+
+```bash
+sudo grep '^admin_token' /etc/garage.toml
+```
+
+*Pilihan B — token khusus panel (disarankan).* Bisa dibatasi scope-nya dan bisa
+dicabut tanpa mengganggu yang lain. Panel hanya memakai delapan operasi:
+
+```bash
+garage admin-token create --expires-in 365d \
+  --scope GetClusterHealth,ListBuckets,GetBucketInfo,CreateBucket,DeleteBucket,UpdateBucket,CreateKey,AllowBucketKey \
+  garagepanel
+```
+
+> Garage menampilkan token ini **sekali saja** — salin sekarang.
+>
+> Perhatikan `--expires-in`: begitu kedaluwarsa, panel berhenti bisa bicara
+> dengan Garage. Cek `garage admin-token --help` untuk opsi tanpa kedaluwarsa,
+> atau pakai Pilihan A, atau pasang pengingat untuk memperpanjang.
+
+Uji tokennya sekarang juga — ini sekaligus membuktikan Admin API bisa dihubungi:
+
+```bash
+curl -s -H "Authorization: Bearer TOKEN_KAMU" http://127.0.0.1:3903/v2/GetClusterHealth
+```
+
+Harus keluar JSON berisi `"status"`. Kalau `401`, tokennya salah. Kalau
+`Connection refused`, `api_bind_addr` belum aktif (ulangi 0b).
+
+**0d. Web endpoint menyala**
+
+```bash
+sudo grep -A4 '^\[s3_web\]' /etc/garage.toml
+curl -s -o /dev/null -w '%{http_code}\n' -H "Host: bucket-yang-tidak-ada" http://127.0.0.1:3902/
+```
+
+Jawaban `404` justru bagus: artinya endpoint hidup dan menolak bucket yang
+memang tidak ada. Yang salah adalah `000` / `Connection refused`.
+
+`root_domain` di `[s3_web]` **tidak wajib** untuk panel ini. Garage melayani
+bucket kalau Host cocok dengan `<bucket>.<root_domain>` **atau** persis sama
+dengan nama bucket — yang kedua itulah yang dipakai panel lewat
+`header_up Host <bucket>`.
+
+**0e. Caddy mengimpor direktori sites**
+
+```bash
+systemctl is-active caddy
+grep -n 'import' /etc/caddy/Caddyfile
+```
+
+Harus ada baris `import /etc/caddy/sites/*.caddy` di level paling atas (bukan di
+dalam blok site). Kalau belum ada, ditangani di [Langkah 4](#langkah-4--siapkan-direktori-sites-caddy).
+
+### Langkah 1 — Build binary
+
+Di mesin lokal:
+
+```bash
+git clone https://github.com/kontaknurman/s3caddy.git
+cd s3caddy
 CGO_ENABLED=0 go build -ldflags="-s -w" -o garagepanel .
 ```
 
-Hasilnya binary statis ±9 MB tanpa dependency runtime. Untuk build di mesin lain
-(misal laptop macOS untuk server Linux):
+Kalau mesin lokal bukan Linux amd64 (misal MacBook Apple Silicon untuk server
+Linux), tentukan targetnya:
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o garagepanel .
 ```
 
-Jalankan test:
+Verifikasi:
+
+```bash
+file garagepanel
+```
+
+Harus tertulis `ELF 64-bit … statically linked`. `CGO_ENABLED=0` itu yang membuat
+binary-nya statis, jadi tidak ada urusan versi glibc di server.
+
+> **Tidak ada Go di mesin lokal?** Clone repo-nya di server, build di sana, lalu
+> lompat ke [Langkah 3](#langkah-3--buat-user-garagepanel) — Langkah 2 tidak
+> diperlukan. Setelah selesai, Go boleh dihapus lagi dari server; binary-nya
+> tidak membutuhkannya saat jalan.
+
+Sekalian jalankan test-nya (opsional, ±2 detik):
 
 ```bash
 go test ./...
 ```
 
-## Deploy
-
-Semua perintah di bawah dijalankan sebagai root di server.
-
-Kirim binary ke server dulu:
+### Langkah 2 — Kirim binary ke server
 
 ```bash
-# dari mesin lokal
 scp garagepanel user@server:/tmp/garagepanel
 ```
 
+Lalu di server, pasang ke `/usr/local/bin` sebagai milik root — panel tidak boleh
+bisa menimpa binary-nya sendiri:
+
 ```bash
-# di server
-install -o root -g root -m 0755 /tmp/garagepanel /usr/local/bin/garagepanel
+sudo install -o root -g root -m 0755 /tmp/garagepanel /usr/local/bin/garagepanel
 rm /tmp/garagepanel
 ```
 
-### 1. User `garagepanel`
+Verifikasi — jalankan tanpa konfigurasi apa pun:
+
+```bash
+/usr/local/bin/garagepanel
+```
+
+Harus keluar pesan ini lalu berhenti dengan exit code 1:
+
+```
+Konfigurasi tidak lengkap:
+
+GARAGE_ADMIN_TOKEN belum diisi.
+…
+```
+
+Itu tandanya binary-nya jalan di server ini.
+
+### Langkah 3 — Buat user `garagepanel`
 
 User sistem tanpa shell dan tanpa home directory:
 
 ```bash
-useradd --system --no-create-home --shell /usr/sbin/nologin garagepanel
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin garagepanel
+id garagepanel
 ```
 
-### 2. Direktori sites Caddy
+Kalau `useradd` bilang user sudah ada, lanjut saja.
 
-Direktori harus bisa **ditulis hanya oleh `garagepanel`**, dan bisa **dibaca
-oleh Caddy**. Bit setgid dipasang supaya file baru otomatis bergrup `caddy`:
+### Langkah 4 — Siapkan direktori sites Caddy
+
+Direktori ini harus bisa **ditulis hanya oleh `garagepanel`** dan bisa **dibaca
+oleh Caddy**. Cek dulu Caddy jalan sebagai user apa:
 
 ```bash
-install -d -o garagepanel -g caddy -m 2750 /etc/caddy/sites
+systemctl show caddy -p User --value    # biasanya: caddy
 ```
+
+Buat direktorinya (ganti `caddy` kalau hasil di atas berbeda). Bit setgid (`2`
+di depan `750`) membuat setiap file baru otomatis bergrup `caddy`, supaya Caddy
+bisa membacanya:
+
+```bash
+sudo install -d -o garagepanel -g caddy -m 2750 /etc/caddy/sites
+stat -c '%U %G %a' /etc/caddy/sites
+```
+
+Harus keluar persis `garagepanel caddy 2750`.
 
 Pastikan Caddyfile utama mengimpornya:
 
 ```bash
 grep -q 'import /etc/caddy/sites/\*.caddy' /etc/caddy/Caddyfile \
-  || echo 'import /etc/caddy/sites/*.caddy' >> /etc/caddy/Caddyfile
+  || echo 'import /etc/caddy/sites/*.caddy' | sudo tee -a /etc/caddy/Caddyfile
 ```
 
-> Baris `import` harus berada di level paling atas Caddyfile, bukan di dalam
-> blok site.
+Uji bahwa Caddy masih mau reload dengan direktori yang masih kosong:
 
-### 3. Sudoers
+```bash
+sudo systemctl reload caddy && echo "reload OK"
+```
+
+> Kalau Caddy mengeluh soal pola import yang tidak cocok dengan file mana pun,
+> isi dengan file kosong sebagai placeholder:
+> `printf '# placeholder\n' | sudo tee /etc/caddy/sites/_placeholder.caddy`
+> lalu reload lagi. Nama berawalan `_` sengaja dipilih supaya panel
+> mengabaikannya (lihat [Cara kerja](#cara-kerja)).
+
+### Langkah 5 — Pasang sudoers
 
 Panel hanya boleh menjalankan **satu** perintah sebagai root. Tidak ada wildcard.
 
-Cek dulu di mana `systemctl` berada, karena sudoers mencocokkan path secara
-literal:
+Cek dulu di mana `systemctl` berada — sudoers mencocokkan path secara literal,
+dan ini penyebab kegagalan paling sering di tahap ini:
 
 ```bash
-command -v systemctl      # biasanya /usr/bin/systemctl atau /bin/systemctl
+command -v systemctl
 ```
 
 Buat filenya dengan `visudo` supaya syntax error tidak mengunci sudo:
 
 ```bash
-visudo -f /etc/sudoers.d/garagepanel
+sudo visudo -f /etc/sudoers.d/garagepanel
 ```
 
-Isi (sesuaikan path dengan hasil `command -v systemctl`):
+Isi — pakai **path hasil perintah di atas**:
 
 ```sudoers
-garagepanel ALL=(root) NOPASSWD: /bin/systemctl reload caddy
+garagepanel ALL=(root) NOPASSWD: /usr/bin/systemctl reload caddy
 ```
 
-Kalau `systemctl` ada di `/usr/bin`, pakai baris itu **dan** set
-`CADDY_RELOAD_CMD` (lihat [Konfigurasi](#konfigurasi)), atau daftarkan keduanya:
+Kalau tidak yakin, daftarkan dua-duanya:
 
 ```sudoers
 garagepanel ALL=(root) NOPASSWD: /bin/systemctl reload caddy, /usr/bin/systemctl reload caddy
 ```
 
-Kunci permissionnya lalu tes sungguhan:
+Kunci permissionnya lalu **tes sungguhan** sebagai user panel:
 
 ```bash
-chmod 0440 /etc/sudoers.d/garagepanel
+sudo chmod 0440 /etc/sudoers.d/garagepanel
 sudo -u garagepanel sudo -n /bin/systemctl reload caddy && echo "sudoers OK"
 ```
 
-Kalau muncul `sudo: a password is required`, path di sudoers tidak cocok dengan
-yang dipanggil panel.
+- `sudo: a password is required` → path di sudoers tidak cocok dengan yang
+  dipanggil panel. Samakan, atau set `CADDY_RELOAD_CMD` di Langkah 7.
+- `sudo: no tty present` → sama, path-nya belum cocok.
 
-**Opsional tapi sangat berguna:** izinkan panel membaca journal Caddy supaya
-pesan error yang asli (bukan sekadar "Job for caddy.service failed") bisa
-ditampilkan di UI saat reload gagal. Ini akses baca saja, bukan privilege escalation:
+**Opsional tapi sangat berguna:** izinkan panel membaca journal Caddy, supaya
+saat reload gagal yang tampil di UI adalah pesan error Caddy yang asli, bukan
+sekadar "Job for caddy.service failed". Ini akses baca saja, bukan privilege
+escalation:
 
 ```bash
-usermod -aG systemd-journal garagepanel
+sudo usermod -aG systemd-journal garagepanel
 ```
 
-### 4. Key S3 untuk panel
+### Langkah 6 — Buat key S3 untuk panel
 
 Panel butuh key S3-nya sendiri untuk membaca isi bucket dan meng-upload objek:
 
@@ -201,90 +374,102 @@ Panel butuh key S3-nya sendiri untuk membaca isi bucket dan meng-upload objek:
 garage key create garagepanel
 ```
 
-Catat `Key ID` dan `Secret key` dari output. Untuk **bucket yang sudah ada**,
-beri izin satu per satu:
+Catat `Key ID` (diawali `GK…`) dan `Secret key` dari output — secret-nya hanya
+ditampilkan sekali.
+
+Untuk **bucket yang sudah ada**, beri izin satu per satu:
 
 ```bash
+garage bucket list
 garage bucket allow --read --write media --key garagepanel
 ```
 
-Untuk bucket yang dibuat lewat panel, izin ini diberikan otomatis — panel
+Untuk bucket yang nanti dibuat lewat panel, izin ini diberikan otomatis — panel
 memanggil `AllowBucketKey` dua kali: sekali untuk `<bucket>-key` yang baru
 dibuat, sekali untuk key panel sendiri.
 
 > Panel tetap jalan tanpa key S3, tapi halaman **Objek** dinonaktifkan dengan
 > pesan yang jelas. Halaman Buckets, Domains, dan IP Whitelist tidak terpengaruh.
 
-### 5. File environment
+### Langkah 7 — Tulis file environment
 
-Berisi token admin dan secret key, jadi hanya root yang boleh membacanya
-(systemd membacanya sebelum privilege di-drop ke `garagepanel`):
-
-```bash
-install -d -o root -g root -m 0750 /etc/garagepanel
-```
+File ini berisi token admin dan secret key, jadi hanya root yang boleh
+membacanya — systemd membacanya sebelum privilege di-drop ke `garagepanel`:
 
 ```bash
-cat > /etc/garagepanel/garagepanel.env <<'EOF'
-GARAGE_ADMIN_TOKEN=ganti-dengan-admin_token-dari-/etc/garage.toml
+sudo install -d -o root -g root -m 0750 /etc/garagepanel
+sudo tee /etc/garagepanel/garagepanel.env > /dev/null <<'EOF'
+GARAGE_ADMIN_TOKEN=token-dari-langkah-0c
 GARAGE_ADMIN_URL=http://127.0.0.1:3903
 GARAGE_S3_URL=http://127.0.0.1:3900
 GARAGE_WEB_URL=http://127.0.0.1:3902
-GARAGE_S3_ACCESS_KEY=GK...
-GARAGE_S3_SECRET_KEY=...
+GARAGE_S3_ACCESS_KEY=GK-dari-langkah-6
+GARAGE_S3_SECRET_KEY=secret-dari-langkah-6
 GARAGE_S3_REGION=garage
 CADDY_SITES_DIR=/etc/caddy/sites
 S3_API_DOMAIN=s3.domainmu.com
 LISTEN=127.0.0.1:8090
 EOF
+sudo chmod 0600 /etc/garagepanel/garagepanel.env
 ```
+
+Lalu isi nilai yang sebenarnya:
 
 ```bash
-chown root:root /etc/garagepanel/garagepanel.env
-chmod 0600 /etc/garagepanel/garagepanel.env
+sudo nano /etc/garagepanel/garagepanel.env
+stat -c '%U %G %a' /etc/garagepanel/garagepanel.env    # harus: root root 600
 ```
 
-`GARAGE_ADMIN_TOKEN` diambil dari blok `[admin]` di `/etc/garage.toml`:
+Catatan pengisian:
+
+- **Jangan pakai tanda kutip** kecuali tanda kutipnya memang bagian dari nilai —
+  systemd tidak menghapusnya seperti shell.
+- `S3_API_DOMAIN` boleh dikosongkan; halaman IP Whitelist akan nonaktif dengan
+  pesan yang jelas.
+- Kalau `command -v systemctl` di Langkah 5 bukan `/bin/systemctl`, tambahkan
+  satu baris: `CADDY_RELOAD_CMD=sudo -n /usr/bin/systemctl reload caddy`.
+
+Kesalahan paling sering di file ini adalah tanda kutip yang tidak sengaja
+terbawa. Perintah ini harus tidak mengeluarkan hasil apa pun:
 
 ```bash
-grep -A2 '^\[admin\]' /etc/garage.toml
+sudo grep -n '"' /etc/garagepanel/garagepanel.env
 ```
 
-> Nilai di `EnvironmentFile` **tidak** boleh diapit tanda kutip kecuali tanda
-> kutipnya memang bagian dari nilai — systemd tidak menghapusnya seperti shell.
+Isinya baru benar-benar diuji di Langkah 8, lewat systemd yang membaca file ini
+dengan aturan parsing-nya sendiri.
 
-### 6. Unit systemd
+### Langkah 8 — Pasang unit systemd
 
 ```bash
-install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
-systemctl daemon-reload
-systemctl enable --now garagepanel
-systemctl status garagepanel
+sudo install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now garagepanel
 ```
 
-Cek log:
+Verifikasi:
 
 ```bash
-journalctl -u garagepanel -f
+systemctl is-active garagepanel        # harus: active
+journalctl -u garagepanel -n 20 --no-pager
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/buckets   # harus: 200
 ```
 
-Saat start yang sehat:
+> Unit ini sengaja memakai `NoNewPrivileges=no` — sudo butuh setuid. Kalau
+> diubah jadi `yes`, reload Caddy akan selalu gagal. Alasannya ditulis juga
+> sebagai komentar di dalam file unit-nya.
 
-```
-garagepanel: terhubung ke Garage Admin API di http://127.0.0.1:3903
-garagepanel: siap di http://127.0.0.1:8090 (loopback saja — akses lewat SSH tunnel)
-```
-
-## Akses lewat SSH tunnel
+### Langkah 9 — Buka panel lewat SSH tunnel
 
 Panel **hanya** mendengarkan di loopback, jadi tidak bisa dibuka langsung dari
-internet. Dari mesin lokal:
+internet dan tidak perlu port apa pun dibuka di firewall. Dari mesin lokal:
 
 ```bash
 ssh -N -L 8090:127.0.0.1:8090 user@server
 ```
 
-Lalu buka <http://127.0.0.1:8090> di browser. Tutup tunnel dengan `Ctrl-C`.
+Biarkan terminal itu terbuka, lalu buka <http://127.0.0.1:8090> di browser.
+Tutup tunnel dengan `Ctrl-C`.
 
 Kalau port 8090 di laptop sudah terpakai, petakan ke port lain — panel menerima
 Host `localhost`/`127.0.0.1` di port berapa pun:
@@ -293,7 +478,7 @@ Host `localhost`/`127.0.0.1` di port berapa pun:
 ssh -N -L 9999:127.0.0.1:8090 user@server   # buka http://127.0.0.1:9999
 ```
 
-Entry `~/.ssh/config` supaya tidak perlu mengetik ulang:
+Supaya tidak perlu mengetik ulang, tambahkan ke `~/.ssh/config`:
 
 ```sshconfig
 Host garage-panel
@@ -307,6 +492,130 @@ Host garage-panel
 ```bash
 ssh garage-panel
 ```
+
+### Langkah 10 — Uji coba end-to-end
+
+Sekarang buktikan semuanya nyambung. Semua lewat UI di browser.
+
+**1. Buat bucket.** Di halaman **Buckets**, isi nama `uji-panel`, centang
+**Public**, klik **Buat bucket**. Semua langkah harus bercentang hijau:
+
+```
+✓ CreateBucket "uji-panel"
+✓ CreateKey "uji-panel-key"
+✓ AllowBucketKey (read+write)
+✓ AllowBucketKey untuk key panel sendiri (read+write)
+✓ Aktifkan website access (index: index.html)
+```
+
+Access key dan secret muncul sekali di sini — untuk bucket uji coba boleh
+diabaikan.
+
+**2. Upload.** Buka **Objek** → pilih bucket `uji-panel` → tarik satu file gambar
+ke kotak upload. Statusnya harus jadi `selesai → <16 hex>.png`, dan
+thumbnail-nya muncul di grid. Kalau thumbnail muncul, berarti Admin API, S3 API
+dengan SigV4, dan endpoint `/preview` semuanya bekerja.
+
+Coba tarik file yang sama sekali lagi: kali ini statusnya
+`sudah ada di bucket (isi identik)` — itu content-addressing bekerja.
+
+**3. Cek dari sisi Garage**, di server:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -H "Host: uji-panel" \
+  http://127.0.0.1:3902/NAMA_FILE_HASIL_UPLOAD
+```
+
+`200` berarti routing lewat Host header sudah benar — persis yang nanti dilakukan
+Caddy untuk domain sungguhan.
+
+**4. Pasang domain** (butuh DNS yang sudah mengarah ke server ini). Di halaman
+**Domains**, isi domain, pilih bucket `uji-panel`, klik **Tambah & reload Caddy**.
+Harus muncul pesan hijau. Cek filenya di server:
+
+```bash
+cat /etc/caddy/sites/DOMAIN_KAMU.caddy
+systemctl is-active caddy
+```
+
+Lalu buka `https://DOMAIN_KAMU/NAMA_FILE_HASIL_UPLOAD` di browser. Sertifikat TLS
+diterbitkan Caddy otomatis, kadang butuh beberapa detik pada permintaan pertama.
+
+**5. Bersihkan.** Hapus domainnya dulu (panel akan menolak menghapus bucket yang
+masih punya domain — itu memang disengaja), lalu hapus objeknya, lalu hapus
+bucket `uji-panel` dengan mengetik ulang namanya.
+
+Terakhir, cek key sisa dari bucket uji coba — panel sengaja tidak menghapus key
+saat bucket dihapus:
+
+```bash
+garage key list
+garage key delete uji-panel-key     # tambahkan --yes kalau diminta konfirmasi
+```
+
+### Checklist instalasi
+
+| # | Langkah | Verifikasi | Hasil |
+|---|---|---|---|
+| 0 | Garage & Caddy siap | `curl -H "Authorization: Bearer …" …/v2/GetClusterHealth` | JSON `status` |
+| 1 | Build | `file garagepanel` | `ELF 64-bit … statically linked` |
+| 2 | Binary terpasang | `/usr/local/bin/garagepanel` | pesan `GARAGE_ADMIN_TOKEN belum diisi` |
+| 3 | User dibuat | `id garagepanel` | uid/gid tampil |
+| 4 | Direktori sites | `stat -c '%U %G %a' /etc/caddy/sites` | `garagepanel caddy 2750` |
+| 5 | Sudoers | `sudo -u garagepanel sudo -n /bin/systemctl reload caddy` | `sudoers OK` |
+| 6 | Key S3 | `garage key list` | `garagepanel` ada |
+| 7 | File env | `stat -c '%U %G %a' /etc/garagepanel/garagepanel.env` | `root root 600` |
+| 8 | Service | `systemctl is-active garagepanel` | `active` |
+| 9 | Tunnel | buka `http://127.0.0.1:8090` | halaman Buckets |
+| 10 | Uji end-to-end | upload + thumbnail muncul | semua hijau |
+
+## Update ke versi baru
+
+Panel tidak punya state sendiri — tidak ada database, tidak ada file cache.
+Semua state ada di Garage dan di file `.caddy`. Jadi update cukup mengganti
+binary:
+
+```bash
+# di mesin lokal
+cd s3caddy && git pull
+CGO_ENABLED=0 go build -ldflags="-s -w" -o garagepanel .
+scp garagepanel user@server:/tmp/garagepanel
+```
+
+```bash
+# di server
+sudo install -o root -g root -m 0755 /tmp/garagepanel /usr/local/bin/garagepanel
+rm /tmp/garagepanel
+sudo systemctl restart garagepanel
+systemctl is-active garagepanel
+```
+
+File environment, file `.caddy`, bucket, dan key tidak tersentuh. Kalau unit
+systemd-nya ikut berubah, salin ulang lalu `sudo systemctl daemon-reload`
+sebelum restart.
+
+## Uninstall
+
+```bash
+sudo systemctl disable --now garagepanel
+sudo rm /etc/systemd/system/garagepanel.service
+sudo systemctl daemon-reload
+sudo rm -rf /etc/garagepanel
+sudo rm -f /usr/local/bin/garagepanel /etc/sudoers.d/garagepanel
+sudo userdel garagepanel
+```
+
+Yang **tidak** ikut terhapus, dan itu memang disengaja:
+
+- **File `.caddy` di `/etc/caddy/sites/`** — semua domain tetap melayani seperti
+  biasa tanpa panel. Hapus manual kalau memang tidak dipakai lagi, lalu
+  `sudo systemctl reload caddy`.
+- **Bucket dan objek di Garage** — tidak tersentuh sama sekali.
+- **Key S3** yang pernah dibuat panel — lihat `garage key list`, hapus dengan
+  `garage key delete <nama>`.
+- **Token admin** kalau kamu memakai Pilihan B di Langkah 0c — cabut lewat
+  `garage admin-token` (lihat `garage admin-token --help` untuk subperintah
+  `list` dan `delete`).
 
 ## Konfigurasi
 
@@ -394,7 +703,25 @@ punya kendali penuh atas panel. Itu memang modelnya — amankan akses SSH-nya.
 
 **`token admin ditolak — periksa GARAGE_ADMIN_TOKEN`** — token tidak cocok
 dengan `admin_token` di `/etc/garage.toml`. Garage perlu di-restart kalau
-tokennya baru diubah.
+tokennya baru diubah. Uji tokennya langsung:
+`curl -s -H "Authorization: Bearer TOKEN" http://127.0.0.1:3903/v2/GetClusterHealth`.
+
+**Sebagian halaman jalan, satu operasi menjawab 403** — kalau kamu memakai token
+ber-scope (Pilihan B di [Langkah 0c](#langkah-0--periksa-garage-dan-caddy)),
+scope-nya kurang. Panel memakai delapan operasi:
+`GetClusterHealth`, `ListBuckets`, `GetBucketInfo`, `CreateBucket`,
+`DeleteBucket`, `UpdateBucket`, `CreateKey`, `AllowBucketKey`. Buat ulang
+tokennya dengan daftar lengkap itu. Gejala yang sama muncul kalau token
+ber-`--expires-in` sudah kedaluwarsa.
+
+**Caddy menolak reload karena pola `import` tidak cocok** — `/etc/caddy/sites`
+masih kosong. Isi placeholder:
+`printf '# placeholder\n' | sudo tee /etc/caddy/sites/_placeholder.caddy`
+lalu reload lagi. Nama berawalan `_` diabaikan panel.
+
+**`Tidak bisa listen di 127.0.0.1:8090: address already in use`** — ada proses
+lain di port itu, sering kali instance panel lama. Cek dengan
+`sudo ss -lntp | grep 8090`, matikan, atau ganti `LISTEN` ke port lain.
 
 **Reload Caddy gagal, pesannya cuma "Job for caddy.service failed"** — panel
 sudah mencoba membaca journal Caddy untuk menampilkan error aslinya. Kalau
@@ -446,7 +773,7 @@ proteksi path traversal):
 ```bash
 go test ./...          # cepat
 go test -race ./...    # dengan race detector
-go test -cover ./...   # ~75% statement coverage
+go test -cover ./...   # ~76% statement coverage
 ```
 
 Menjalankan panel lokal tanpa server Garage sungguhan: lihat
