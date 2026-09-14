@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -260,5 +262,186 @@ func TestForgedSessionCookieIsRejected(t *testing.T) {
 		if resp.StatusCode != http.StatusSeeOther {
 			t.Errorf("cookie palsu %q diterima (status %d)", forged, resp.StatusCode)
 		}
+	}
+}
+
+// --- sync ------------------------------------------------------------------
+
+// A remote's secret must never be readable back through the panel: not on any
+// page, not in the polling JSON, not in the failed-key view, not in the job
+// file, and not in the journal — even when the provider echoes the request's
+// Authorization header into an error body.
+func TestRemoteSecretNeverLeaksThroughSyncPagesFilesOrLog(t *testing.T) {
+	p := newTestPanel(t)
+	p.garage.addBucket("arsip", 0, 0, false)
+	p.addTestRemote(t)
+	p.remote.put("backup", "in/a.txt", []byte("x"), "text/plain")
+
+	logs := &safeLog{}
+	log.SetOutput(logs)
+	defer log.SetOutput(os.Stderr)
+
+	// Start a job normally, then make the remote refuse everything with a
+	// body that repeats a fake credential line.
+	resp := p.post(t, "/sync/jobs/create", url.Values{
+		"direction": {"import"}, "remote": {"wasabi"}, "remote_bucket": {"backup"}, "remote_prefix": {"in/"},
+		"garage_bucket": {"arsip"}, "mode": {"overwrite"}, "transfers": {"1"},
+	})
+	p.followFlash(t, resp)
+	jobs := p.waitJobs(t, func(js []jobView) bool { return len(js) == 1 && !js[0].Active })
+	id := jobs[0].ID
+
+	p.remote.deny = `<Error><Code>AccessDenied</Code><Message>denied for Credential=WASABIKEY/… secret ` + testRemoteSecret + `</Message></Error>`
+	resp = p.post(t, "/sync/remotes/test", url.Values{"name": {"wasabi"}, "bucket": {"backup"}})
+	flash := p.followFlash(t, resp)
+	if !strings.Contains(flash, "AccessDenied") {
+		t.Fatalf("provider error should be shown: %s", firstLines(flash))
+	}
+
+	_, syncPage := p.get(t, "/sync")
+	_, failedPage := p.get(t, "/sync/jobs/failed?id="+id)
+	jobFile, _ := os.ReadFile(filepath.Join(p.app.cfg.StateDir, "jobs", id+".json"))
+	req, _ := http.NewRequest(http.MethodGet, p.srv.URL+"/sync/jobs.json", nil)
+	req.Header.Set("Accept", "application/json")
+	jr, err := p.client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonBody, _ := io.ReadAll(jr.Body)
+	jr.Body.Close()
+
+	p.app.jobs.Shutdown(t.Context())
+	for name, blob := range map[string]string{
+		"halaman /sync": syncPage,
+		"halaman gagal": failedPage,
+		"file job":      string(jobFile),
+		"jobs.json":     string(jsonBody),
+		"log":           logs.String(),
+		"flash tes":     flash,
+	} {
+		if strings.Contains(blob, testRemoteSecret) {
+			t.Errorf("%s memuat secret remote", name)
+		}
+		if strings.Contains(blob, testGarageSecret) {
+			t.Errorf("%s memuat secret Garage", name)
+		}
+	}
+	// The flash carries the provider's message — which here echoed the secret
+	// — so the panel must have redacted it.
+	if strings.Contains(flash, testRemoteSecret) {
+		t.Error("pesan error penyedia yang menggemakan secret harus disamarkan")
+	}
+}
+
+// The rclone child gets exactly the two remotes of its job and nothing from
+// the panel's own environment.
+func TestRcloneChildDoesNotInheritPanelSecrets(t *testing.T) {
+	t.Setenv("GARAGE_ADMIN_TOKEN", "admin-token-must-stay-home")
+	t.Setenv("PANEL_PASSWORD_HASH", "hash-must-stay-home")
+	p := newTestPanel(t)
+	p.garage.addBucket("arsip", 0, 0, false)
+	p.addTestRemote(t)
+	p.remote.put("backup", "a.txt", []byte("x"), "text/plain")
+	p.post(t, "/sync/jobs/create", url.Values{
+		"direction": {"import"}, "remote": {"wasabi"}, "remote_bucket": {"backup"},
+		"garage_bucket": {"arsip"}, "mode": {"overwrite"}, "transfers": {"1"},
+	})
+	p.waitJobs(t, func(js []jobView) bool { return len(js) == 1 && !js[0].Active })
+
+	recs := readFakeRcloneRecords(t, p.rcDir)
+	if len(recs) != 1 {
+		t.Fatalf("rclone runs = %d", len(recs))
+	}
+	env := strings.Join(recs[0].Env, "\n")
+	for _, forbidden := range []string{"admin-token-must-stay-home", "hash-must-stay-home", "GARAGE_ADMIN_TOKEN", "PANEL_PASSWORD_HASH", "GARAGE_S3_SECRET_KEY"} {
+		if strings.Contains(env, forbidden) {
+			t.Errorf("child environment contains %s", forbidden)
+		}
+	}
+	if !strings.Contains(env, "RCLONE_CONFIG_SRC_SECRET_ACCESS_KEY="+testRemoteSecret) || !strings.Contains(env, "RCLONE_CONFIG_DST_SECRET_ACCESS_KEY="+p.app.cfg.S3SecretKey) {
+		t.Error("child must get exactly its two remotes")
+	}
+	if args := strings.Join(recs[0].Args, " "); strings.Contains(args, testRemoteSecret) || strings.Contains(args, p.app.cfg.S3SecretKey) {
+		t.Error("secret in argv")
+	}
+}
+
+// Extra rclone arguments are handed to exec as-is: no shell ever sees them.
+func TestRcloneExtraArgsAreNotInterpretedByAShell(t *testing.T) {
+	dir := t.TempDir()
+	bin := fakeRcloneBin(t, dir)
+	marker := filepath.Join(dir, "pwned")
+	extra := []string{"--bwlimit", "1M;", "$(touch " + marker + ")", "`touch " + marker + "`", "a b"}
+	r, err := detectRclone(bin, "", extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := filepath.Join(dir, "chunk.txt")
+	if err := os.WriteFile(chunk, []byte("a.txt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.run(t.Context(), rcloneRun{Verb: "copy", ChunkPath: chunk, Src: "src:b/", Dst: "dst:c/"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("an extra argument was interpreted by a shell")
+	}
+	recs := readFakeRcloneRecords(t, dir)
+	if len(recs) != 1 {
+		t.Fatalf("runs = %d", len(recs))
+	}
+	got := strings.Join(recs[0].Args, "\x00")
+	for _, want := range extra {
+		if !strings.Contains(got, "\x00"+want+"\x00") {
+			t.Errorf("argument %q not passed literally: %q", want, recs[0].Args)
+		}
+	}
+}
+
+// Job ids are the only user input that becomes a path under STATE_DIR.
+func TestJobIDCannotEscapeStateDir(t *testing.T) {
+	p := newTestPanel(t)
+	victim := filepath.Join(p.app.cfg.StateDir, "remotes.json")
+	if err := os.WriteFile(victim, []byte(`{"remotes":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"../remotes", "..%2Fremotes", "../../etc/passwd", "0123456789abcdef/../x", ""} {
+		if resp, _ := p.get(t, "/sync/jobs/failed?id="+id); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("failed?id=%q: status %d, want 400", id, resp.StatusCode)
+		}
+		resp := p.post(t, "/sync/jobs/delete", url.Values{"id": {id}})
+		if body := p.followFlash(t, resp); !strings.Contains(body, "tidak valid") {
+			t.Errorf("delete id=%q accepted: %s", id, firstLines(body))
+		}
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Error("a file next to the jobs directory was touched")
+	}
+}
+
+// Names typed into the file manager never reach a key as a path escape.
+func TestFolderAndRenameNamesCannotTraverse(t *testing.T) {
+	p := newTestPanel(t)
+	p.garage.addBucket("media", 0, 0, true)
+	p.s3.put("media", "docs/a.pdf", []byte("A"), "application/pdf")
+
+	for _, name := range []string{"..", "../x", "a/../b", `..\x`, "x/y"} {
+		resp := p.post(t, "/objects/mkdir", url.Values{"bucket": {"media"}, "prefix": {"docs/"}, "name": {name}})
+		if body := p.followFlash(t, resp); strings.Contains(body, "dibuat") {
+			t.Errorf("mkdir %q accepted", name)
+		}
+		resp = p.post(t, "/objects/rename", url.Values{"bucket": {"media"}, "prefix": {"docs/"}, "key": {"docs/a.pdf"}, "name": {name + ".pdf"}})
+		if body := p.followFlash(t, resp); strings.Contains(body, "diganti nama") {
+			t.Errorf("rename to %q accepted", name)
+		}
+	}
+	for _, dst := range []string{"../", "a/../", "/abs/"} {
+		resp := p.post(t, "/objects/move", url.Values{"bucket": {"media"}, "prefix": {"docs/"}, "key": {"docs/a.pdf"}, "dst_prefix": {dst}})
+		if body := p.followFlash(t, resp); strings.Contains(body, "dipindah") {
+			t.Errorf("move to %q accepted", dst)
+		}
+	}
+	if keys := p.s3.keys("media"); strings.Join(keys, ",") != "docs/a.pdf" {
+		t.Errorf("bucket changed: %v", keys)
 	}
 }

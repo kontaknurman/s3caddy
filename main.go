@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -60,6 +61,11 @@ type Config struct {
 	Username     string
 	PasswordHash string
 	PanelDomain  string
+
+	// Sync dengan S3 lain: state (remote + checkpoint job) dan rclone.
+	StateDir        string
+	RcloneBin       string
+	RcloneExtraArgs []string
 
 	webURL *url.URL
 	s3URL  *url.URL
@@ -106,6 +112,12 @@ func loadConfig() (*Config, error) {
 		Username:     env("PANEL_USERNAME", "admin"),
 		PasswordHash: strings.TrimSpace(os.Getenv("PANEL_PASSWORD_HASH")),
 		PanelDomain:  strings.TrimSpace(os.Getenv("PANEL_DOMAIN")),
+
+		// systemd mengekspor STATE_DIRECTORY saat unit memakai StateDirectory=,
+		// jadi tanpa setelan apa pun panel sudah menulis ke tempat yang benar.
+		StateDir:        env("STATE_DIR", env("STATE_DIRECTORY", "/var/lib/garagepanel")),
+		RcloneBin:       env("RCLONE_BIN", "rclone"),
+		RcloneExtraArgs: strings.Fields(os.Getenv("RCLONE_EXTRA_ARGS")),
 	}
 
 	if strings.TrimSpace(cfg.AdminToken) == "" {
@@ -231,6 +243,13 @@ type App struct {
 	// iterasi itu sengaja mahal, jadi request paralel tidak boleh dibiarkan
 	// menghabiskan CPU panel.
 	loginMu sync.Mutex
+
+	// Sync dengan S3 lain. Keduanya nil kalau syncDisabled terisi.
+	remotes *RemoteStore
+	jobs    *JobManager
+	// syncDisabled berisi alasan halaman Sync tidak aktif (STATE_DIR tidak
+	// bisa ditulis, rclone tidak ada, kredensial S3 kosong). Kosong = aktif.
+	syncDisabled string
 }
 
 func main() {
@@ -308,6 +327,12 @@ func main() {
 	}
 	log.Printf("siap di http://%s (loopback saja — akses lewat SSH tunnel)", cfg.Listen)
 
+	if app.jobs != nil {
+		// Job yang sedang berjalan saat panel terakhir berhenti dilanjutkan
+		// dari checkpoint-nya.
+		app.jobs.ResumeInterrupted()
+	}
+
 	idle := make(chan struct{})
 	go func() {
 		sigs := make(chan os.Signal, 1)
@@ -316,7 +341,17 @@ func main() {
 		log.Printf("berhenti…")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		// Job dihentikan (rclone dapat SIGINT, checkpoint terakhir disimpan)
+		// sementara server menyelesaikan request yang masih berjalan.
+		jobsDone := make(chan struct{})
+		go func() {
+			if app.jobs != nil {
+				app.jobs.Shutdown(shutdownCtx)
+			}
+			close(jobsDone)
+		}()
 		_ = srv.Shutdown(shutdownCtx)
+		<-jobsDone
 		close(idle)
 	}()
 
@@ -485,14 +520,80 @@ func newApp(cfg *Config) (*App, error) {
 	if err := app.parseTemplates(); err != nil {
 		return nil, err
 	}
+	app.setupSync()
 	return app, nil
+}
+
+// setupSync menyiapkan direktori state untuk fitur Sync. Kegagalan di sini
+// tidak menghentikan panel: install lama memakai unit tanpa StateDirectory=,
+// dan halaman lain tidak butuh direktori ini. Alasannya ditampilkan di
+// halaman Sync beserta cara memperbaikinya.
+func (a *App) setupSync() {
+	if a.s3 == nil {
+		a.syncDisabled = "GARAGE_S3_ACCESS_KEY dan GARAGE_S3_SECRET_KEY belum diatur, jadi panel tidak bisa membaca atau menulis bucket. Isi keduanya di file environment lalu restart garagepanel."
+		return
+	}
+	if err := prepareStateDir(a.cfg.StateDir); err != nil {
+		a.syncDisabled = fmt.Sprintf("Direktori state %s tidak bisa dipakai: %v.\n"+
+			"Pasang unit systemd terbaru (ada baris StateDirectory=garagepanel) lalu restart, atau buat manual:\n"+
+			"  sudo install -d -o garagepanel -g garagepanel -m 0700 %s", a.cfg.StateDir, err, a.cfg.StateDir)
+		log.Printf("PERINGATAN: %s", strings.ReplaceAll(a.syncDisabled, "\n", " "))
+		return
+	}
+	remotes, err := NewRemoteStore(filepath.Join(a.cfg.StateDir, remotesFileName))
+	if err != nil {
+		a.syncDisabled = fmt.Sprintf("Daftar remote tidak bisa dibaca: %v.\nPerbaiki atau hapus file itu, lalu restart garagepanel.", err)
+		log.Printf("PERINGATAN: %s", strings.ReplaceAll(a.syncDisabled, "\n", " "))
+		return
+	}
+	rclone, err := detectRclone(a.cfg.RcloneBin, filepath.Join(a.cfg.StateDir, "cache"), a.cfg.RcloneExtraArgs)
+	if err != nil {
+		a.syncDisabled = fmt.Sprintf("%v\nSetelah rclone terpasang, restart garagepanel. Halaman lain tidak terpengaruh.", err)
+		log.Printf("PERINGATAN: %s", strings.ReplaceAll(a.syncDisabled, "\n", " "))
+		return
+	}
+	jobs, err := NewJobManager(filepath.Join(a.cfg.StateDir, "jobs"), garageRemote(a.cfg), remotes, rclone)
+	if err != nil {
+		a.syncDisabled = fmt.Sprintf("Job tidak bisa dimuat dari %s: %v", filepath.Join(a.cfg.StateDir, "jobs"), err)
+		log.Printf("PERINGATAN: %s", a.syncDisabled)
+		return
+	}
+	a.remotes = remotes
+	a.jobs = jobs
+	log.Printf("sync aktif: rclone v%s, state di %s, %d remote, %d job tersimpan", rclone.version, a.cfg.StateDir, len(remotes.List()), len(jobs.List()))
+}
+
+// prepareStateDir membuat STATE_DIR beserta subdirektorinya dan memastikan
+// panel bisa menulis di sana. File di dalamnya berisi secret remote, jadi mode
+// yang longgar dilaporkan.
+func prepareStateDir(dir string) error {
+	if dir == "" {
+		return errors.New("STATE_DIR kosong")
+	}
+	for _, sub := range []string{"", "jobs", "cache"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			return err
+		}
+	}
+	probe, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return fmt.Errorf("tidak bisa menulis: %w", err)
+	}
+	probe.Close()
+	os.Remove(probe.Name())
+
+	if info, err := os.Stat(dir); err == nil && info.Mode().Perm()&0o077 != 0 {
+		log.Printf("PERINGATAN: %s bisa dibaca user lain (mode %o). File di dalamnya memuat secret remote — rapikan dengan: chmod 0700 %s",
+			dir, info.Mode().Perm(), dir)
+	}
+	return nil
 }
 
 // parseTemplates builds one template set per page, each combined with the
 // shared layout. html/template is used throughout so every value is
 // contextually auto-escaped.
 func (a *App) parseTemplates() error {
-	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html"}
+	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html", "sync.html", "sync_failed.html"}
 	a.pages = make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.New("layout.html").Funcs(templateFuncs()).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -509,6 +610,21 @@ func templateFuncs() template.FuncMap {
 		"humanBytes": humanBytes,
 		"humanTime":  humanTime,
 		"commaSep":   func(s []string) string { return strings.Join(s, ", ") },
+		// dict lets a sub-template receive several values.
+		"dict": func(kv ...any) (map[string]any, error) {
+			if len(kv)%2 != 0 {
+				return nil, errors.New("dict: jumlah argumen ganjil")
+			}
+			m := make(map[string]any, len(kv)/2)
+			for i := 0; i < len(kv); i += 2 {
+				k, ok := kv[i].(string)
+				if !ok {
+					return nil, errors.New("dict: kunci harus string")
+				}
+				m[k] = kv[i+1]
+			}
+			return m, nil
+		},
 	}
 }
 
@@ -532,12 +648,31 @@ func (a *App) routes() http.Handler {
 
 	mux.HandleFunc("GET /objects", a.handleObjects)
 	mux.HandleFunc("POST /objects/delete", a.handleObjectDelete)
+	mux.HandleFunc("POST /objects/delete-many", a.handleObjectsDeleteMany)
+	mux.HandleFunc("POST /objects/mkdir", a.handleFolderCreate)
+	mux.HandleFunc("POST /objects/rename", a.handleObjectRename)
+	mux.HandleFunc("POST /objects/move", a.handleObjectTransfer(true))
+	mux.HandleFunc("POST /objects/copy", a.handleObjectTransfer(false))
+	mux.HandleFunc("POST /objects/folder-job", a.handleFolderJob)
 	mux.HandleFunc("POST /upload", a.handleUpload)
 	mux.HandleFunc("GET /preview", a.handlePreview)
 
 	mux.HandleFunc("GET /login", a.handleLoginPage)
 	mux.HandleFunc("POST /login", a.handleLogin)
 	mux.HandleFunc("POST /logout", a.handleLogout)
+
+	mux.HandleFunc("GET /sync", a.handleSync)
+	mux.HandleFunc("GET /sync/jobs.json", a.handleSyncJobsJSON)
+	mux.HandleFunc("GET /sync/jobs/failed", a.handleJobFailed)
+	mux.HandleFunc("POST /sync/remotes/add", a.handleRemoteAdd)
+	mux.HandleFunc("POST /sync/remotes/delete", a.handleRemoteDelete)
+	mux.HandleFunc("POST /sync/remotes/test", a.handleRemoteTest)
+	mux.HandleFunc("POST /sync/jobs/create", a.handleJobCreate)
+	mux.HandleFunc("POST /sync/jobs/pause", a.jobAction("dijeda setelah rclone berhenti", func(id string) error { return a.jobs.Pause(id) }))
+	mux.HandleFunc("POST /sync/jobs/resume", a.jobAction("dilanjutkan dari checkpoint", func(id string) error { return a.jobs.Resume(id) }))
+	mux.HandleFunc("POST /sync/jobs/rerun", a.jobAction("dijalankan ulang dari awal", func(id string) error { return a.jobs.Rerun(id) }))
+	mux.HandleFunc("POST /sync/jobs/cancel", a.jobAction("dibatalkan", func(id string) error { return a.jobs.Cancel(id) }))
+	mux.HandleFunc("POST /sync/jobs/delete", a.jobAction("catatan dihapus", func(id string) error { return a.jobs.Delete(id) }))
 
 	mux.HandleFunc("GET /whitelist", a.handleWhitelist)
 	mux.HandleFunc("POST /whitelist/add", a.handleWhitelistAdd)
@@ -1450,13 +1585,74 @@ func (a *App) handleDomainDelete(w http.ResponseWriter, r *http.Request) {
 // --- page 3: object browser ----------------------------------------------
 
 type objectRow struct {
-	Key       string
-	Name      string
-	Size      int64
-	Modified  time.Time
-	IsImage   bool
-	PublicURL string
+	Key         string
+	Name        string
+	Ext         string
+	Size        int64
+	Modified    time.Time
+	IsImage     bool
+	PublicURL   string
+	PreviewURL  string
+	DownloadURL string
 }
+
+type folderRow struct {
+	Prefix string
+	Name   string
+	URL    string
+}
+
+type crumb struct {
+	Name   string
+	Prefix string
+	URL    string
+}
+
+// queryEscape is url.QueryEscape with spaces as %20 rather than "+". Both
+// decode the same on the server; %20 survives html/template's attribute
+// escaping (which turns a literal "+" into &#43;) and reads better in links.
+func queryEscape(s string) string {
+	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
+
+// listURL builds an /objects link; every parameter is escaped here so
+// templates never assemble URLs by hand. The view is only carried when the
+// link is meant to switch it; otherwise the cookie remembers it.
+func listURL(bucket, prefix, sortBy, dir, view, token string) string {
+	parts := []string{"bucket=" + queryEscape(bucket)}
+	if prefix != "" {
+		parts = append(parts, "prefix="+queryEscape(prefix))
+	}
+	if sortBy != "" && sortBy != "name" {
+		parts = append(parts, "sort="+queryEscape(sortBy))
+	}
+	if dir == "desc" {
+		parts = append(parts, "dir=desc")
+	}
+	if view != "" {
+		parts = append(parts, "view="+queryEscape(view))
+	}
+	if token != "" {
+		parts = append(parts, "token="+queryEscape(token))
+	}
+	return "/objects?" + strings.Join(parts, "&")
+}
+
+// breadcrumbs splits "a/b/c/" into clickable segments.
+func breadcrumbs(bucket, prefix, sortBy, dir string) []crumb {
+	out := []crumb{{Name: bucket, Prefix: "", URL: listURL(bucket, "", sortBy, dir, "", "")}}
+	acc := ""
+	for _, seg := range strings.Split(strings.TrimSuffix(prefix, "/"), "/") {
+		if seg == "" {
+			continue
+		}
+		acc += seg + "/"
+		out = append(out, crumb{Name: seg, Prefix: acc, URL: listURL(bucket, acc, sortBy, dir, "", "")})
+	}
+	return out
+}
+
+const viewCookieName = "garagepanel_view"
 
 func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -1464,6 +1660,21 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 	bucket := strings.TrimSpace(q.Get("bucket"))
 	prefix := q.Get("prefix")
 	token := q.Get("token")
+	sortBy, dir := SortParams(q.Get("sort"), q.Get("dir"))
+
+	// The grid/list choice is remembered per browser.
+	view := q.Get("view")
+	if view != "grid" && view != "list" {
+		view = ""
+		if c, err := r.Cookie(viewCookieName); err == nil && (c.Value == "grid" || c.Value == "list") {
+			view = c.Value
+		}
+	} else {
+		http.SetCookie(w, &http.Cookie{Name: viewCookieName, Value: view, Path: "/objects", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 365 * 24 * 3600})
+	}
+	if view == "" {
+		view = "grid"
+	}
 
 	buckets, bucketsErr := a.garage.ListBuckets(ctx)
 	data := map[string]any{
@@ -1474,6 +1685,9 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 		"Prefix":     prefix,
 		"MaxUploadH": humanBytes(MaxUploadSize),
 		"AllowedExt": strings.Join(AllowedExtensionList(), " "),
+		"Sort":       sortBy,
+		"Dir":        dir,
+		"View":       view,
 	}
 	if bucketsErr != nil {
 		data["BucketsWarning"] = bucketsErr.Error()
@@ -1501,7 +1715,7 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 	domain := FirstDomainForBucket(sites, bucket)
 	data["Domain"] = domain
 
-	result, err := a.s3.ListObjectsV2(ctx, bucket, prefix, token, "/", objectsPerPage)
+	result, err := a.s3.ListObjectsV2(ctx, bucket, ListOptions{Prefix: prefix, Delimiter: "/", ContinuationToken: token, MaxKeys: objectsPerPage})
 	if err != nil {
 		msg := err.Error()
 		// Untuk penolakan tanda tangan, tanyakan langsung ke Garage supaya
@@ -1518,40 +1732,101 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var images, others []objectRow
+	var rows []objectRow
+	images := 0
 	for _, obj := range result.Objects {
 		// A "directory marker" object is the prefix itself; skip it.
 		if obj.Key == prefix {
 			continue
 		}
 		row := objectRow{
-			Key:      obj.Key,
-			Name:     strings.TrimPrefix(obj.Key, prefix),
-			Size:     obj.Size,
-			Modified: obj.LastModified,
-			IsImage:  IsImageKey(obj.Key),
+			Key:         obj.Key,
+			Name:        strings.TrimPrefix(obj.Key, prefix),
+			Ext:         strings.TrimPrefix(strings.ToLower(path.Ext(obj.Key)), "."),
+			Size:        obj.Size,
+			Modified:    obj.LastModified,
+			IsImage:     IsImageKey(obj.Key),
+			PreviewURL:  "/preview?bucket=" + queryEscape(bucket) + "&key=" + queryEscape(obj.Key),
+			DownloadURL: "/preview?bucket=" + queryEscape(bucket) + "&key=" + queryEscape(obj.Key) + "&dl=1",
 		}
 		if domain != "" {
 			row.PublicURL = publicURL(domain, obj.Key)
 		}
 		if row.IsImage {
-			images = append(images, row)
-		} else {
-			others = append(others, row)
+			images++
+		}
+		rows = append(rows, row)
+	}
+	sortRows(rows, sortBy, dir)
+
+	folders := make([]folderRow, 0, len(result.CommonPrefixes))
+	for _, cp := range result.CommonPrefixes {
+		folders = append(folders, folderRow{
+			Prefix: cp,
+			Name:   strings.TrimSuffix(strings.TrimPrefix(cp, prefix), "/"),
+			URL:    listURL(bucket, cp, sortBy, dir, "", ""),
+		})
+	}
+	if dir == "desc" && sortBy == "name" {
+		for i, j := 0, len(folders)-1; i < j; i, j = i+1, j-1 {
+			folders[i], folders[j] = folders[j], folders[i]
 		}
 	}
 
-	data["Images"] = images
-	data["Others"] = others
-	data["Folders"] = result.CommonPrefixes
+	sortURL := map[string]string{}
+	for _, col := range []string{"name", "size", "date"} {
+		nextDir := "asc"
+		if col == sortBy && dir == "asc" {
+			nextDir = "desc"
+		}
+		sortURL[col] = listURL(bucket, prefix, col, nextDir, "", token)
+	}
+
+	data["Rows"] = rows
+	data["Folders"] = folders
+	data["Breadcrumbs"] = breadcrumbs(bucket, prefix, sortBy, dir)
 	data["ParentPrefix"] = parentPrefix(prefix)
+	data["ParentURL"] = listURL(bucket, parentPrefix(prefix), sortBy, dir, "", "")
 	data["HasParent"] = prefix != ""
-	data["NextToken"] = result.NextToken
+	data["NextURL"] = ""
+	if result.IsTruncated {
+		data["NextURL"] = listURL(bucket, prefix, sortBy, dir, "", result.NextToken)
+	}
+	data["FirstURL"] = listURL(bucket, prefix, sortBy, dir, "", "")
+	data["GridURL"] = listURL(bucket, prefix, sortBy, dir, "grid", token)
+	data["ListURL"] = listURL(bucket, prefix, sortBy, dir, "list", token)
+	data["SortURL"] = sortURL
 	data["IsTruncated"] = result.IsTruncated
-	data["Count"] = len(images) + len(others)
-	data["Empty"] = len(images) == 0 && len(others) == 0 && len(result.CommonPrefixes) == 0
+	data["Count"] = len(rows)
+	data["ImageCount"] = images
+	data["Empty"] = len(rows) == 0 && len(folders) == 0
+	data["SyncEnabled"] = a.syncDisabled == ""
+	data["PerPage"] = objectsPerPage
 
 	a.render(w, r, "objects.html", data)
+}
+
+// sortRows orders one page of objects. The listing itself is always in key
+// order; sorting by size or date is only ever within the page.
+func sortRows(rows []objectRow, sortBy, dir string) {
+	less := func(i, j int) bool {
+		switch sortBy {
+		case "size":
+			if rows[i].Size != rows[j].Size {
+				return rows[i].Size < rows[j].Size
+			}
+		case "date":
+			if !rows[i].Modified.Equal(rows[j].Modified) {
+				return rows[i].Modified.Before(rows[j].Modified)
+			}
+		}
+		return rows[i].Key < rows[j].Key
+	}
+	if dir == "desc" {
+		sort.SliceStable(rows, func(i, j int) bool { return less(j, i) })
+		return
+	}
+	sort.SliceStable(rows, less)
 }
 
 // publicURL builds the URL a visitor would use, which is always
@@ -1570,16 +1845,122 @@ func parentPrefix(prefix string) string {
 	return trimmed[:idx+1]
 }
 
+// objectsBack builds the redirect target after a mutation.
+func objectsBack(bucket, prefix string) string {
+	return listURL(bucket, prefix, "", "", "", "")
+}
+
+// handleObjectsDeleteMany removes the keys ticked in the listing with one
+// DeleteObjects call.
+func (a *App) handleObjectsDeleteMany(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if err := r.ParseForm(); err != nil {
+		a.redirectErr(w, r, "/objects", err)
+		return
+	}
+	bucket := strings.TrimSpace(r.PostFormValue("bucket"))
+	prefix := r.PostFormValue("prefix")
+	keys := r.PostForm["key"]
+
+	if err := ValidateBucketName(bucket); err != nil {
+		a.redirectErr(w, r, "/objects", err)
+		return
+	}
+	back := objectsBack(bucket, prefix)
+	if err := ValidatePrefix(prefix); err != nil {
+		a.redirectErr(w, r, back, err)
+		return
+	}
+	if len(keys) == 0 {
+		a.redirectErr(w, r, back, errors.New("tidak ada objek yang dipilih"))
+		return
+	}
+	if len(keys) > maxDeleteObjects {
+		a.redirectErr(w, r, back, fmt.Errorf("maksimal %d objek sekali hapus, dapat %d", maxDeleteObjects, len(keys)))
+		return
+	}
+	for _, key := range keys {
+		if err := ValidateObjectKey(key); err != nil {
+			a.redirectErr(w, r, back, err)
+			return
+		}
+	}
+	if a.s3 == nil {
+		a.redirectErr(w, r, back, errors.New("kredensial S3 panel belum diatur"))
+		return
+	}
+	failed, err := a.s3.DeleteObjects(ctx, bucket, keys)
+	if err != nil {
+		a.redirectErr(w, r, back, fmt.Errorf("gagal menghapus: %w", err))
+		return
+	}
+	log.Printf("bucket %q: %d objek dihapus, %d gagal", bucket, len(keys)-len(failed), len(failed))
+	if len(failed) > 0 {
+		var lines []string
+		for i, f := range failed {
+			if i == 5 {
+				lines = append(lines, fmt.Sprintf("… dan %d lainnya", len(failed)-5))
+				break
+			}
+			lines = append(lines, f.String())
+		}
+		a.redirectErr(w, r, back, fmt.Errorf("%d objek dihapus, %d gagal:\n%s", len(keys)-len(failed), len(failed), strings.Join(lines, "\n")))
+		return
+	}
+	a.redirectOK(w, r, back, fmt.Sprintf("%d objek dihapus.", len(keys)))
+}
+
+// handleFolderCreate writes the zero-byte "prefix/name/" marker that S3
+// clients treat as a folder.
+func (a *App) handleFolderCreate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	bucket := strings.TrimSpace(r.PostFormValue("bucket"))
+	prefix := r.PostFormValue("prefix")
+	name := strings.TrimSpace(r.PostFormValue("name"))
+
+	if err := ValidateBucketName(bucket); err != nil {
+		a.redirectErr(w, r, "/objects", err)
+		return
+	}
+	back := objectsBack(bucket, prefix)
+	if err := ValidatePrefix(prefix); err != nil {
+		a.redirectErr(w, r, back, err)
+		return
+	}
+	if err := ValidateFolderName(name); err != nil {
+		a.redirectErr(w, r, back, fmt.Errorf("nama folder: %w", err))
+		return
+	}
+	if a.s3 == nil {
+		a.redirectErr(w, r, back, errors.New("kredensial S3 panel belum diatur"))
+		return
+	}
+	key := prefix + name + "/"
+	if err := ValidateObjectKey(key); err != nil {
+		a.redirectErr(w, r, back, err)
+		return
+	}
+	if exists, _, err := a.s3.StatObject(ctx, bucket, key); err != nil {
+		a.redirectErr(w, r, back, err)
+		return
+	} else if exists {
+		a.redirectErr(w, r, back, fmt.Errorf("folder %q sudah ada", name))
+		return
+	}
+	if err := a.s3.PutObject(ctx, bucket, key, []byte{}, "application/x-directory"); err != nil {
+		a.redirectErr(w, r, back, fmt.Errorf("gagal membuat folder: %w", err))
+		return
+	}
+	a.redirectOK(w, r, objectsBack(bucket, key), fmt.Sprintf("Folder %q dibuat.", name))
+}
+
 func (a *App) handleObjectDelete(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucket := strings.TrimSpace(r.PostFormValue("bucket"))
 	key := r.PostFormValue("key")
 	prefix := r.PostFormValue("prefix")
 
-	back := "/objects?bucket=" + url.QueryEscape(bucket)
-	if prefix != "" {
-		back += "&prefix=" + url.QueryEscape(prefix)
-	}
+	back := objectsBack(bucket, prefix)
 
 	if err := ValidateBucketName(bucket); err != nil {
 		a.redirectErr(w, r, "/objects", err)
@@ -1602,13 +1983,14 @@ func (a *App) handleObjectDelete(w http.ResponseWriter, r *http.Request) {
 
 // uploadResult is the JSON answer of /upload, one file per request.
 type uploadResult struct {
-	OK        bool   `json:"ok"`
-	Key       string `json:"key,omitempty"`
-	Size      int64  `json:"size,omitempty"`
-	Deduped   bool   `json:"deduped,omitempty"`
-	PublicURL string `json:"publicUrl,omitempty"`
-	Preview   string `json:"preview,omitempty"`
-	Error     string `json:"error,omitempty"`
+	OK          bool   `json:"ok"`
+	Key         string `json:"key,omitempty"`
+	Size        int64  `json:"size,omitempty"`
+	Deduped     bool   `json:"deduped,omitempty"`
+	Overwritten bool   `json:"overwritten,omitempty"`
+	PublicURL   string `json:"publicUrl,omitempty"`
+	Preview     string `json:"preview,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -1651,6 +2033,21 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
 		return
 	}
+	// Files land in the folder being browsed. An empty prefix is the root.
+	prefix := r.FormValue("prefix")
+	if err := ValidateJobPrefix(prefix); err != nil {
+		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
+		return
+	}
+	mode := r.FormValue("mode")
+	if mode == "" {
+		mode = "hash"
+	}
+	if mode != "hash" && mode != "name" {
+		writeJSON(w, http.StatusBadRequest, uploadResult{Error: "mode penamaan harus hash atau name"})
+		return
+	}
+	overwrite := r.FormValue("overwrite") == "1"
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -1659,7 +2056,15 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	ext, contentType, err := ValidateUploadName(header.Filename)
+	// Only the base name is ever looked at; directories in the client's
+	// path are dropped before any validation.
+	baseName := path.Base(strings.ReplaceAll(header.Filename, `\`, `/`))
+	var ext, contentType string
+	if mode == "name" {
+		ext, contentType, err = ValidateObjectBaseName(baseName)
+	} else {
+		ext, contentType, err = ValidateUploadName(baseName)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
 		return
@@ -1681,10 +2086,19 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Content addressing: the name is derived from the bytes, so uploading the
-	// same file twice cannot create a duplicate.
-	sum := sha256.Sum256(content)
-	key := hex.EncodeToString(sum[:])[:16] + ext
+	var key string
+	if mode == "name" {
+		key = prefix + baseName
+	} else {
+		// Content addressing: the name is derived from the bytes, so
+		// uploading the same file twice cannot create a duplicate.
+		sum := sha256.Sum256(content)
+		key = prefix + hex.EncodeToString(sum[:])[:16] + ext
+	}
+	if err := ValidateObjectKey(key); err != nil {
+		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
+		return
+	}
 
 	res := uploadResult{Key: key, Size: int64(len(content))}
 
@@ -1693,11 +2107,19 @@ func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, uploadResult{Key: key, Error: err.Error()})
 		return
 	}
-	if exists {
+	switch {
+	case exists && mode == "hash":
+		// Same bytes, same name: nothing to store.
 		res.Deduped = true
-	} else if err := a.s3.PutObject(ctx, bucket, key, content, contentType); err != nil {
-		writeJSON(w, http.StatusBadGateway, uploadResult{Key: key, Error: err.Error()})
+	case exists && !overwrite:
+		writeJSON(w, http.StatusConflict, uploadResult{Key: key, Error: fmt.Sprintf("%s sudah ada di folder ini — centang \"timpa yang sudah ada\" kalau memang mau menggantinya", baseName)})
 		return
+	default:
+		if err := a.s3.PutObject(ctx, bucket, key, content, contentType); err != nil {
+			writeJSON(w, http.StatusBadGateway, uploadResult{Key: key, Error: err.Error()})
+			return
+		}
+		res.Overwritten = exists
 	}
 
 	sites, _ := a.caddy.ListSites()
@@ -1747,7 +2169,7 @@ func (a *App) handlePreview(w http.ResponseWriter, r *http.Request) {
 	// download. That keeps an uploaded .html or .svg from running as script in
 	// the panel's origin.
 	base := path.Base(key)
-	if IsImageKey(key) {
+	if IsImageKey(key) && r.URL.Query().Get("dl") != "1" {
 		w.Header().Set("Content-Type", ContentTypeForKey(key))
 		w.Header().Set("Content-Disposition", "inline")
 	} else {

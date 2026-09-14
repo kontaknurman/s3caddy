@@ -38,6 +38,14 @@ UMask=0077
 ProtectSystem=full
 # /etc read-only karena ProtectSystem=full, jadi direktori sites dibuka lagi:
 ReadWritePaths=/etc/caddy/sites
+
+# /var/lib/garagepanel: remote S3 (berisi secret) dan checkpoint job sync.
+# systemd membuatnya sebagai garagepanel:garagepanel mode 0700 dan mengekspor
+# STATE_DIRECTORY, jadi tidak ada langkah mkdir manual. /var/lib tetap bisa
+# ditulis di bawah ProtectSystem=full, jadi tidak perlu ReadWritePaths lagi.
+# rclone (proses anak panel) menaruh cache-nya di sini juga.
+StateDirectory=garagepanel
+StateDirectoryMode=0700
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
@@ -53,9 +61,17 @@ LockPersonality=yes
 # PAM). Memblokirnya berisiko membuat satu-satunya operasi istimewa panel gagal.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
-# Batas wajar: panel menyangga file upload sampai 50 MB di memori.
+# Batas memori: panel sendiri kecil (upload disangga maksimal 50 MB), tapi job
+# sync menjalankan rclone sebagai proses anak di cgroup yang sama. Satu rclone
+# memakai ~100-250 MB (transfers × 2 × 8 MiB buffer multipart + baseline), dan
+# panel membatasi 2 job berjalan bersamaan.
 LimitNOFILE=4096
-MemoryMax=512M
+MemoryMax=1G
+
+# Saat stop/restart, panel memberi job yang sedang berjalan waktu untuk
+# menyimpan checkpoint dan menghentikan rclone dengan rapi. Job lanjut
+# otomatis dari checkpoint itu setelah start lagi.
+TimeoutStopSec=30
 
 StandardOutput=journal
 StandardError=journal

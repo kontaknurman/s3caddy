@@ -1,0 +1,260 @@
+{{define "content"}}
+
+{{with .Disabled}}
+<div class="notice warn">
+  <strong>Fitur Sync nonaktif.</strong>
+  <pre>{{.}}</pre>
+</div>
+{{else}}
+
+{{with .BucketsWarning}}
+<div class="notice warn">Daftar bucket tidak bisa diambil dari Garage.<pre>{{.}}</pre></div>
+{{end}}
+
+<div class="card">
+  <div class="row" style="justify-content: space-between; align-items: center;">
+    <h3 style="margin: 0;">Remote S3</h3>
+    <span class="muted small">rclone v{{.RcloneVersion}} · kredensial disimpan di <span class="mono">{{.StateDir}}/remotes.json</span> (0600)</span>
+  </div>
+
+  {{if .Remotes}}
+  <div class="table-wrap" style="margin-top: 12px;">
+  <table>
+    <thead>
+      <tr><th>Nama</th><th>Provider</th><th>Endpoint</th><th>Region</th><th>Access key</th><th>Aksi</th></tr>
+    </thead>
+    <tbody>
+      {{range .Remotes}}
+      <tr>
+        <td class="mono">{{.Name}}</td>
+        <td>{{.Provider}}</td>
+        <td class="mono">{{.Endpoint}} {{if .Insecure}}<span class="badge warn" title="Isi objek lewat jaringan tanpa enkripsi">tanpa TLS</span>{{end}}</td>
+        <td class="mono">{{.Region}}</td>
+        <td class="mono">{{.AccessKeyMasked}}</td>
+        <td>
+          <div class="row" style="gap: 6px; align-items: center;">
+            <form method="post" action="/sync/remotes/test" class="row" style="gap: 6px; align-items: center;">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="name" value="{{.Name}}">
+              <input type="text" name="bucket" placeholder="nama bucket" style="width: 160px;" required>
+              <button type="submit" class="small">Tes koneksi</button>
+            </form>
+            <form method="post" action="/sync/remotes/delete" data-confirm="Hapus remote {{.Name}}? Kredensialnya akan dihapus dari remotes.json.">
+              <input type="hidden" name="csrf" value="{{$.CSRF}}">
+              <input type="hidden" name="name" value="{{.Name}}">
+              <button type="submit" class="danger small">Hapus</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{else}}
+  <p class="muted" style="margin-top: 10px;">Belum ada remote. Tambahkan dulu Wasabi, AWS, MinIO, atau Garage lain di bawah.</p>
+  {{end}}
+
+  <details style="margin-top: 14px;">
+    <summary style="cursor: pointer; color: var(--accent);">Tambah remote</summary>
+    <form method="post" action="/sync/remotes/add" style="margin-top: 12px;">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="row">
+        <div class="field">
+          <label for="r-name">Nama (huruf kecil, angka, tanda hubung)</label>
+          <input type="text" id="r-name" name="name" placeholder="wasabi-sg" required pattern="[a-z0-9][a-z0-9-]{0,31}">
+        </div>
+        <div class="field" style="flex: 0 0 160px;">
+          <label for="r-provider">Provider</label>
+          <select id="r-provider" name="provider">
+            {{range .Providers}}<option value="{{.}}">{{.}}</option>{{end}}
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <div class="field">
+          <label for="r-endpoint">Endpoint (skema + host saja)</label>
+          <input type="text" id="r-endpoint" name="endpoint" placeholder="https://s3.ap-southeast-1.wasabisys.com" required>
+        </div>
+        <div class="field" style="flex: 0 0 200px;">
+          <label for="r-region">Region (untuk tanda tangan)</label>
+          <input type="text" id="r-region" name="region" placeholder="ap-southeast-1" required>
+        </div>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <div class="field">
+          <label for="r-ak">Access key</label>
+          <input type="text" id="r-ak" name="access_key" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="r-sk">Secret key</label>
+          <input type="password" id="r-sk" name="secret_key" autocomplete="off" required>
+        </div>
+        <div class="field" style="flex: 0 0 auto;">
+          <label>&nbsp;</label>
+          <button type="submit" class="primary">Simpan remote</button>
+        </div>
+      </div>
+      <p class="small muted" style="margin: 10px 0 0;">
+        Wasabi: <span class="mono">us-east-1</span> → <span class="mono">https://s3.wasabisys.com</span>; region lain →
+        <span class="mono">https://s3.&lt;region&gt;.wasabisys.com</span> (contoh <span class="mono">ap-southeast-1</span>, <span class="mono">eu-central-1</span>).
+        AWS: <span class="mono">https://s3.&lt;region&gt;.amazonaws.com</span>. MinIO/Garage lain: alamat servernya, provider <span class="mono">Minio</span>/<span class="mono">Other</span>.
+        Region harus cocok dengan endpoint, kalau tidak tanda tangan ditolak.
+      </p>
+    </form>
+  </details>
+</div>
+
+<div class="card">
+  <h3>Job baru: impor atau ekspor bucket</h3>
+  {{if not .Remotes}}
+    <p class="muted">Tambah remote dulu di atas.</p>
+  {{else}}
+  <form method="post" action="/sync/jobs/create">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <div class="row">
+      <div class="field" style="flex: 0 0 auto;">
+        <label>Arah</label>
+        <label class="check"><input type="radio" name="direction" value="import" checked> Impor: remote → Garage</label>
+        <label class="check"><input type="radio" name="direction" value="export"> Ekspor: Garage → remote</label>
+      </div>
+    </div>
+    <div class="row" style="margin-top: 12px;">
+      <div class="field" style="flex: 0 0 180px;">
+        <label for="j-remote">Remote</label>
+        <select id="j-remote" name="remote">
+          {{range .Remotes}}<option value="{{.Name}}">{{.Name}}</option>{{end}}
+        </select>
+      </div>
+      <div class="field">
+        <label for="j-rbucket">Bucket di remote</label>
+        <input type="text" id="j-rbucket" name="remote_bucket" placeholder="backup-2026" required>
+      </div>
+      <div class="field">
+        <label for="j-rprefix">Prefix di remote (opsional, akhiri dengan /)</label>
+        <input type="text" id="j-rprefix" name="remote_prefix" placeholder="foto/2026/">
+      </div>
+    </div>
+    <div class="row" style="margin-top: 12px;">
+      <div class="field" style="flex: 0 0 180px;">
+        <label for="j-gbucket">Bucket di Garage</label>
+        <select id="j-gbucket" name="garage_bucket" required>
+          <option value="">— pilih —</option>
+          {{range .Buckets}}<option value="{{.}}">{{.}}</option>{{end}}
+        </select>
+      </div>
+      <div class="field">
+        <label for="j-gprefix">Prefix di Garage (opsional, akhiri dengan /)</label>
+        <input type="text" id="j-gprefix" name="garage_prefix" placeholder="arsip/">
+      </div>
+      <div class="field" style="flex: 0 0 140px;">
+        <label for="j-transfers">Transfer paralel (1–{{.MaxTransfers}})</label>
+        <input type="text" id="j-transfers" name="transfers" value="4" inputmode="numeric">
+      </div>
+    </div>
+    <div class="field" style="margin-top: 12px;">
+      <label>Objek yang sudah ada di tujuan</label>
+      <label class="check"><input type="radio" name="mode" value="skip-existing" checked> <strong>Lewati</strong>&nbsp;— hanya salin yang belum ada (update saja)</label>
+      <label class="check"><input type="radio" name="mode" value="update-if-different"> <strong>Perbarui kalau beda</strong>&nbsp;— salin yang belum ada atau ukurannya beda</label>
+      <label class="check"><input type="radio" name="mode" value="overwrite"> <strong>Timpa semua</strong>&nbsp;— salin semua objek tanpa memeriksa tujuan</label>
+    </div>
+    <div class="row" style="margin-top: 12px; align-items: center;">
+      <button type="submit" class="primary">Mulai job</button>
+      <span class="small muted">Job jalan di server, per {{.ChunkKeys}} objek dicatat checkpoint. Tab boleh ditutup; setelah restart panel job lanjut sendiri. Objek di tujuan tidak pernah dihapus.</span>
+    </div>
+  </form>
+  {{end}}
+</div>
+
+<div class="card" id="jobs" data-active="{{if .HasActive}}1{{else}}0{{end}}">
+  <h3>Job</h3>
+  {{if not .Jobs}}
+    <div class="empty">Belum ada job.</div>
+  {{else}}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Job</th><th>Sumber → Tujuan</th><th>Status</th><th>Progres</th><th>Aksi</th></tr>
+    </thead>
+    <tbody>
+      {{range .Jobs}}
+      <tr data-job="{{.ID}}" data-status="{{.Status}}">
+        <td>
+          <div><strong>{{.Direction}}</strong> <span class="muted small mono">{{.ID}}</span></div>
+          <div class="small muted">mulai {{.StartedH}}{{if .FinishedH}} · selesai {{.FinishedH}}{{end}} · run ke-{{.Runs}}</div>
+          {{if eq .Kind "sync"}}<div class="small muted">mode {{.Mode}} · {{.Transfers}} transfer paralel</div>{{end}}
+        </td>
+        <td class="mono small">{{.SrcLabel}}{{if .DstLabel}}<br>→ {{.DstLabel}}{{end}}</td>
+        <td>
+          <span class="badge {{if .Active}}warn{{else if eq .Status "done"}}ok{{else}}bad{{end}}" data-field="statusLabel">{{.StatusLabel}}</span>
+          <div class="small muted">diperbarui <span data-field="updatedH">{{.UpdatedH}}</span></div>
+        </td>
+        <td class="small">
+          <div>diperiksa <strong data-field="listed">{{.Counters.Listed}}</strong> · ditransfer <strong data-field="transferred">{{.Counters.Transferred}}</strong> · dilewati <strong data-field="skipped">{{.Counters.Skipped}}</strong> · gagal <strong data-field="failed">{{.Counters.Failed}}</strong></div>
+          <div class="muted"><span data-field="bytesH">{{.BytesH}}</span> <span data-field="speedH">{{.SpeedH}}</span> · chunk <span data-field="chunks">{{.Counters.Chunks}}</span> · checkpoint <span class="mono" data-field="checkpoint">{{if .Checkpoint}}{{.Checkpoint}}{{else}}—{{end}}</span></div>
+          {{if .Counters.Failed}}<div><a href="/sync/jobs/failed?id={{.ID}}">lihat key yang gagal</a></div>{{end}}
+          {{with .PauseReason}}<pre class="small" style="white-space: pre-wrap; margin: 6px 0 0; color: var(--warn);">{{.}}</pre>{{end}}
+          {{with .ErrorShort}}<pre class="small" style="white-space: pre-wrap; margin: 6px 0 0; color: var(--err);">{{.}}</pre>{{end}}
+          {{if .LastLogText}}<details class="small"><summary style="cursor: pointer;">log rclone terakhir</summary><pre style="white-space: pre-wrap;">{{.LastLogText}}</pre></details>{{end}}
+        </td>
+        <td>
+          <div class="row" style="gap: 6px;">
+            {{if .CanPause}}<form method="post" action="/sync/jobs/pause"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Jeda</button></form>{{end}}
+            {{if .CanResume}}<form method="post" action="/sync/jobs/resume"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small primary">Lanjutkan</button></form>{{end}}
+            {{if .CanCancel}}<form method="post" action="/sync/jobs/cancel" data-confirm="Batalkan job {{.ID}}? Objek yang sudah tersalin tetap ada."><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Batalkan</button></form>{{end}}
+            {{if .CanRerun}}<form method="post" action="/sync/jobs/rerun" data-confirm="Jalankan ulang job {{.ID}} dari awal?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="small">Ulangi</button></form>{{end}}
+            {{if .CanDelete}}<form method="post" action="/sync/jobs/delete" data-confirm="Hapus catatan job {{.ID}} beserta daftar key gagalnya?"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button type="submit" class="danger small">Hapus</button></form>{{end}}
+          </div>
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  <p class="small muted" style="margin: 12px 0 0;">
+    Angka diperbarui tiap 3 detik selama ada job berjalan. Setelah restart panel, job melanjutkan dari checkpoint chunk terakhir; objek di chunk yang terputus diperiksa ulang (di mode "lewati" tidak disalin dua kali). Log lengkap ada di <span class="mono">journalctl -u garagepanel</span>.
+  </p>
+  {{end}}
+</div>
+
+<script>
+(function () {
+  var root = document.getElementById('jobs');
+  if (!root || root.getAttribute('data-active') !== '1') { return; }
+  var fields = ['statusLabel', 'updatedH', 'listed', 'transferred', 'skipped', 'failed', 'bytesH', 'speedH', 'chunks', 'checkpoint'];
+  function tick() {
+    fetch('/sync/jobs.json', { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+      .then(function (jobs) {
+        var stillActive = false;
+        jobs.forEach(function (job) {
+          var row = root.querySelector('[data-job="' + job.id + '"]');
+          if (!row) { return; }
+          if (row.getAttribute('data-status') !== job.status) { window.location.reload(); return; }
+          if (job.active) { stillActive = true; }
+          fields.forEach(function (f) {
+            var el = row.querySelector('[data-field="' + f + '"]');
+            if (!el) { return; }
+            var v;
+            switch (f) {
+              case 'listed': v = job.counters.listed; break;
+              case 'transferred': v = job.counters.transferred; break;
+              case 'skipped': v = job.counters.skipped; break;
+              case 'failed': v = job.counters.failed; break;
+              case 'chunks': v = job.counters.chunks; break;
+              case 'checkpoint': v = job.checkpoint || '—'; break;
+              default: v = job[f];
+            }
+            el.textContent = (v === undefined || v === null) ? '' : String(v);
+          });
+        });
+        if (stillActive) { setTimeout(tick, 3000); }
+      })
+      .catch(function () { setTimeout(tick, 10000); });
+  }
+  setTimeout(tick, 3000);
+})();
+</script>
+
+{{end}}
+{{end}}

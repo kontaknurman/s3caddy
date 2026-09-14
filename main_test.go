@@ -232,9 +232,12 @@ type testPanel struct {
 	client   *http.Client
 	sitesDir string
 	garage   *fakeGarage
-	s3Store  map[string][]byte
-	// s3Deny, kalau diisi, membuat S3 tiruan menjawab 403 dengan body ini.
-	s3Deny string
+	// s3 is the in-memory S3 the panel's own Garage credentials talk to.
+	s3 *fakeS3
+	// remote is a second in-memory S3 standing in for Wasabi.
+	remote *fakeS3
+	// rcDir holds the fake rclone script and its knobs.
+	rcDir string
 }
 
 func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
@@ -244,62 +247,16 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 	garageSrv := fg.server(t)
 	t.Cleanup(garageSrv.Close)
 
-	store := map[string][]byte{}
-	var storeMu sync.Mutex
 	panel := &testPanel{}
-	s3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		storeMu.Lock()
-		defer storeMu.Unlock()
-		if panel.s3Deny != "" {
-			w.WriteHeader(http.StatusForbidden)
-			io.WriteString(w, panel.s3Deny)
-			return
-		}
-		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
-		key := ""
-		if len(parts) == 2 {
-			key, _ = url.PathUnescape(parts[1])
-		}
-		switch r.Method {
-		case http.MethodGet:
-			if key == "" { // ListObjectsV2
-				w.Header().Set("Content-Type", "application/xml")
-				io.WriteString(w, listXML)
-				return
-			}
-			body, ok := store[key]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>tidak ada</Message></Error>`)
-				return
-			}
-			w.Write(body)
-		case http.MethodHead:
-			if _, ok := store[key]; !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-		case http.MethodPut:
-			body, _ := io.ReadAll(r.Body)
-			store[key] = body
-			w.WriteHeader(http.StatusOK)
-		case http.MethodDelete:
-			delete(store, key)
-			w.WriteHeader(http.StatusNoContent)
-		}
-	}))
-	t.Cleanup(s3Srv.Close)
+	fake := newFakeS3(t, "GK-test", "secret-test", "garage")
 
 	// Web endpoint (port 3902 in production): serves by Host header.
 	webSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		storeMu.Lock()
-		defer storeMu.Unlock()
 		if r.Host != "media" { // only "media" has website access in these tests
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		body, ok := store[strings.TrimPrefix(r.URL.Path, "/")]
+		body, ok := fake.get("media", strings.TrimPrefix(r.URL.Path, "/"))
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -310,10 +267,11 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 	t.Cleanup(webSrv.Close)
 
 	dir := t.TempDir()
+	rcDir := t.TempDir()
 	cfg := &Config{
 		AdminToken:  "test-token",
 		AdminURL:    garageSrv.URL,
-		S3URL:       s3Srv.URL,
+		S3URL:       fake.URL(),
 		WebURL:      webSrv.URL,
 		S3AccessKey: "GK-test",
 		S3SecretKey: "secret-test",
@@ -322,6 +280,8 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 		S3APIDomain: "s3.example.com",
 		Listen:      "127.0.0.1:0",
 		ReloadCmd:   reloadOK,
+		StateDir:    filepath.Join(t.TempDir(), "state"),
+		RcloneBin:   fakeRcloneBin(t, rcDir),
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -358,7 +318,9 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 	panel.client = client
 	panel.sitesDir = dir
 	panel.garage = fg
-	panel.s3Store = store
+	panel.s3 = fake
+	panel.remote = newFakeS3(t, "WASABIKEY", testRemoteSecret, "us-east-1")
+	panel.rcDir = rcDir
 	return panel
 }
 
@@ -758,7 +720,7 @@ func TestUploadIsContentAddressedAndDeduplicates(t *testing.T) {
 	if first.PublicURL != "https://cdn.example.com/"+wantKey {
 		t.Errorf("public URL = %q", first.PublicURL)
 	}
-	if string(p.s3Store[wantKey]) != string(content) {
+	if got, _ := p.s3.get("media", wantKey); string(got) != string(content) {
 		t.Error("object content not stored")
 	}
 
@@ -782,7 +744,7 @@ func TestUploadRejectsDisallowedExtension(t *testing.T) {
 	if !strings.Contains(res.Error, "tidak diizinkan") {
 		t.Errorf("unexpected error: %q", res.Error)
 	}
-	if len(p.s3Store) != 0 {
+	if p.s3.count("media") != 0 {
 		t.Error("nothing should have been stored")
 	}
 }
@@ -807,7 +769,13 @@ func TestUploadRequiresCSRFHeader(t *testing.T) {
 
 func (p *testPanel) upload(t *testing.T, bucket, filename string, content []byte) uploadResult {
 	t.Helper()
-	body, contentType := multipartBody(t, bucket, filename, content)
+	return p.uploadWith(t, bucket, filename, content, nil)
+}
+
+// uploadWith posts one file with extra form fields (mode, prefix, overwrite).
+func (p *testPanel) uploadWith(t *testing.T, bucket, filename string, content []byte, extra map[string]string) uploadResult {
+	t.Helper()
+	body, contentType := multipartBodyWith(t, bucket, filename, content, extra)
 	req, err := http.NewRequest(http.MethodPost, p.srv.URL+"/upload", body)
 	if err != nil {
 		t.Fatal(err)
@@ -829,10 +797,20 @@ func (p *testPanel) upload(t *testing.T, bucket, filename string, content []byte
 
 func multipartBody(t *testing.T, bucket, filename string, content []byte) (io.Reader, string) {
 	t.Helper()
+	return multipartBodyWith(t, bucket, filename, content, nil)
+}
+
+func multipartBodyWith(t *testing.T, bucket, filename string, content []byte, extra map[string]string) (io.Reader, string) {
+	t.Helper()
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	if err := mw.WriteField("bucket", bucket); err != nil {
 		t.Fatal(err)
+	}
+	for k, v := range extra {
+		if err := mw.WriteField(k, v); err != nil {
+			t.Fatal(err)
+		}
 	}
 	fw, err := mw.CreateFormFile("file", filename)
 	if err != nil {
@@ -850,8 +828,8 @@ func multipartBody(t *testing.T, bucket, filename string, content []byte) (io.Re
 func TestPreviewServesImagesInlineAndForcesDownloadOtherwise(t *testing.T) {
 	p := newTestPanel(t)
 	p.garage.addBucket("media", 0, 0, true)
-	p.s3Store["a.png"] = []byte("pngbytes")
-	p.s3Store["page.html"] = []byte("<script>alert(1)</script>")
+	p.s3.put("media", "a.png", []byte("pngbytes"), "image/png")
+	p.s3.put("media", "page.html", []byte("<script>alert(1)</script>"), "text/html")
 
 	resp, body := p.get(t, "/preview?bucket=media&key=a.png")
 	if resp.StatusCode != http.StatusOK {
@@ -885,7 +863,7 @@ func TestPreviewServesImagesInlineAndForcesDownloadOtherwise(t *testing.T) {
 func TestPreviewFallsBackToSignedS3ForPrivateBucket(t *testing.T) {
 	p := newTestPanel(t)
 	p.garage.addBucket("rahasia", 0, 0, false)
-	p.s3Store["secret.png"] = []byte("private-bytes")
+	p.s3.put("rahasia", "secret.png", []byte("private-bytes"), "image/png")
 
 	resp, body := p.get(t, "/preview?bucket=rahasia&key=secret.png")
 	if resp.StatusCode != http.StatusOK {
@@ -913,12 +891,19 @@ func TestPreviewRejectsTraversal(t *testing.T) {
 func TestObjectsPageListsImagesAndFiles(t *testing.T) {
 	p := newTestPanel(t)
 	p.garage.addBucket("media", 2, 2063, true)
+	p.s3.put("media", "hello world.jpg", []byte("jpg"), "image/jpeg")
+	p.s3.put("media", "plus+file.pdf", []byte("pdf"), "application/pdf")
+	p.s3.put("media", "thumbs/x.jpg", []byte("jpg"), "image/jpeg")
+	// Enough filler to make the first page of 100 truncate.
+	for i := 0; i < objectsPerPage; i++ {
+		p.s3.put("media", fmt.Sprintf("zz-%03d.txt", i), []byte("x"), "text/plain")
+	}
 
 	resp, body := p.get(t, "/objects?bucket=media")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	// From listXML: one jpg (grid) and one pdf (list), plus a folder.
+	// One jpg (grid) and one pdf (list), plus a folder.
 	if !strings.Contains(body, `loading="lazy"`) {
 		t.Error("thumbnails must be lazy-loaded")
 	}
@@ -930,11 +915,11 @@ func TestObjectsPageListsImagesAndFiles(t *testing.T) {
 	if !strings.Contains(body, "plus&#43;file.pdf") {
 		t.Error("non-image not listed")
 	}
-	if !strings.Contains(body, "key=plus%2bfile.pdf") {
+	if !strings.Contains(body, "key=plus%2Bfile.pdf") {
 		t.Error("the plus in the key must be percent-encoded in the preview link")
 	}
-	if !strings.Contains(body, "thumbs/") {
-		t.Error("folder prefix not listed")
+	if !strings.Contains(body, "📁 thumbs") || !strings.Contains(body, "prefix=thumbs%2F") {
+		t.Error("folder not listed with its name and a prefix link")
 	}
 	if !strings.Contains(body, "Halaman berikutnya") {
 		t.Error("pagination link missing for a truncated listing")
@@ -1240,7 +1225,7 @@ func TestUploadWithoutSessionReturnsJSON(t *testing.T) {
 
 func TestPreviewRequiresLogin(t *testing.T) {
 	p := newTestPanel(t, withLogin(t))
-	p.s3Store["a.png"] = []byte("rahasia")
+	p.s3.put("media", "a.png", []byte("rahasia"), "image/png")
 
 	resp, body := p.get(t, "/preview?bucket=media&key=a.png")
 	if resp.StatusCode == http.StatusOK && strings.Contains(body, "rahasia") {
@@ -1514,7 +1499,7 @@ func TestObjectsPageShowsCredentialDiagnosis(t *testing.T) {
 	p := newTestPanel(t)
 	p.garage.addBucket("media", 0, 0, true)
 	p.garage.keys = map[string]string{p.app.cfg.S3AccessKey: "secret-yang-berbeda"}
-	p.s3Deny = `<Error><Code>AccessDenied</Code><Message>Forbidden: Invalid signature</Message></Error>`
+	p.s3.deny = `<Error><Code>AccessDenied</Code><Message>Forbidden: Invalid signature</Message></Error>`
 
 	_, body := p.get(t, "/objects?bucket=media")
 	if !strings.Contains(body, "Invalid signature") {

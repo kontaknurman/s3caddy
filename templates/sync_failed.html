@@ -1,0 +1,36 @@
+{{define "content"}}
+<div class="card">
+  <div class="row" style="justify-content: space-between; align-items: center;">
+    <h3 style="margin: 0;">Job <span class="mono">{{.Job.ID}}</span> · {{.Job.Direction}} <span class="mono small">{{.Job.SrcLabel}}{{if .Job.DstLabel}} → {{.Job.DstLabel}}{{end}}</span></h3>
+    <div class="row" style="gap: 8px;">
+      {{if .Total}}<a class="btn small" href="/sync/jobs/failed?id={{.Job.ID}}&amp;download=1">Unduh semua ({{.Total}}) sebagai JSONL</a>{{end}}
+      <a class="btn small" href="/sync">← Kembali ke Sync</a>
+    </div>
+  </div>
+  <p class="small muted" style="margin: 10px 0 0;">
+    Total {{.Total}} key gagal{{if gt .Total .Tail}}; yang ditampilkan {{.Tail}} terakhir{{end}}. Kolom "error" adalah pesan asli dari rclone atau dari provider.
+    Setelah penyebabnya dibereskan, jalankan job lagi dengan mode "Lewati": objek yang sudah tersalin dilewati, yang gagal dicoba lagi.
+  </p>
+</div>
+
+{{if not .Keys}}
+  <div class="empty">Tidak ada key yang gagal.</div>
+{{else}}
+<div class="card">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Key</th><th>Error</th><th>Waktu</th></tr></thead>
+    <tbody>
+      {{range .Keys}}
+      <tr>
+        <td class="mono small" style="word-break: break-all;">{{.Key}}</td>
+        <td class="small" style="word-break: break-word;">{{.Error}}</td>
+        <td class="small muted">{{humanTime .At}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+</div>
+{{end}}
+{{end}}

@@ -5,7 +5,9 @@ dan domain [Caddy](https://caddyserver.com/) di satu server Linux.
 
 Go murni, **tanpa dependency eksternal** — tidak ada framework web, tidak ada
 AWS SDK. Template di-embed dengan `//go:embed`, hasil build adalah satu binary
-statis tanpa file pendukung.
+statis tanpa file pendukung. Satu-satunya program tambahan adalah
+[rclone](https://rclone.org/), itu pun opsional dan hanya untuk fitur Sync
+(impor/ekspor bucket dari Wasabi dan layanan S3 lain).
 
 ```
 $ go list -m all
@@ -17,9 +19,10 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 - [Yang bisa dilakukan](#yang-bisa-dilakukan)
 - [Cara kerja](#cara-kerja)
 - [Peta komponen](#peta-komponen)
-- [Memasang Go dan Caddy](#memasang-go-dan-caddy)
+- [Memasang Go, Caddy, dan rclone](#memasang-go-caddy-dan-rclone)
   - [Go (di mesin build)](#go-di-mesin-build)
   - [Caddy (di server)](#caddy-di-server)
+  - [rclone (di server, untuk Sync)](#rclone-di-server-untuk-sync)
 - [Instalasi](#instalasi)
   - [Prasyarat](#prasyarat)
   - [Langkah 0 — Periksa Garage dan Caddy](#langkah-0--periksa-garage-dan-caddy)
@@ -36,6 +39,13 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Checklist instalasi](#checklist-instalasi)
 - [Diverifikasi di Ubuntu 24.04](#diverifikasi-di-ubuntu-2404)
 - [Login dan akses lewat domain](#login-dan-akses-lewat-domain)
+- [Sync dengan S3 lain (Wasabi, dll.)](#sync-dengan-s3-lain-wasabi-dll)
+  - [Menambah remote](#menambah-remote)
+  - [Memulai impor atau ekspor](#memulai-impor-atau-ekspor)
+  - [Cara kerja job](#cara-kerja-job)
+  - [Restart, jeda, dan key yang gagal](#restart-jeda-dan-key-yang-gagal)
+  - [Biaya request dan batasan](#biaya-request-dan-batasan)
+- [File manager di halaman Objek](#file-manager-di-halaman-objek)
 - [Update ke versi baru](#update-ke-versi-baru)
   - [1. Catat versi yang sedang berjalan](#1-catat-versi-yang-sedang-berjalan)
   - [2. Build versi baru](#2-build-versi-baru)
@@ -55,7 +65,8 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 |---|---|
 | **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi |
 | **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback |
-| **Objek** | Browser objek per bucket: grid untuk gambar, list untuk file lain, upload drag-and-drop content-addressed, hapus, copy URL publik |
+| **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
+| **Sync** | Impor/ekspor bucket dari/ke Wasabi, AWS, MinIO, atau Garage lain. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
 
 ## Cara kerja
@@ -99,7 +110,23 @@ dan stderr Caddy ditampilkan ke user. Config yang sedang berjalan tidak pernah
 ditinggalkan dalam keadaan rusak.
 
 **SigV4 ditulis tangan** dengan `crypto/hmac` + `crypto/sha256`. Implementasinya
-diuji terhadap dua test vector resmi AWS (lihat `s3_test.go`).
+diuji terhadap tiga test vector resmi AWS (lihat `s3_test.go` dan
+`s3_ops_test.go`).
+
+**Sync = panel yang memutuskan, rclone yang menyalin.** Panel men-list bucket
+sumber dan tujuan halaman demi halaman (1000 key per request, selalu terurut)
+dan membandingkannya seperti merge sort — dua request listing per 1000 objek,
+tanpa HEAD per objek, tanpa menahan daftar di memori. Key yang harus disalin
+ditulis ke file chunk (maksimal 10.000 key) dan diserahkan ke
+`rclone copy --files-from-raw`, yang menyalin persis daftar itu tanpa men-list
+apa pun. Setiap chunk selesai, key terakhirnya dicatat sebagai checkpoint di
+`/var/lib/garagepanel`. Detailnya di [Sync dengan S3 lain](#sync-dengan-s3-lain-wasabi-dll).
+
+**State yang ada hanya untuk Sync.** Selain file `.caddy`, panel menulis ke
+`/var/lib/garagepanel`: daftar remote (dengan secret-nya, mode 0600) dan
+checkpoint job. Itu bukan database: isi bucket tetap satu-satunya sumber
+kebenaran, dan panel tanpa direktori ini tetap berjalan — hanya halaman Sync
+yang nonaktif.
 
 ## Peta komponen
 
@@ -119,8 +146,12 @@ panel seluruhnya di loopback.
                                                ├──▶ 127.0.0.1:3902  Garage web
                                                │       thumbnail lewat /preview
                                                │
-                                               └──▶ tulis /etc/caddy/sites/*.caddy
-                                                       lalu `systemctl reload caddy`
+                                               ├──▶ tulis /etc/caddy/sites/*.caddy
+                                               │       lalu `systemctl reload caddy`
+                                               │
+                                               └──▶ rclone (proses anak, user garagepanel)
+                                                       Garage S3 ◀──▶ Wasabi / AWS / MinIO
+                                                       daftar key dari panel, kredensial lewat env
 ```
 
 **Jalur pengunjung — orang membuka domainmu:**
@@ -144,9 +175,10 @@ Yang perlu ada di mesin mana:
 | Go 1.24+ | ✔ | — (binary statis) |
 | Garage | — | ✔ |
 | Caddy | — | ✔ |
+| rclone 1.59+ | — | ✔ hanya kalau fitur Sync dipakai |
 | garagepanel | dibuat di sini | ✔ dijalankan di sini |
 
-## Memasang Go dan Caddy
+## Memasang Go, Caddy, dan rclone
 
 Lewati bagian ini kalau keduanya sudah ada. Go hanya dibutuhkan di **mesin yang
 mem-build** — binary hasilnya statis, jadi server tidak perlu Go terpasang.
@@ -277,6 +309,32 @@ sudo ufw allow 80,443/tcp        # Debian/Ubuntu dengan ufw
 sudo firewall-cmd --permanent --add-service={http,https} && sudo firewall-cmd --reload
 ```
 
+### rclone (di server, untuk Sync)
+
+Hanya perlu kalau kamu memakai halaman Sync. Panel tidak butuh `rclone config`
+sama sekali: kredensial diberikan lewat environment proses anak, per job.
+
+Ubuntu 24.04 menyediakan versi yang cukup (1.60):
+
+```bash
+sudo apt install rclone
+rclone version        # harus: rclone v1.59 atau lebih baru
+```
+
+Distro yang paketnya lebih tua dari 1.59 (Ubuntu 22.04 punya 1.53 — terlalu
+lama, panel menolaknya karena butuh `--metadata`): pakai skrip resmi, yang
+memasang binary statis ke `/usr/bin/rclone`:
+
+```bash
+curl -fsSL https://rclone.org/install.sh | sudo bash
+rclone version
+```
+
+rclone berjalan sebagai user `garagepanel`, tanpa sudo, di dalam sandbox unit
+systemd yang sama. Tidak ada yang perlu dikonfigurasi selain memasangnya. Kalau
+dipasang belakangan, `sudo systemctl restart garagepanel` supaya panel
+mendeteksinya.
+
 ## Instalasi
 
 Tutorial dari nol sampai panel bisa dipakai. Sekitar 15 menit. Setiap langkah
@@ -293,8 +351,9 @@ dijelaskan, artinya di server).
 | Caddy sudah jalan | `systemctl is-active caddy` | `active` |
 | Akses `sudo` di server | `sudo -v` | tidak error |
 | Go 1.24+ di mesin build | `go version` | `go1.24` atau lebih baru |
+| rclone 1.59+ di server (opsional, untuk Sync) | `rclone version` | `rclone v1.59` atau lebih baru |
 
-Belum ada Go atau Caddy? Lihat [Memasang Go dan Caddy](#memasang-go-dan-caddy)
+Belum ada Go atau Caddy? Lihat [Memasang Go dan Caddy](#memasang-go-caddy-dan-rclone)
 di atas.
 
 Panel **tidak** memasang atau mengubah Garage maupun Caddy. Keduanya harus sudah
@@ -696,6 +755,24 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/buckets   # harus
 > diubah jadi `yes`, reload Caddy akan selalu gagal. Alasannya ditulis juga
 > sebagai komentar di dalam file unit-nya.
 
+Baris `StateDirectory=garagepanel` di unit membuat `/var/lib/garagepanel`
+(milik `garagepanel`, mode 0700) secara otomatis — tidak ada `mkdir` manual.
+Di sanalah daftar remote dan checkpoint job Sync disimpan:
+
+```bash
+stat -c '%U %G %a' /var/lib/garagepanel     # harus: garagepanel garagepanel 700
+```
+
+Di log start harus ada satu dari dua baris ini — keduanya normal:
+
+```
+garagepanel: sync aktif: rclone v1.60.1, state di /var/lib/garagepanel, 0 remote, 0 job tersimpan
+garagepanel: PERINGATAN: rclone tidak ditemukan ("rclone"): ... Pasang dengan: sudo apt install rclone
+```
+
+Yang kedua hanya berarti halaman Sync nonaktif sampai rclone dipasang; halaman
+lain tidak terpengaruh.
+
 ### Langkah 9 — Buka panel lewat SSH tunnel
 
 Panel **hanya** mendengarkan di loopback, jadi tidak bisa dibuka langsung dari
@@ -986,13 +1063,222 @@ sudo systemctl restart garagepanel
 Mau memaksa semua orang logout? `sudo systemctl restart garagepanel` sudah cukup —
 session hanya ada di memori.
 
+## Sync dengan S3 lain (Wasabi, dll.)
+
+Halaman **Sync** menyalin isi satu bucket dari layanan S3 lain ke Garage
+(impor) atau sebaliknya (ekspor). Dirancang untuk bucket dengan ratusan juta
+objek dan proses yang memakan hari: job jalan di server, bukan di browser, dan
+dilanjutkan otomatis dari checkpoint setelah panel di-restart atau server
+reboot.
+
+Prasyarat: rclone terpasang di server (lihat
+[rclone (di server, untuk Sync)](#rclone-di-server-untuk-sync)) dan
+`/var/lib/garagepanel` ada (dibuat unit systemd). Kalau salah satunya kurang,
+halaman Sync menampilkan alasannya beserta perintah perbaikannya.
+
+### Menambah remote
+
+Remote = satu endpoint S3 beserta kredensialnya. Diisi di kartu **Remote S3**:
+
+| Kolom | Isi |
+|---|---|
+| Nama | pengenal pendek, huruf kecil/angka/tanda hubung, misalnya `wasabi-sg` |
+| Provider | `Wasabi`, `AWS`, `Minio`, atau `Other` (Garage lain, Ceph, dll.) — ini nilai `provider` rclone |
+| Endpoint | skema + host saja, tanpa path: `https://s3.ap-southeast-1.wasabisys.com` |
+| Region | region untuk tanda tangan; **harus cocok dengan endpoint** |
+| Access key / Secret key | dari penyedia. Spasi atau baris baru di ujung dipangkas otomatis |
+
+Endpoint dan region Wasabi:
+
+| Region | Endpoint |
+|---|---|
+| `us-east-1` | `https://s3.wasabisys.com` |
+| `us-east-2`, `us-central-1`, `us-west-1` | `https://s3.<region>.wasabisys.com` |
+| `eu-central-1`, `eu-central-2`, `eu-west-1`, `eu-west-2` | `https://s3.<region>.wasabisys.com` |
+| `ap-northeast-1`, `ap-northeast-2`, `ap-southeast-1`, `ap-southeast-2` | `https://s3.<region>.wasabisys.com` |
+
+AWS: `https://s3.<region>.amazonaws.com` dengan region bucket-nya. MinIO atau
+Garage lain: alamat servernya (boleh `http://` di LAN — panel menandainya
+"tanpa TLS" karena isi objek lewat tanpa enkripsi; secret sendiri tidak pernah
+dikirim, SigV4 hanya mengirim tanda tangannya).
+
+Kredensial disimpan di `/var/lib/garagepanel/remotes.json` mode 0600 dan tidak
+pernah ditampilkan lagi (access key disamarkan). Klik **Tes koneksi** dengan
+nama bucket untuk memastikan endpoint, region, dan kredensial benar — pesan
+error yang muncul adalah pesan asli penyedianya.
+
+### Memulai impor atau ekspor
+
+Di kartu **Job baru**:
+
+1. **Arah**: Impor (remote → Garage) atau Ekspor (Garage → remote).
+2. Remote, bucket di remote, bucket di Garage, dan prefix opsional di
+   masing-masing sisi (`foto/2026/`, harus diakhiri `/`). Prefix sumber dan
+   tujuan boleh beda: `wasabi:backup/2024/` → `garage:arsip/`.
+3. **Objek yang sudah ada di tujuan**:
+   - **Lewati** (bawaan) — hanya salin yang belum ada. Ini mode "update saja":
+     jalankan berulang, hanya objek baru yang disalin.
+   - **Perbarui kalau beda** — salin juga yang ukurannya beda di kedua sisi.
+   - **Timpa semua** — salin semua tanpa memeriksa tujuan (tujuan tidak
+     di-list sama sekali).
+4. **Transfer paralel** (1–16, bawaan 4): jumlah objek yang disalin
+   bersamaan oleh rclone.
+
+Sebelum job dibuat, panel mencoba membaca satu key di kedua bucket; kalau
+gagal, job tidak dibuat dan pesannya ditampilkan. Setelah itu tab boleh
+ditutup. Angka di tabel job diperbarui tiap 3 detik selama ada job berjalan.
+
+Batas: satu job belum-selesai per bucket, dan maksimal 2 job berjalan
+bersamaan (memori rclone).
+
+### Cara kerja job
+
+```
+  panel                                          rclone (proses anak)
+  ─────                                          ────────────────────
+  list sumber  ─┐  merge-join, 1000 key/halaman
+  list tujuan  ─┘  → key yang harus disalin
+  tulis chunk.txt (≤ 10.000 key relatif)  ───▶  rclone copy --files-from-raw chunk.txt
+                                                 --no-traverse --no-check-dest -M ...
+  baca log JSON (progres, key gagal)      ◀───  src:bucket/prefix/  dst:bucket/prefix/
+  chunk selesai → checkpoint = key terakhir
+  ulangi sampai sumber habis
+```
+
+Perintah rclone persisnya (bisa direproduksi manual untuk debugging):
+
+```
+rclone copy --files-from-raw <chunk> --no-traverse --use-json-log --stats 5s \
+  --stats-log-level NOTICE --log-level NOTICE --transfers <N> --checkers <N> \
+  --retries 3 --low-level-retries 10 --config "" --no-check-dest -M \
+  --s3-upload-cutoff 8M --s3-chunk-size 8M --s3-upload-concurrency 2 \
+  --cache-dir /var/lib/garagepanel/cache src:<bucket>/<prefix> dst:<bucket>/<prefix>
+```
+
+Remote `src` dan `dst` didefinisikan lewat environment proses anak
+(`RCLONE_CONFIG_SRC_TYPE=s3`, `..._ENDPOINT`, `..._ACCESS_KEY_ID`,
+`..._SECRET_ACCESS_KEY`, dst.) — tidak lewat argumen (terlihat di `ps`), tidak
+lewat file. Environment itu dibangun dari nol: `GARAGE_ADMIN_TOKEN` dan
+`PANEL_PASSWORD_HASH` milik panel tidak diwariskan ke rclone.
+
+Kenapa tidak `rclone copy` polos? rclone menahan seluruh isi satu direktori di
+memori (~1 KB per objek). Bucket yang dibuat panel ini justru datar — semua
+objek di akar bucket — sehingga 100 juta objek berarti ±100 GB RAM. Dengan
+`--files-from-raw --no-traverse`, rclone tidak men-list apa pun: ia hanya
+mengakses key yang diberikan, satu per satu. Memori panel tetap satu halaman
+listing per sisi; memori rclone ≈ `transfers × 2 × 8 MiB` untuk buffer
+multipart plus ~100 MB dasar.
+
+`-M` membawa metadata: Content-Type, Cache-Control, Content-Disposition,
+Content-Encoding, dan `x-amz-meta-*` ikut menyeberang. Objek di atas 8 MiB
+diunggah multipart dengan part 8 MiB, jadi tidak ada objek yang pernah disangga
+utuh.
+
+### Restart, jeda, dan key yang gagal
+
+**Restart / reboot.** Job yang berstatus *berjalan* dilanjutkan otomatis saat
+panel start, dari checkpoint chunk terakhir: kedua sisi di-list lagi dengan
+`start-after=<checkpoint>`. Objek di chunk yang terputus diperiksa ulang — di
+mode "Lewati" yang sudah tersalin terlihat ada di tujuan dan dilewati; di mode
+"Timpa semua" disalin lagi. Angka di tabel bisa terhitung dua kali sebanyak
+satu chunk.
+
+**Jeda / Lanjutkan / Batalkan.** Jeda menulis niatnya ke disk dulu, baru
+menghentikan rclone (SIGINT, rclone membatalkan multipart yang tergantung), jadi
+crash di tengah "menjeda" tidak menghidupkan job lagi. Lanjutkan mulai dari
+checkpoint. Batalkan menghentikan job untuk selamanya; objek yang sudah
+tersalin tetap ada — **panel tidak pernah menghapus apa pun di tujuan**.
+
+**Key yang gagal.** Objek yang gagal disalin (izin, key aneh, dsb.) dicatat ke
+`/var/lib/garagepanel/jobs/<id>/failed.jsonl` beserta pesan errornya, dan job
+lanjut ke key berikutnya. Tautan "lihat key yang gagal" menampilkan 500
+terakhir; bisa diunduh seluruhnya. Setelah penyebabnya dibereskan, jalankan job
+lagi dengan mode "Lewati": yang sudah tersalin dilewati, yang gagal dicoba lagi.
+
+**Jeda otomatis.** Kalau di satu chunk paling sedikit 10 key gagal dan itu
+separuh chunk atau lebih, panel menganggap salah satu sisi sedang tidak bisa
+dihubungi: job dijeda, chunk itu **tidak** dicatat selesai dan key-nya tidak
+dicatat gagal, jadi cukup klik Lanjutkan setelah koneksinya pulih. Job juga
+dijeda setelah 1.000.000 key gagal dicatat.
+
+**rclone keluar dengan error** (exit code 1/2/3/4/7 — argumen, remote tidak
+ditemukan, fatal): job berstatus gagal dengan 20 baris log rclone terakhir.
+Chunk itu tidak dicatat selesai; setelah penyebabnya diperbaiki, Lanjutkan.
+
+### Biaya request dan batasan
+
+Per 1000 objek yang diperiksa: 1 request listing di sumber + 1 di tujuan (tidak
+ada listing tujuan di mode "Timpa semua"). Per objek yang disalin: 1 HEAD + 1
+GET di sumber (rclone memeriksa objek yang diberi nama satu per satu), 1 PUT
+(atau multipart) + 1 HEAD di tujuan. Wasabi tidak menagih request maupun egress,
+tapi punya minimum retensi; AWS menagih keduanya — hitung dulu untuk bucket
+besar.
+
+Yang tidak dilakukan:
+
+- Tidak menghapus di tujuan (bukan mirror). Objek yang hanya ada di tujuan
+  dibiarkan.
+- Tidak membandingkan ETag/checksum; "beda" berarti ukuran beda.
+- Key yang memuat baris baru, `//`, atau segmen `.`/`..` tidak bisa
+  diserahkan ke rclone lewat file daftar; dicatat sebagai gagal beserta
+  alasannya.
+- Folder kosong (objek marker `nama/` tanpa isi) ikut dibuat di tujuan, tapi
+  ACL dan properti lain di luar metadata objek tidak dibawa.
+- Sisa upload multipart yang tergantung setelah crash bisa dibersihkan di
+  Garage dengan `garage bucket cleanup-incomplete-uploads`.
+
+Perkiraan waktu: yang menentukan hampir selalu bandwidth dan latensi ke
+penyedia, bukan panel. Sebagai gambaran, 100 juta objek kecil dengan 8 transfer
+paralel pada latensi 50 ms ke Wasabi berarti berhari-hari — itulah kenapa job
+dibuat tahan restart. Lihat laju di kolom progres, dan batasi kalau perlu:
+`RCLONE_EXTRA_ARGS="--bwlimit 20M"` di file environment.
+
+Garage di belakang Cloudflare menolak tanda tangan rclone? Tambahkan
+`RCLONE_EXTRA_ARGS="--s3-sign-accept-encoding=false"`.
+
+## File manager di halaman Objek
+
+Halaman Objek adalah file manager per bucket:
+
+- **Folder** = prefix key yang diakhiri `/`. "Folder baru" menulis objek
+  marker kosong `prefix/nama/` (konvensi yang sama dengan S3 Console dan
+  rclone), breadcrumb di atas daftar menunjukkan posisi.
+- **Tampilan** grid (thumbnail untuk gambar, kotak ekstensi untuk file lain)
+  atau daftar (tabel), diingat per browser lewat cookie. **Urutan** nama,
+  ukuran, atau tanggal — urutan ukuran/tanggal hanya berlaku di dalam halaman
+  yang sedang tampil, karena S3 selalu mengembalikan 100 objek per halaman
+  terurut nama.
+- **Upload** masuk ke folder yang sedang dibuka, dengan dua mode penamaan yang
+  dipilih saat upload: **nama dari isi file** (`sha256(isi)[:16] + ekstensi`,
+  anti-duplikat, seperti sebelumnya) atau **nama asli file** (hanya nama
+  dasarnya; direktori dari client dibuang). Di mode nama asli, file yang sudah
+  ada tidak ditimpa kecuali kotak "timpa yang sudah ada" dicentang. Whitelist
+  ekstensi dan batas 50 MB berlaku di kedua mode.
+- **Ganti nama / pindah / salin** satu objek lewat menu `⋯`. S3 tidak punya
+  operasi rename, jadi ini `CopyObject` (server-side, metadata ikut) lalu
+  `DeleteObject`; kalau langkah hapusnya gagal, pesannya mengatakan objek sudah
+  tersalin tapi yang lama masih ada. Tujuan yang sudah ada tidak ditimpa
+  tanpa centang "timpa". Ekstensi boleh dipertahankan, tapi ekstensi baru
+  harus dari whitelist upload.
+- **Pilih banyak → Hapus terpilih**: satu request `DeleteObjects` untuk maksimal
+  1000 objek; yang gagal disebutkan satu per satu.
+- **Unduh** memaksa `Content-Disposition: attachment` untuk semua tipe.
+- **Operasi folder** (salin / pindah / hapus folder yang sedang dibuka beserta
+  isinya) dijalankan sebagai job latar di halaman Sync, karena satu folder bisa
+  berisi jutaan objek. Hapus folder minta nama foldernya diketik ulang. Salin
+  dan pindah memakai `CopyObject` server-side di dalam Garage (rclone dengan
+  remote yang sama di kedua sisi), jadi datanya tidak keluar-masuk server.
+
 ## Update ke versi baru
 
-Panel tidak punya state sendiri — tidak ada database, tidak ada file cache.
-Semua state ada di Garage dan di file `.caddy`. Update berarti mengganti satu
-file binary, tidak lebih.
+State panel kecil dan tidak butuh migrasi: file `.caddy` di `/etc/caddy/sites`
+dan, sejak fitur Sync, `/var/lib/garagepanel` (remote + checkpoint job). Update
+berarti mengganti satu file binary — dan sekali ini, menyalin ulang unit
+systemd (lihat [di bawah](#kalau-unit-systemd-ikut-berubah)).
 
-**File environment, file `.caddy`, bucket, objek, dan key tidak tersentuh.**
+**File environment, file `.caddy`, `/var/lib/garagepanel`, bucket, objek, dan
+key tidak tersentuh.** Job Sync yang sedang berjalan dilanjutkan dari
+checkpoint setelah restart.
 
 ### 1. Catat versi yang sedang berjalan
 
@@ -1075,8 +1361,12 @@ membaca file `.caddy` dan file environment yang sama persis.
 
 ### Kalau unit systemd ikut berubah
 
-`garagepanel.service` jarang berubah, tapi kalau iya (misalnya baris hardening
-baru), salin ulang dan muat ulang systemd sebelum restart:
+`garagepanel.service` jarang berubah, tapi kalau iya, salin ulang dan muat
+ulang systemd sebelum restart. **Versi dengan fitur Sync mengubahnya**: ada
+baris `StateDirectory=garagepanel` (membuat `/var/lib/garagepanel`),
+`MemoryMax=1G`, dan `TimeoutStopSec=30`. Tanpa unit baru, halaman Sync
+menampilkan notice "direktori state tidak bisa dipakai" beserta perintah
+`install -d` untuk membuatnya manual.
 
 ```bash
 sudo install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
@@ -1100,25 +1390,28 @@ ada yang benar-benar wajib.
 
 ## Backup dan pemulihan
 
-Panel tidak menyimpan state apa pun sendiri. Yang perlu di-backup hanya dua
-tempat, dan keduanya kecil:
+State panel kecil. Yang perlu di-backup:
 
 | Apa | Di mana | Isinya |
 |---|---|---|
 | Konfigurasi panel | `/etc/garagepanel/garagepanel.env` | token admin, key S3, hash password login |
 | Pemetaan domain | `/etc/caddy/sites/*.caddy` | domain → bucket, whitelist IP S3 API |
+| Remote dan job Sync | `/var/lib/garagepanel/` | `remotes.json` (kredensial remote, 0600), `jobs/*.json` (checkpoint), `jobs/<id>/failed.jsonl` |
 
 ```bash
 sudo tar czf garagepanel-backup-$(date +%F).tar.gz \
   /etc/garagepanel/garagepanel.env \
   /etc/caddy/sites \
   /etc/sudoers.d/garagepanel \
-  /etc/systemd/system/garagepanel.service
+  /etc/systemd/system/garagepanel.service \
+  /var/lib/garagepanel
 ```
 
-Arsip ini memuat token admin Garage dan secret key S3 dalam bentuk terbaca.
-Simpan seperti kamu menyimpan kunci SSH — jangan ke object storage yang dikelola
-panel ini sendiri.
+Arsip ini memuat token admin Garage, secret key S3, dan secret key setiap
+remote dalam bentuk terbaca. Simpan seperti kamu menyimpan kunci SSH — jangan
+ke object storage yang dikelola panel ini sendiri, dan jangan ke remote yang
+kredensialnya ada di dalam arsip itu. Direktori `cache/` di dalamnya boleh
+dilewati.
 
 Memulihkannya: pasang binary seperti di [Langkah 2](#langkah-2--kirim-binary-ke-server),
 buat user dan direktori seperti [Langkah 3](#langkah-3--buat-user-garagepanel)
@@ -1141,9 +1434,10 @@ ZFS. Backup data object storage adalah urusan terpisah; lihat
 sudo systemctl disable --now garagepanel
 sudo rm /etc/systemd/system/garagepanel.service
 sudo systemctl daemon-reload
-sudo rm -rf /etc/garagepanel
+sudo rm -rf /etc/garagepanel /var/lib/garagepanel
 sudo rm -f /usr/local/bin/garagepanel /etc/sudoers.d/garagepanel
 sudo userdel garagepanel
+sudo apt remove rclone      # kalau hanya dipasang untuk panel
 ```
 
 Yang **tidak** ikut terhapus, dan itu memang disengaja:
@@ -1178,6 +1472,9 @@ Semua lewat environment variable.
 | `PANEL_PASSWORD_HASH` | — | Hash password login. Kosong → tidak ada login (lihat [Login](#login-dan-akses-lewat-domain)) |
 | `PANEL_USERNAME` | `admin` | Username untuk login |
 | `PANEL_DOMAIN` | — | Domain untuk **UI panel** — bukan untuk S3 API. Wajib disertai `PANEL_PASSWORD_HASH` |
+| `STATE_DIR` | `$STATE_DIRECTORY` dari systemd, kalau tidak ada `/var/lib/garagepanel` | Remote dan checkpoint job Sync. Tidak bisa ditulis → halaman Sync nonaktif, sisanya jalan |
+| `RCLONE_BIN` | `rclone` (dicari di PATH) | Path rclone. Butuh v1.59+ |
+| `RCLONE_EXTRA_ARGS` | — | Argumen tambahan untuk setiap rclone, dipecah per spasi, **tidak** lewat shell. Contoh: `--bwlimit 20M`, `--s3-sign-accept-encoding=false` |
 
 ## Keamanan
 
@@ -1205,7 +1502,13 @@ divalidasi lebih dulu:
 | Domain | `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$` |
 | IP / CIDR | `net.ParseIP` dan `net.ParseCIDR` — bukan regex; hasilnya dinormalkan (`198.51.100.5/24` → `198.51.100.0/24`) |
 | Label | `[a-zA-Z0-9 _-]`, maks 40 karakter (`\|` sengaja dilarang karena jadi pemisah di komentar) |
-| Object key | tolak yang mengandung `..` atau diawali `/` |
+| Object key | tolak yang diawali `/` atau memuat segmen `.`/`..` (dipisah `/`). `laporan..final.pdf` sah — bucket sungguhan memang punya key seperti itu — sedangkan `a/../b` ditolak |
+| Nama remote | `^[a-z0-9][a-z0-9-]{0,31}$` |
+| Endpoint remote | `http`/`https`, host + port saja: tanpa path, query, fragment, atau user:password; alamat link-local/metadata (`169.254.0.0/16`, `fe80::/10`) dan `0.0.0.0` ditolak |
+| Region | `^[a-z0-9-]{1,32}$`; provider dari whitelist `Wasabi`, `AWS`, `Minio`, `Other` |
+| Bucket remote | aturan AWS (3–63, boleh titik, bukan alamat IP) — tidak pernah jadi nama file |
+| Nama folder / nama file | satu komponen: tanpa `/` `\`, bukan `.`/`..`, tanpa karakter kontrol, maks 255 byte; nama file juga lewat whitelist ekstensi |
+| ID job | `^[0-9a-f]{16}$`, diperiksa sebelum dijadikan path di `STATE_DIR` |
 
 Semua nilai yang dipakai sebagai komponen nama file juga ditolak kalau
 mengandung `..`, `/`, `\`, diawali titik, atau berisi karakter kontrol.
@@ -1225,6 +1528,19 @@ jadi `application/octet-stream` + `Content-Disposition: attachment`, ditambah
 **Upload.** Maksimal 50 MB per file, whitelist ekstensi, dan nama objek
 sepenuhnya dibuat dari isi file (`sha256(isi)[:16] + ekstensi`) — nama asli dari
 client dibuang, jadi tidak ada jalur dari nama file user ke nama objek.
+
+**Sync.** Secret remote hanya ada di `remotes.json` (0600) dan di environment
+proses rclone — tidak di argumen (`ps` tidak menampilkannya), tidak di file
+job, tidak di log, tidak di halaman mana pun (access key disamarkan, secret
+tidak pernah dirender). Environment rclone dibangun dari nol, jadi token admin
+dan hash password panel tidak ikut. rclone tidak pernah men-list bucket dan
+tidak pernah diberi kredensial selain dua remote job itu. `RCLONE_EXTRA_ARGS`
+dipecah per spasi dan diberikan langsung ke `exec`, tanpa shell.
+
+**File manager.** Ganti nama tidak bisa memperkenalkan ekstensi di luar
+whitelist (menghindari `.jpg` → `.html` yang lalu dilayani web endpoint).
+Operasi massal dibatasi 1000 objek per request; operasi folder dijalankan
+sebagai job dan hapus folder minta nama foldernya diketik ulang.
 
 **Privilege.** Jalan sebagai user non-root `garagepanel`, dengan sudoers untuk
 persis satu perintah tanpa wildcard. Unit systemd sengaja memakai
@@ -1385,6 +1701,39 @@ sedang dipakai panel.
 signature** — kredensialnya benar, tapi key panel belum diberi izin pada bucket
 itu: `garage bucket allow --read --write <bucket> --key garagepanel`.
 
+**Halaman Sync bilang "Fitur Sync nonaktif"** — alasannya tertulis di notice.
+`rclone tidak ditemukan`: `sudo apt install rclone` lalu restart panel.
+`rclone vX terlalu lama`: butuh 1.59+, pakai skrip resmi rclone. `Direktori
+state … tidak bisa dipakai`: unit systemd lama tanpa `StateDirectory=` —
+salin ulang unit dari repo, `daemon-reload`, restart. Kalau `RCLONE_BIN`
+diisi manual, pastikan file itu bisa dieksekusi oleh user `garagepanel`.
+
+**Tes koneksi remote: `SignatureDoesNotMatch`** — secret key salah, atau region
+tidak cocok dengan endpoint (Wasabi: `s3.wasabisys.com` → `us-east-1`,
+`s3.<region>.wasabisys.com` → `<region>`). Hapus remote, tambah lagi dengan
+nilai yang benar. Pesan errornya menyebut region yang sedang dipakai.
+
+**Job dijeda otomatis "… dari … objek di chunk terakhir gagal"** — salah satu
+sisi tidak bisa dihubungi selama satu chunk. Periksa koneksi ke remote (atau
+Garage), lalu klik Lanjutkan: chunk itu diulang, tidak ada yang dicatat gagal.
+
+**Job gagal "rclone berhenti dengan exit code 1"** — baris log rclone terakhir
+ada di bawah statusnya. Exit 1 biasanya remote tidak terdefinisi atau argumen
+di `RCLONE_EXTRA_ARGS` salah; exit 5 berarti retry ke salah satu sisi habis;
+exit 7 error fatal rclone. Lihat log lengkap: `journalctl -u garagepanel`, dan
+kalau perlu jalankan perintah rclone yang tercantum di
+[Cara kerja job](#cara-kerja-job) secara manual.
+
+**Banyak key gagal dengan `SlowDown` / 503 dari Wasabi atau AWS** — terlalu
+banyak transfer paralel untuk rate limit penyedia. Turunkan transfer paralel
+di job (mulai dari 4) — rclone sudah retry 10 kali per request, jadi yang
+tercatat gagal memang benar-benar ditolak.
+
+**Job `listing sumber tidak terurut`** — penyedia mengembalikan key tidak
+terurut byte-wise, yang melanggar spesifikasi S3; panel menghentikan job supaya
+tidak salah banding. Laporkan ke penyedianya; untuk Garage, AWS, Wasabi, dan
+MinIO ini tidak pernah terjadi.
+
 **Domain sudah ditambah tapi masih 404** — pastikan DNS-nya sudah mengarah ke
 server ini (Caddy butuh itu untuk menerbitkan sertifikat), dan bucket-nya
 `public` (website access aktif). Cek langsung tanpa lewat Caddy:
@@ -1399,10 +1748,16 @@ pesan errornya: `curl -i "http://127.0.0.1:8090/preview?bucket=media&key=namafil
 ## Pengembangan
 
 ```
-main.go               konfigurasi, routing, middleware, semua handler
+main.go               konfigurasi, routing, middleware, handler bucket/domain/objek/whitelist/login
+objects_ops.go        ganti nama, pindah, salin objek; operasi folder → job
 garage.go             client Garage Admin API v2
-s3.go                 SigV4, ListObjectsV2, PutObject, GetObject, StatObject, DeleteObject
-caddy.go              tulis/hapus file site + reload + rollback, file whitelist
+s3.go                 SigV4, ListObjectsV2 (start-after), Put/Get/Head/Delete, CopyObject, DeleteObjects
+caddy.go              tulis/hapus file site + reload + rollback, file whitelist, writeFileAtomic
+remotes.go            daftar remote S3 (remotes.json), env rclone per remote, probe
+rclone.go             deteksi versi rclone, menjalankan satu chunk, parser log JSON
+sync.go               iterator listing terurut, merge-join, penulis chunk
+jobs.go               job: state di disk, siklus hidup, resume saat start, shutdown
+sync_http.go          halaman Sync, jobs.json, handler remote dan job
 auth.go               hash password, session, pembatas percobaan login
 validate.go           semua validasi input
 templates/            *.html, di-embed dengan //go:embed
@@ -1412,14 +1767,24 @@ garagepanel.service   unit systemd
 Test mencakup vector SigV4 resmi AWS, round-trip parse/render file Caddy,
 rollback saat reload gagal, dan integrasi seluruh handler terhadap Garage
 tiruan (urutan pemanggilan API, CSRF, escaping HTML, content-addressing upload,
-proteksi path traversal):
+proteksi path traversal). Untuk Sync ada S3 tiruan sungguhan di memori
+(`fake_s3_test.go`: listing terurut dengan prefix/delimiter/start-after,
+multipart, CopyObject, DeleteObjects, dan pemeriksaan tanda tangan SigV4) dan
+rclone tiruan (`rclone_fake_test.go`: binary test meng-exec dirinya sendiri,
+memenuhi kontrak `--files-from-raw` dengan client S3 panel, mengeluarkan log
+JSON yang sama, dan merekam argv + env untuk asersi). Tes resume, jeda,
+pembatalan, jeda otomatis, dan batas job semuanya lewat rclone tiruan itu.
 
 ```bash
 go test ./...          # cepat
 go test -race ./...    # dengan race detector
-go test -cover ./...   # ~76% statement coverage
+go test -cover ./...   # ~80% statement coverage
+
+# Dengan rclone sungguhan (dilewati kalau tidak ada): 302 objek termasuk satu
+# 20 MiB multipart, antar dua S3 tiruan
+GARAGEPANEL_TEST_RCLONE=/usr/bin/rclone go test -run TestRealRclone ./...
 ```
 
 Menjalankan panel lokal tanpa server Garage sungguhan: lihat
-`newTestPanel` di `main_test.go` — isinya Garage + S3 + web endpoint tiruan yang
-bisa dipakai ulang.
+`newTestPanel` di `main_test.go` — isinya Garage + S3 + web endpoint + rclone
+tiruan yang bisa dipakai ulang.

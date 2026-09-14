@@ -39,87 +39,157 @@
 {{else if .Error}}
 {{else}}
 
-<div class="card" id="uploader" data-bucket="{{.Bucket}}" data-csrf="{{.CSRF}}">
-  <h3>Upload</h3>
+<div class="card" id="uploader" data-bucket="{{.Bucket}}" data-prefix="{{.Prefix}}" data-csrf="{{.CSRF}}">
+  <h3>Upload ke <span class="mono">{{.Bucket}}/{{.Prefix}}</span></h3>
   <div class="dropzone" id="dropzone">
     <p style="margin-bottom: 8px;"><strong>Tarik file ke sini</strong> atau
       <label style="display:inline; color: var(--accent); cursor: pointer; text-decoration: underline;">
         pilih file<input type="file" id="filepick" multiple hidden>
       </label>
     </p>
-    <p class="small" style="margin: 0;">
-      Maksimal {{.MaxUploadH}} per file. Nama objek dibuat dari isi file
-      (<code>sha256(isi)[:16] + ekstensi</code>), jadi file yang sama tidak akan terduplikasi.
-      File disimpan di akar bucket.
-    </p>
+    <p class="small" style="margin: 0;">Maksimal {{.MaxUploadH}} per file. File masuk ke folder yang sedang dibuka.</p>
     <p class="small muted" style="margin: 8px 0 0;">Ekstensi yang diizinkan: {{.AllowedExt}}</p>
+  </div>
+  <div class="row" style="margin-top: 12px; align-items: center;">
+    <label class="check"><input type="radio" name="naming" value="hash" checked> Nama dari isi file (<code>sha256(isi)[:16] + ekstensi</code>, otomatis anti-duplikat)</label>
+    <label class="check"><input type="radio" name="naming" value="name"> Nama asli file</label>
+    <label class="check" id="overwrite-wrap" hidden><input type="checkbox" id="overwrite"> timpa yang sudah ada</label>
   </div>
   <div id="uplist" style="margin-top: 14px;"></div>
 </div>
 
 <div class="card">
   <div class="row" style="justify-content: space-between; align-items: center;">
-    <h3 style="margin: 0;">
-      <span class="mono">{{.Bucket}}/{{.Prefix}}</span>
-      <span class="muted">· {{.Count}} objek di halaman ini</span>
-    </h3>
-    {{if .HasParent}}
-      <a class="btn small" href="/objects?bucket={{.Bucket}}&amp;prefix={{.ParentPrefix}}">↑ Naik satu level</a>
-    {{end}}
+    <nav class="crumbs" aria-label="lokasi">
+      {{range $i, $c := .Breadcrumbs}}{{if $i}}<span class="muted"> › </span>{{end}}<a class="mono" href="{{$c.URL}}">{{$c.Name}}</a>{{end}}
+      <span class="muted small">· {{.Count}} objek{{if .Folders}}, {{len .Folders}} folder{{end}} di halaman ini</span>
+    </nav>
+    <div class="row" style="gap: 6px; align-items: center;">
+      <a class="btn small {{if eq .View "grid"}}primary{{end}}" href="{{.GridURL}}">Grid</a>
+      <a class="btn small {{if eq .View "list"}}primary{{end}}" href="{{.ListURL}}">Daftar</a>
+      <span class="muted small" style="margin-left: 6px;">urut:</span>
+      <a class="btn small {{if eq .Sort "name"}}primary{{end}}" href="{{index .SortURL "name"}}" title="Urut nama">Nama{{if eq .Sort "name"}}{{if eq .Dir "desc"}} ↓{{else}} ↑{{end}}{{end}}</a>
+      <a class="btn small {{if eq .Sort "size"}}primary{{end}}" href="{{index .SortURL "size"}}" title="Urut ukuran (dalam halaman ini)">Ukuran{{if eq .Sort "size"}}{{if eq .Dir "desc"}} ↓{{else}} ↑{{end}}{{end}}</a>
+      <a class="btn small {{if eq .Sort "date"}}primary{{end}}" href="{{index .SortURL "date"}}" title="Urut tanggal (dalam halaman ini)">Tanggal{{if eq .Sort "date"}}{{if eq .Dir "desc"}} ↓{{else}} ↑{{end}}{{end}}</a>
+    </div>
   </div>
 
+  <div class="row" style="margin-top: 12px; gap: 8px; align-items: center;">
+    {{if .HasParent}}<a class="btn small" href="{{.ParentURL}}">↑ Naik satu level</a>{{end}}
+    <details class="inline">
+      <summary class="btn small">＋ Folder baru</summary>
+      <form method="post" action="/objects/mkdir" class="row" style="gap: 6px; align-items: center; margin-top: 8px;">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="hidden" name="bucket" value="{{.Bucket}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="text" name="name" placeholder="nama folder" required>
+        <button type="submit" class="small primary">Buat</button>
+      </form>
+    </details>
+    <label class="check"><input type="checkbox" id="select-all"> pilih semua</label>
+    <button type="submit" form="bulk" class="danger small" id="bulk-delete" disabled>Hapus terpilih</button>
+    <span class="muted small" id="selected-count"></span>
+  </div>
+
+  <form id="bulk" method="post" action="/objects/delete-many" data-confirm="Hapus objek yang dipilih dari {{.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <input type="hidden" name="bucket" value="{{.Bucket}}">
+    <input type="hidden" name="prefix" value="{{.Prefix}}">
+  </form>
+
+  {{if .Prefix}}
+  <details class="inline" style="margin-top: 10px;">
+    <summary class="btn small">Folder ini: salin / pindah / hapus…</summary>
+    <div class="confirm-body" style="margin-top: 8px;">
+      {{if not .SyncEnabled}}
+        <p class="small muted">Operasi folder dijalankan sebagai job latar dan butuh fitur Sync (rclone). Lihat halaman Sync untuk mengaktifkannya.</p>
+      {{else}}
+      <p class="small muted" style="margin-bottom: 10px;">Folder bisa berisi jutaan objek, jadi ketiga operasi ini berjalan sebagai job latar (lihat halaman Sync). Nama folder ikut dibawa ke tujuan.</p>
+      <form method="post" action="/objects/folder-job" class="row" style="gap: 6px; align-items: center; margin-bottom: 8px;">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="hidden" name="bucket" value="{{.Bucket}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="hidden" name="action" value="copy">
+        <span class="small">Salin ke</span>
+        <select name="dst_bucket">{{range .Buckets}}<option value="{{.}}" {{if eq . $.Bucket}}selected{{end}}>{{.}}</option>{{end}}</select>
+        <input type="text" name="dst_prefix" placeholder="folder tujuan/ (kosong = akar)" style="width: 220px;">
+        <button type="submit" class="small">Mulai job salin</button>
+      </form>
+      <form method="post" action="/objects/folder-job" class="row" style="gap: 6px; align-items: center; margin-bottom: 8px;">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="hidden" name="bucket" value="{{.Bucket}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="hidden" name="action" value="move">
+        <span class="small">Pindah ke</span>
+        <select name="dst_bucket">{{range .Buckets}}<option value="{{.}}" {{if eq . $.Bucket}}selected{{end}}>{{.}}</option>{{end}}</select>
+        <input type="text" name="dst_prefix" placeholder="folder tujuan/ (kosong = akar)" style="width: 220px;">
+        <button type="submit" class="small">Mulai job pindah</button>
+      </form>
+      <form method="post" action="/objects/folder-job" class="row" style="gap: 6px; align-items: center;" data-confirm="Hapus folder {{.Prefix}} beserta SELURUH isinya dari {{.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
+        <input type="hidden" name="csrf" value="{{.CSRF}}">
+        <input type="hidden" name="bucket" value="{{.Bucket}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="hidden" name="action" value="delete">
+        <span class="small" style="color: var(--err);">Hapus folder ini beserta isinya — ketik nama foldernya:</span>
+        <input type="text" name="confirm" placeholder="nama folder" style="width: 180px;">
+        <button type="submit" class="danger small">Mulai job hapus</button>
+      </form>
+      {{end}}
+    </div>
+  </details>
+  {{end}}
+
   {{if .Empty}}
-    <div class="empty">Bucket ini kosong.</div>
+    <div class="empty">Folder ini kosong.</div>
   {{end}}
 
   {{if .Folders}}
   <h2>Folder</h2>
   <div class="row" style="gap: 8px;">
     {{range .Folders}}
-      <a class="btn small" href="/objects?bucket={{$.Bucket}}&amp;prefix={{.}}">📁 {{.}}</a>
+      <a class="btn small mono" href="{{.URL}}">📁 {{.Name}}</a>
     {{end}}
   </div>
   {{end}}
 
-  {{if .Images}}
-  <h2>Gambar ({{len .Images}})</h2>
+  {{if .Rows}}
+  <h2>File{{if .ImageCount}} <span class="muted small">({{.ImageCount}} gambar)</span>{{end}}</h2>
+
+  {{if eq .View "grid"}}
   <div class="grid">
-    {{range .Images}}
+    {{range .Rows}}
     <div class="tile">
-      <a href="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}" target="_blank" rel="noreferrer noopener">
-        <img class="thumb" loading="lazy" decoding="async"
-             src="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}" alt="{{.Name}}">
+      <label class="tile-pick"><input type="checkbox" name="key" value="{{.Key}}" form="bulk"></label>
+      {{if .IsImage}}
+      <a href="{{.PreviewURL}}" target="_blank" rel="noreferrer noopener">
+        <img class="thumb" loading="lazy" decoding="async" src="{{.PreviewURL}}" alt="{{.Name}}">
       </a>
+      {{else}}
+      <a href="{{.PreviewURL}}" class="thumb filetype"><span>.{{.Ext}}</span></a>
+      {{end}}
       <div class="meta">
-        <div class="name mono">{{.Name}}</div>
+        <div class="name mono" title="{{.Key}}">{{.Name}}</div>
         <div class="muted">{{humanBytes .Size}} · {{humanTime .Modified}}</div>
       </div>
       <div class="actions">
+        <a class="btn small" href="{{.DownloadURL}}">Unduh</a>
         {{if .PublicURL}}
           <button type="button" class="small" data-copy="{{.PublicURL}}">Copy URL</button>
         {{else}}
           <button type="button" class="small" disabled title="Bucket ini belum punya domain">Copy URL</button>
         {{end}}
-        <form method="post" action="/objects/delete" style="display:inline"
-              data-confirm="Hapus {{.Key}} dari {{$.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
-          <input type="hidden" name="csrf" value="{{$.CSRF}}">
-          <input type="hidden" name="bucket" value="{{$.Bucket}}">
-          <input type="hidden" name="prefix" value="{{$.Prefix}}">
-          <input type="hidden" name="key" value="{{.Key}}">
-          <button type="submit" class="danger small">Hapus</button>
-        </form>
+        {{template "object-actions" (dict "Row" . "Bucket" $.Bucket "Prefix" $.Prefix "CSRF" $.CSRF "Buckets" $.Buckets)}}
       </div>
     </div>
     {{end}}
   </div>
-  {{end}}
-
-  {{if .Others}}
-  <h2>File lain ({{len .Others}})</h2>
+  {{else}}
   <div class="table-wrap">
   <table>
     <thead>
       <tr>
+        <th style="width: 28px;"></th>
+        <th style="width: 44px;"></th>
         <th>Nama</th>
         <th class="num">Ukuran</th>
         <th>Diubah</th>
@@ -127,28 +197,24 @@
       </tr>
     </thead>
     <tbody>
-      {{range .Others}}
+      {{range .Rows}}
       <tr>
+        <td><input type="checkbox" name="key" value="{{.Key}}" form="bulk"></td>
+        <td>{{if .IsImage}}<img class="mini" loading="lazy" decoding="async" src="{{.PreviewURL}}" alt="">{{else}}<span class="filetype mini"><span>.{{.Ext}}</span></span>{{end}}</td>
         <td class="mono" style="word-break: break-all;">
-          <a href="/preview?bucket={{$.Bucket}}&amp;key={{.Key}}">{{.Name}}</a>
+          <a href="{{.PreviewURL}}" {{if .IsImage}}target="_blank" rel="noreferrer noopener"{{end}}>{{.Name}}</a>
         </td>
         <td class="num">{{humanBytes .Size}}</td>
         <td>{{humanTime .Modified}}</td>
         <td>
           <div class="row" style="gap: 6px; align-items: center;">
+            <a class="btn small" href="{{.DownloadURL}}">Unduh</a>
             {{if .PublicURL}}
               <button type="button" class="small" data-copy="{{.PublicURL}}">Copy URL</button>
             {{else}}
               <button type="button" class="small" disabled title="Bucket ini belum punya domain">Copy URL</button>
             {{end}}
-            <form method="post" action="/objects/delete" style="display:inline"
-                  data-confirm="Hapus {{.Key}} dari {{$.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
-              <input type="hidden" name="csrf" value="{{$.CSRF}}">
-              <input type="hidden" name="bucket" value="{{$.Bucket}}">
-              <input type="hidden" name="prefix" value="{{$.Prefix}}">
-              <input type="hidden" name="key" value="{{.Key}}">
-              <button type="submit" class="danger small">Hapus</button>
-            </form>
+            {{template "object-actions" (dict "Row" . "Bucket" $.Bucket "Prefix" $.Prefix "CSRF" $.CSRF "Buckets" $.Buckets)}}
           </div>
         </td>
       </tr>
@@ -157,13 +223,14 @@
   </table>
   </div>
   {{end}}
+  {{end}}
 
   <div class="pager">
-    {{if .IsTruncated}}
-      <a class="btn" href="/objects?bucket={{.Bucket}}&amp;prefix={{.Prefix}}&amp;token={{.NextToken}}">Halaman berikutnya →</a>
+    {{if .NextURL}}
+      <a class="btn" href="{{.NextURL}}">Halaman berikutnya →</a>
     {{end}}
-    <a class="btn" href="/objects?bucket={{.Bucket}}&amp;prefix={{.Prefix}}">Halaman pertama</a>
-    <span class="muted small">100 objek per halaman. Gunakan tombol back browser untuk mundur.</span>
+    <a class="btn" href="{{.FirstURL}}">Halaman pertama</a>
+    <span class="muted small">{{.PerPage}} objek per halaman, selalu urut nama dari S3; urutan ukuran/tanggal hanya berlaku di dalam halaman ini. Gunakan tombol back browser untuk mundur.</span>
   </div>
 </div>
 
@@ -172,12 +239,23 @@
   var root = document.getElementById('uploader');
   if (!root) { return; }
   var bucket = root.getAttribute('data-bucket');
+  var prefix = root.getAttribute('data-prefix') || '';
   var csrf = root.getAttribute('data-csrf');
   var zone = document.getElementById('dropzone');
   var picker = document.getElementById('filepick');
   var list = document.getElementById('uplist');
+  var overwriteWrap = document.getElementById('overwrite-wrap');
+  var overwriteBox = document.getElementById('overwrite');
   var queue = [];
   var busy = false;
+
+  function naming() {
+    var r = root.querySelector('input[name=naming]:checked');
+    return r ? r.value : 'hash';
+  }
+  Array.prototype.forEach.call(root.querySelectorAll('input[name=naming]'), function (r) {
+    r.addEventListener('change', function () { overwriteWrap.hidden = naming() !== 'name'; });
+  });
 
   ['dragenter', 'dragover'].forEach(function (ev) {
     zone.addEventListener(ev, function (e) {
@@ -241,6 +319,9 @@
   function send(item, done) {
     var data = new FormData();
     data.append('bucket', bucket);
+    data.append('prefix', prefix);
+    data.append('mode', naming());
+    if (overwriteBox.checked) { data.append('overwrite', '1'); }
     data.append('file', item.file);
 
     var xhr = new XMLHttpRequest();
@@ -285,7 +366,7 @@
     item.status.style.color = 'var(--ok)';
     item.status.textContent = res.deduped
       ? 'sudah ada di bucket (isi identik) → ' + res.key
-      : 'selesai → ' + res.key;
+      : (res.overwritten ? 'ditimpa → ' : 'selesai → ') + res.key;
 
     var box = document.createElement('div');
     box.className = 'urlbox';
@@ -308,8 +389,78 @@
     }
     item.row.appendChild(box);
   }
+
+  // Bulk selection.
+  var selectAll = document.getElementById('select-all');
+  var bulkBtn = document.getElementById('bulk-delete');
+  var counter = document.getElementById('selected-count');
+  function boxes() { return document.querySelectorAll('input[name=key][form=bulk]'); }
+  function refresh() {
+    var n = 0;
+    Array.prototype.forEach.call(boxes(), function (b) { if (b.checked) { n++; } });
+    bulkBtn.disabled = n === 0;
+    counter.textContent = n ? n + ' dipilih' : '';
+  }
+  if (selectAll) {
+    selectAll.addEventListener('change', function () {
+      Array.prototype.forEach.call(boxes(), function (b) { b.checked = selectAll.checked; });
+      refresh();
+    });
+    document.addEventListener('change', function (ev) {
+      if (ev.target && ev.target.name === 'key') { refresh(); }
+    });
+    refresh();
+  }
 })();
 </script>
 
 {{end}}
+{{end}}
+
+{{define "object-actions"}}
+<details class="inline">
+  <summary class="btn small" title="Ganti nama, pindah, salin, hapus">⋯</summary>
+  <div class="confirm-body objmenu">
+    <form method="post" action="/objects/rename" class="row" style="gap: 6px; align-items: center; margin-bottom: 8px;">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="bucket" value="{{.Bucket}}">
+      <input type="hidden" name="prefix" value="{{.Prefix}}">
+      <input type="hidden" name="key" value="{{.Row.Key}}">
+      <span class="small">Nama baru</span>
+      <input type="text" name="name" value="{{.Row.Name}}" style="width: 200px;" required>
+      <label class="check small"><input type="checkbox" name="overwrite" value="1"> timpa</label>
+      <button type="submit" class="small">Ganti nama</button>
+    </form>
+    <form method="post" action="/objects/move" class="row" style="gap: 6px; align-items: center; margin-bottom: 8px;">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="bucket" value="{{.Bucket}}">
+      <input type="hidden" name="prefix" value="{{.Prefix}}">
+      <input type="hidden" name="key" value="{{.Row.Key}}">
+      <span class="small">Pindah ke</span>
+      <select name="dst_bucket">{{range .Buckets}}<option value="{{.}}" {{if eq . $.Bucket}}selected{{end}}>{{.}}</option>{{end}}</select>
+      <input type="text" name="dst_prefix" value="{{.Prefix}}" placeholder="folder/ (kosong = akar)" style="width: 180px;">
+      <label class="check small"><input type="checkbox" name="overwrite" value="1"> timpa</label>
+      <button type="submit" class="small">Pindah</button>
+    </form>
+    <form method="post" action="/objects/copy" class="row" style="gap: 6px; align-items: center; margin-bottom: 8px;">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="bucket" value="{{.Bucket}}">
+      <input type="hidden" name="prefix" value="{{.Prefix}}">
+      <input type="hidden" name="key" value="{{.Row.Key}}">
+      <span class="small">Salin ke</span>
+      <select name="dst_bucket">{{range .Buckets}}<option value="{{.}}" {{if eq . $.Bucket}}selected{{end}}>{{.}}</option>{{end}}</select>
+      <input type="text" name="dst_prefix" value="{{.Prefix}}" placeholder="folder/ (kosong = akar)" style="width: 180px;">
+      <label class="check small"><input type="checkbox" name="overwrite" value="1"> timpa</label>
+      <button type="submit" class="small">Salin</button>
+    </form>
+    <form method="post" action="/objects/delete" style="display:inline"
+          data-confirm="Hapus {{.Row.Key}} dari {{.Bucket}}? Tindakan ini tidak bisa dibatalkan.">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="bucket" value="{{.Bucket}}">
+      <input type="hidden" name="prefix" value="{{.Prefix}}">
+      <input type="hidden" name="key" value="{{.Row.Key}}">
+      <button type="submit" class="danger small">Hapus</button>
+    </form>
+  </div>
+</details>
 {{end}}

@@ -167,7 +167,7 @@ func TestListObjectsV2(t *testing.T) {
 	defer srv.Close()
 
 	c := newTestS3(t, srv.URL)
-	res, err := c.ListObjectsV2(context.Background(), "media", "", "", "/", 100)
+	res, err := c.ListObjectsV2(context.Background(), "media", ListOptions{Delimiter: "/", MaxKeys: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

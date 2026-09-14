@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -21,46 +23,84 @@ import (
 // Minimal S3 client with hand-written AWS Signature Version 4.
 //
 // No SDK: signing is crypto/hmac + crypto/sha256, requests are net/http, and
-// responses are parsed with encoding/xml. Garage is addressed path-style
-// (http://host:3900/<bucket>/<key>).
+// responses are parsed with encoding/xml. Every endpoint is addressed
+// path-style (http://host:3900/<bucket>/<key>), which Garage, Wasabi, AWS and
+// MinIO all accept.
+//
+// The client is deliberately small: it lists, inspects, copies and deletes.
+// Bulk transfers between providers are rclone's job (see rclone.go).
 
 const (
 	// emptyPayloadHash is sha256("").
 	emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	iso8601BasicFmt  = "20060102T150405Z"
 	dateStampFmt     = "20060102"
+
+	// maxDeleteObjects is the S3 limit for one DeleteObjects request.
+	maxDeleteObjects = 1000
 )
 
-// S3 is a tiny S3 client for the Garage S3 endpoint.
+// S3 is a tiny S3 client for one endpoint.
 type S3 struct {
 	endpoint  *url.URL
 	accessKey string
 	secretKey string
 	region    string
 	http      *http.Client
+
+	// label names the endpoint in messages ("Garage" or the remote's name).
+	label string
+	// garage selects the Garage-specific troubleshooting text.
+	garage bool
 }
 
-// NewS3 builds a client. It returns nil when credentials are not configured, so
-// callers can report "S3 credentials belum diatur" instead of failing at
-// request time.
+// S3Options tunes a client for an endpoint other than the panel's own Garage.
+type S3Options struct {
+	Label  string
+	Garage bool
+}
+
+// NewS3 builds a client for the panel's own Garage. It returns an error when
+// the endpoint is not a full URL, so callers can report "GARAGE_S3_URL tidak
+// valid" at start-up instead of failing at request time.
 func NewS3(endpoint, accessKey, secretKey, region string) (*S3, error) {
+	c, err := NewS3With(endpoint, accessKey, secretKey, region, S3Options{Label: "Garage", Garage: true})
+	if err != nil {
+		return nil, fmt.Errorf("GARAGE_S3_URL %w", err)
+	}
+	return c, nil
+}
+
+// NewS3With builds a client for any S3-compatible endpoint (Wasabi, AWS,
+// MinIO, another Garage). The panel uses it to list and probe remotes; the
+// transfers themselves run through rclone.
+func NewS3With(endpoint, accessKey, secretKey, region string, o S3Options) (*S3, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("GARAGE_S3_URL tidak valid: %w", err)
+		return nil, fmt.Errorf("tidak valid: %w", err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("GARAGE_S3_URL harus berupa URL lengkap, contoh http://127.0.0.1:3900")
+		return nil, fmt.Errorf("harus berupa URL lengkap, contoh http://127.0.0.1:3900 (dapat %q)", endpoint)
+	}
+	label := o.Label
+	if label == "" {
+		label = u.Host
 	}
 	return &S3{
 		endpoint:  u,
 		accessKey: accessKey,
 		secretKey: secretKey,
 		region:    region,
+		label:     label,
+		garage:    o.Garage,
 		http: &http.Client{
 			Timeout: 5 * time.Minute, // uploads of up to 50 MB
 		},
 	}, nil
 }
+
+// Label reports the human name of the endpoint.
+func (c *S3) Label() string { return c.label }
 
 // S3Error is a parsed S3 error document.
 type S3Error struct {
@@ -99,8 +139,23 @@ func (c *S3) forbiddenHint(e *S3Error) string {
 		return ""
 	}
 	blob := strings.ToLower(e.Message + " " + e.Code + " " + e.Body)
+	signature := strings.Contains(blob, "signature")
 
-	if strings.Contains(blob, "signature") {
+	if !c.garage {
+		if signature {
+			return "Tanda tangan SigV4 ditolak oleh " + c.label + " — ini BUKAN soal izin bucket. Yang perlu dicek:\n" +
+				"\n" +
+				"  1. Secret key remote salah ketik atau terpotong (spasi di ujung ikut merusak).\n" +
+				"  2. Region tidak cocok dengan endpoint. Panel menandatangani dengan region " + strconv.Quote(c.region) + ".\n" +
+				"     Wasabi: s3.wasabisys.com → us-east-1, s3.<region>.wasabisys.com → <region>.\n" +
+				"     AWS: region tempat bucket berada. MinIO/Garage: nilai region di config servernya.\n" +
+				"  3. Jam server meleset jauh — tanda tangan memuat stempel waktu."
+		}
+		return "Kredensial remote " + c.label + " diterima, tapi aksinya ditolak — key itu belum punya izin\n" +
+			"pada bucket ini. Periksa policy/izin key di penyedia S3-nya."
+	}
+
+	if signature {
 		return "Tanda tangan SigV4 ditolak — ini BUKAN soal izin bucket, dan tidak ada\n" +
 			"hubungannya dengan status public/private bucket. Yang perlu dicek:\n" +
 			"\n" +
@@ -126,6 +181,14 @@ func (c *S3) forbiddenHint(e *S3Error) string {
 		"berpengaruh di sini: halaman Objek selalu lewat S3 API, bukan lewat web\n" +
 		"endpoint. Beri izin dengan:\n" +
 		"  garage bucket allow --read --write <bucket> --key <nama-key-panel>"
+}
+
+// redact replaces the client's secret key wherever it appears in text.
+func (c *S3) redact(text string) string {
+	if c.secretKey == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, c.secretKey, "[secret]")
 }
 
 // NotFound reports whether the object or bucket does not exist.
@@ -181,9 +244,27 @@ func sha256Hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// signedHeaderName reports whether a request header takes part in the
+// signature. Host is always signed; every x-amz-* header must be (S3 rejects
+// an unsigned x-amz-copy-source, for instance); content-type, content-md5 and
+// date are signed when present because AWS's own examples do. Authorization
+// itself never is.
+func signedHeaderName(lower string) bool {
+	if strings.HasPrefix(lower, "x-amz-") {
+		return true
+	}
+	switch lower {
+	case "content-type", "content-md5", "date":
+		return true
+	}
+	return false
+}
+
 // sign adds the SigV4 Authorization header to req. canonicalPath must be the
 // already-encoded path that will appear on the wire, and payloadHash the hex
-// sha256 of the body.
+// sha256 of the body. Every header already present on req that
+// signedHeaderName accepts is covered by the signature, so callers set their
+// x-amz-* headers before calling sign.
 func (c *S3) sign(req *http.Request, canonicalPath, canonicalQueryString, payloadHash string, now time.Time) {
 	amzDate := now.UTC().Format(iso8601BasicFmt)
 	dateStamp := now.UTC().Format(dateStampFmt)
@@ -194,15 +275,18 @@ func (c *S3) sign(req *http.Request, canonicalPath, canonicalQueryString, payloa
 		req.Host = req.URL.Host
 	}
 
-	// Sign host, x-amz-* and content-type when present.
 	type hdr struct{ name, value string }
-	headers := []hdr{
-		{"host", req.Host},
-		{"x-amz-content-sha256", payloadHash},
-		{"x-amz-date", amzDate},
-	}
-	if ct := req.Header.Get("Content-Type"); ct != "" {
-		headers = append(headers, hdr{"content-type", ct})
+	headers := []hdr{{"host", req.Host}}
+	for name, values := range req.Header {
+		lower := strings.ToLower(name)
+		if !signedHeaderName(lower) {
+			continue
+		}
+		trimmed := make([]string, len(values))
+		for i, v := range values {
+			trimmed[i] = strings.TrimSpace(v)
+		}
+		headers = append(headers, hdr{lower, strings.Join(trimmed, ",")})
 	}
 	sort.Slice(headers, func(i, j int) bool { return headers[i].name < headers[j].name })
 
@@ -211,7 +295,7 @@ func (c *S3) sign(req *http.Request, canonicalPath, canonicalQueryString, payloa
 	for _, h := range headers {
 		canonicalHeaders.WriteString(h.name)
 		canonicalHeaders.WriteByte(':')
-		canonicalHeaders.WriteString(strings.TrimSpace(h.value))
+		canonicalHeaders.WriteString(h.value)
 		canonicalHeaders.WriteByte('\n')
 		signedNames = append(signedNames, h.name)
 	}
@@ -247,6 +331,14 @@ func (c *S3) sign(req *http.Request, canonicalPath, canonicalQueryString, payloa
 
 // newRequest builds and signs a request against <endpoint>/<bucket>[/<key>].
 func (c *S3) newRequest(ctx context.Context, method, bucket, key string, params [][2]string, body []byte, contentType string) (*http.Request, error) {
+	return c.newRequestWith(ctx, method, bucket, key, params, body, contentType, nil)
+}
+
+// newRequestWith is newRequest with extra headers that must be part of the
+// signature (x-amz-copy-source, content-md5, …). A non-nil empty body sends a
+// zero-length payload with Content-Length: 0, which is how folder markers and
+// other empty objects are created.
+func (c *S3) newRequestWith(ctx context.Context, method, bucket, key string, params [][2]string, body []byte, contentType string, extra map[string]string) (*http.Request, error) {
 	rawPath := "/" + bucket
 	if key != "" {
 		rawPath += "/" + key
@@ -278,6 +370,9 @@ func (c *S3) newRequest(ctx context.Context, method, bucket, key string, params 
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
+	for name, value := range extra {
+		req.Header.Set(name, value)
+	}
 	c.sign(req, encodedPath, cq, payloadHash, time.Now())
 	return req, nil
 }
@@ -286,27 +381,66 @@ func (c *S3) newRequest(ctx context.Context, method, bucket, key string, params 
 func (c *S3) do(req *http.Request, op string) (*http.Response, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("tidak bisa menghubungi S3 API di %s (%s): %v", c.endpoint.String(), op, unwrapURLError(err))
+		return nil, fmt.Errorf("tidak bisa menghubungi S3 API %s di %s (%s): %v", c.label, c.endpoint.String(), op, unwrapURLError(err))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		s3err := &S3Error{Op: op, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(raw))}
-		var doc struct {
-			Code    string `xml:"Code"`
-			Message string `xml:"Message"`
-		}
-		if xml.Unmarshal(raw, &doc) == nil {
-			s3err.Code = doc.Code
-			s3err.Message = doc.Message
-		}
-		if len(s3err.Body) > 500 {
-			s3err.Body = s3err.Body[:500] + "…"
-		}
-		s3err.Hint = c.forbiddenHint(s3err)
-		return nil, s3err
+		return nil, c.errorFromBody(op, resp.StatusCode, raw)
 	}
 	return resp, nil
+}
+
+// errorFromBody builds an *S3Error out of an error document. The secret key
+// is scrubbed from whatever the provider sent back: no provider echoes it,
+// but the message ends up on a page and in the journal, so nothing is
+// trusted to keep it out.
+func (c *S3) errorFromBody(op string, status int, raw []byte) *S3Error {
+	s3err := &S3Error{Op: op, StatusCode: status, Body: c.redact(strings.TrimSpace(string(raw)))}
+	var doc struct {
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	}
+	if xml.Unmarshal(raw, &doc) == nil {
+		s3err.Code = c.redact(doc.Code)
+		s3err.Message = c.redact(doc.Message)
+	}
+	if len(s3err.Body) > 500 {
+		s3err.Body = s3err.Body[:500] + "…"
+	}
+	s3err.Hint = c.forbiddenHint(s3err)
+	return s3err
+}
+
+// decodeXMLResult reads a 2xx response body into out. CopyObject and a few
+// other operations can answer HTTP 200 with an <Error> document on AWS and
+// Wasabi (the status line is sent before the operation finishes), so the root
+// element is checked before trusting the status code.
+func (c *S3) decodeXMLResult(resp *http.Response, op string, out any) error {
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("%s: response tidak bisa dibaca: %w", op, err)
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	var root struct {
+		XMLName xml.Name
+	}
+	if err := xml.Unmarshal(raw, &root); err != nil {
+		return fmt.Errorf("%s: response bukan XML yang valid: %w", op, err)
+	}
+	if root.XMLName.Local == "Error" {
+		return c.errorFromBody(op, resp.StatusCode, raw)
+	}
+	if out == nil {
+		return nil
+	}
+	if err := xml.Unmarshal(raw, out); err != nil {
+		return fmt.Errorf("%s: response tidak bisa dibaca: %w", op, err)
+	}
+	return nil
 }
 
 // --- ListObjectsV2 --------------------------------------------------------
@@ -326,6 +460,20 @@ type ListResult struct {
 	IsTruncated    bool
 	NextToken      string
 	KeyCount       int
+}
+
+// ListOptions selects what one ListObjectsV2 call returns.
+type ListOptions struct {
+	Prefix    string
+	Delimiter string // "" for a flat listing, "/" for folder-style
+	// ContinuationToken continues a paged listing. It is opaque and may
+	// expire, so long-running walks use StartAfter instead.
+	ContinuationToken string
+	// StartAfter lists keys strictly after this one. It is only sent when
+	// ContinuationToken is empty: providers ignore it otherwise, and some
+	// object to seeing both.
+	StartAfter string
+	MaxKeys    int // 0 means 100
 }
 
 type listBucketResult struct {
@@ -348,28 +496,30 @@ type listBucketResult struct {
 	} `xml:"CommonPrefixes"`
 }
 
-// ListObjectsV2 lists one page of objects. delimiter may be "" (flat listing)
-// or "/" (folder-style). The returned NextToken is passed back verbatim to get
-// the next page.
-func (c *S3) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int) (*ListResult, error) {
-	if maxKeys <= 0 {
-		maxKeys = 100
+// ListObjectsV2 lists one page of objects. The returned NextToken is passed
+// back verbatim (as ContinuationToken) to get the next page.
+func (c *S3) ListObjectsV2(ctx context.Context, bucket string, o ListOptions) (*ListResult, error) {
+	if o.MaxKeys <= 0 {
+		o.MaxKeys = 100
 	}
 	params := [][2]string{
 		{"list-type", "2"},
-		{"max-keys", strconv.Itoa(maxKeys)},
+		{"max-keys", strconv.Itoa(o.MaxKeys)},
 		// Ask for URL-encoded keys so names with newlines or other awkward
 		// bytes survive the XML round-trip.
 		{"encoding-type", "url"},
 	}
-	if prefix != "" {
-		params = append(params, [2]string{"prefix", prefix})
+	if o.Prefix != "" {
+		params = append(params, [2]string{"prefix", o.Prefix})
 	}
-	if continuationToken != "" {
-		params = append(params, [2]string{"continuation-token", continuationToken})
+	if o.Delimiter != "" {
+		params = append(params, [2]string{"delimiter", o.Delimiter})
 	}
-	if delimiter != "" {
-		params = append(params, [2]string{"delimiter", delimiter})
+	switch {
+	case o.ContinuationToken != "":
+		params = append(params, [2]string{"continuation-token", o.ContinuationToken})
+	case o.StartAfter != "":
+		params = append(params, [2]string{"start-after", o.StartAfter})
 	}
 
 	req, err := c.newRequest(ctx, http.MethodGet, bucket, "", params, nil, "")
@@ -409,17 +559,21 @@ func (c *S3) ListObjectsV2(ctx context.Context, bucket, prefix, continuationToke
 	return out, nil
 }
 
-// urlDecodeKey reverses encoding-type=url. PathUnescape is used rather than
-// QueryUnescape so that "+" inside a key stays a plus sign.
+// urlDecodeKey reverses encoding-type=url.
+//
+// Providers disagree on the dialect: AWS, Wasabi and MinIO use form encoding
+// (a space becomes "+", a literal plus "%2B"), while Garage uses RFC 3986 (a
+// space becomes "%20" and a plus "%2B", so a raw "+" never appears). Query
+// unescaping is right for both — that is why QueryUnescape, not PathUnescape.
 func urlDecodeKey(s string) string {
-	if decoded, err := url.PathUnescape(s); err == nil {
+	if decoded, err := url.QueryUnescape(s); err == nil {
 		return decoded
 	}
 	return s
 }
 
 func parseS3Time(s string) time.Time {
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z"} {
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05.000Z", http.TimeFormat} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t
 		}
@@ -429,10 +583,14 @@ func parseS3Time(s string) time.Time {
 
 // --- object operations ----------------------------------------------------
 
-// PutObject stores body under key.
+// PutObject stores body under key. A non-nil empty body creates an empty
+// object, which is how a folder marker ("prefix/") is made.
 func (c *S3) PutObject(ctx context.Context, bucket, key string, body []byte, contentType string) error {
 	if err := ValidateObjectKey(key); err != nil {
 		return err
+	}
+	if body == nil {
+		body = []byte{}
 	}
 	req, err := c.newRequest(ctx, http.MethodPut, bucket, key, nil, body, contentType)
 	if err != nil {
@@ -463,27 +621,52 @@ func (c *S3) GetObject(ctx context.Context, bucket, key string) (io.ReadCloser, 
 	return resp.Body, resp.Header, nil
 }
 
-// StatObject issues a HEAD and reports whether the object already exists. It is
-// what makes content-addressed uploads skip work for a file that is already
-// stored.
-func (c *S3) StatObject(ctx context.Context, bucket, key string) (exists bool, size int64, err error) {
+// ObjectInfo is what HeadObject reports.
+type ObjectInfo struct {
+	Size         int64
+	ETag         string
+	ContentType  string
+	LastModified time.Time
+}
+
+// HeadObject reports whether an object exists and, if so, its metadata.
+func (c *S3) HeadObject(ctx context.Context, bucket, key string) (*ObjectInfo, bool, error) {
 	if err := ValidateObjectKey(key); err != nil {
-		return false, 0, err
+		return nil, false, err
 	}
 	req, err := c.newRequest(ctx, http.MethodHead, bucket, key, nil, nil, "")
 	if err != nil {
-		return false, 0, err
+		return nil, false, err
 	}
 	resp, err := c.do(req, "HeadObject")
 	if err != nil {
 		var s3err *S3Error
 		if errors.As(err, &s3err) && s3err.NotFound() {
-			return false, 0, nil
+			return nil, false, nil
 		}
-		return false, 0, err
+		return nil, false, err
 	}
 	defer resp.Body.Close()
-	return true, resp.ContentLength, nil
+	info := &ObjectInfo{
+		Size:        resp.ContentLength,
+		ETag:        strings.Trim(resp.Header.Get("ETag"), `"`),
+		ContentType: resp.Header.Get("Content-Type"),
+	}
+	if lm := resp.Header.Get("Last-Modified"); lm != "" {
+		info.LastModified = parseS3Time(lm)
+	}
+	return info, true, nil
+}
+
+// StatObject issues a HEAD and reports whether the object already exists. It is
+// what makes content-addressed uploads skip work for a file that is already
+// stored.
+func (c *S3) StatObject(ctx context.Context, bucket, key string) (exists bool, size int64, err error) {
+	info, exists, err := c.HeadObject(ctx, bucket, key)
+	if err != nil || !exists {
+		return false, 0, err
+	}
+	return true, info.Size, nil
 }
 
 // DeleteObject removes an object.
@@ -502,4 +685,110 @@ func (c *S3) DeleteObject(ctx context.Context, bucket, key string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	return nil
+}
+
+// CopyObject copies one object server-side, metadata included. S3 has no
+// rename: a rename is this followed by DeleteObject on the source.
+func (c *S3) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string) error {
+	if err := ValidateObjectKey(srcKey); err != nil {
+		return fmt.Errorf("sumber: %w", err)
+	}
+	if err := ValidateObjectKey(dstKey); err != nil {
+		return fmt.Errorf("tujuan: %w", err)
+	}
+	extra := map[string]string{
+		// The header is URL-encoded per the S3 API; every provider (Garage
+		// included) percent-decodes it.
+		"x-amz-copy-source":        "/" + srcBucket + "/" + awsURIEncode(srcKey, false),
+		"x-amz-metadata-directive": "COPY",
+	}
+	req, err := c.newRequestWith(ctx, http.MethodPut, dstBucket, dstKey, nil, nil, "", extra)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req, "CopyObject")
+	if err != nil {
+		return err
+	}
+	return c.decodeXMLResult(resp, "CopyObject", nil)
+}
+
+// DeleteError is one key that a DeleteObjects call could not remove.
+type DeleteError struct {
+	Key     string
+	Code    string
+	Message string
+}
+
+func (e DeleteError) String() string {
+	if e.Message != "" {
+		return e.Key + ": " + e.Code + ": " + e.Message
+	}
+	return e.Key + ": " + e.Code
+}
+
+type deleteRequest struct {
+	XMLName xml.Name `xml:"Delete"`
+	Xmlns   string   `xml:"xmlns,attr"`
+	Quiet   bool     `xml:"Quiet"`
+	Objects []struct {
+		Key string `xml:"Key"`
+	} `xml:"Object"`
+}
+
+type deleteResult struct {
+	XMLName xml.Name `xml:"DeleteResult"`
+	Errors  []struct {
+		Key     string `xml:"Key"`
+		Code    string `xml:"Code"`
+		Message string `xml:"Message"`
+	} `xml:"Error"`
+}
+
+// DeleteObjects removes up to 1000 keys in one request. Keys the server
+// refused come back as DeleteError values; the error return is for the request
+// as a whole.
+func (c *S3) DeleteObjects(ctx context.Context, bucket string, keys []string) ([]DeleteError, error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	if len(keys) > maxDeleteObjects {
+		return nil, fmt.Errorf("DeleteObjects: maksimal %d key per request, dapat %d", maxDeleteObjects, len(keys))
+	}
+	doc := deleteRequest{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Quiet: true}
+	for _, key := range keys {
+		if err := ValidateObjectKey(key); err != nil {
+			return nil, err
+		}
+		doc.Objects = append(doc.Objects, struct {
+			Key string `xml:"Key"`
+		}{Key: key})
+	}
+	body, err := xml.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("DeleteObjects: %w", err)
+	}
+	body = append([]byte(xml.Header), body...)
+
+	// AWS and Wasabi refuse the request without Content-MD5; Garage ignores
+	// it. The header is signed because sign() covers content-md5.
+	sum := md5.Sum(body)
+	extra := map[string]string{"Content-MD5": base64.StdEncoding.EncodeToString(sum[:])}
+	req, err := c.newRequestWith(ctx, http.MethodPost, bucket, "", [][2]string{{"delete", ""}}, body, "application/xml", extra)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req, "DeleteObjects")
+	if err != nil {
+		return nil, err
+	}
+	var result deleteResult
+	if err := c.decodeXMLResult(resp, "DeleteObjects", &result); err != nil {
+		return nil, err
+	}
+	var failed []DeleteError
+	for _, e := range result.Errors {
+		failed = append(failed, DeleteError{Key: urlDecodeKey(e.Key), Code: e.Code, Message: e.Message})
+	}
+	return failed, nil
 }

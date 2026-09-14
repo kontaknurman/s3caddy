@@ -137,6 +137,24 @@ details.confirm .confirm-body {
 .tile .meta { padding: 8px 10px; font-size: 12px; }
 .tile .meta .name { word-break: break-all; margin-bottom: 4px; }
 .tile .actions { display: flex; gap: 6px; padding: 0 10px 10px; flex-wrap: wrap; }
+.tile { position: relative; }
+.tile .tile-pick { position: absolute; top: 6px; left: 6px; z-index: 2; background: rgba(13,16,21,.75); border-radius: 6px; padding: 3px 4px; margin: 0; }
+.tile .tile-pick input { width: 16px; height: 16px; display: block; }
+.filetype {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-weight: 600; letter-spacing: .5px; text-decoration: none;
+}
+.filetype span { font-size: 13px; text-transform: uppercase; }
+a.thumb.filetype:hover { color: var(--text); text-decoration: none; }
+.mini { width: 36px; height: 36px; object-fit: cover; border-radius: 6px; background: #0d1015; border: 1px solid var(--line); display: block; }
+span.filetype.mini span { font-size: 10px; }
+.crumbs { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 14px; }
+.objmenu { min-width: 320px; }
+.objmenu select { max-width: 160px; }
+.tile .actions details.inline .confirm-body { position: absolute; left: 6px; right: 6px; bottom: 44px; z-index: 3; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+details.inline { display: inline-block; }
+details.inline > summary { list-style: none; display: inline-block; }
+details.inline > summary::-webkit-details-marker { display: none; }
 
 .creds { background: #0d1015; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
 .creds .pair { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
@@ -196,6 +214,7 @@ details.confirm .confirm-body {
     <a href="/buckets" {{if eq .Page "buckets"}}class="active"{{end}}>Buckets</a>
     <a href="/domains" {{if eq .Page "domains"}}class="active"{{end}}>Domains</a>
     <a href="/objects" {{if eq .Page "objects"}}class="active"{{end}}>Objek</a>
+    <a href="/sync" {{if eq .Page "sync"}}class="active"{{end}}>Sync</a>
     <a href="/whitelist" {{if eq .Page "whitelist"}}class="active"{{end}}>IP Whitelist</a>
   </nav>
   {{end}}

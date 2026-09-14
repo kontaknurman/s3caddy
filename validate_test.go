@@ -228,3 +228,159 @@ func TestHumanBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateObjectKeyRefusesDotSegmentsOnly(t *testing.T) {
+	// Real buckets contain keys with consecutive dots; only actual dot
+	// segments can escape anything.
+	good := []string{"laporan..final.pdf", "a/b..c/d.png", "..hidden", "x/..."}
+	for _, s := range good {
+		if err := ValidateObjectKey(s); err != nil {
+			t.Errorf("ValidateObjectKey(%q) = %v, want nil", s, err)
+		}
+	}
+	bad := []string{"../x", "a/../b", "a/./b", "./a", "/a", "a/.."}
+	for _, s := range bad {
+		if err := ValidateObjectKey(s); err == nil {
+			t.Errorf("ValidateObjectKey(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestValidateRemoteEndpoint(t *testing.T) {
+	good := map[string]string{
+		"https://s3.wasabisys.com":                 "https://s3.wasabisys.com",
+		"https://s3.ap-southeast-1.wasabisys.com/": "https://s3.ap-southeast-1.wasabisys.com",
+		"https://S3.Example.COM":                   "https://s3.example.com",
+		"http://10.0.0.5:3900":                     "http://10.0.0.5:3900",
+		"http://127.0.0.1:3900":                    "http://127.0.0.1:3900",
+		"http://minio:9000":                        "http://minio:9000",
+		"  https://s3.amazonaws.com  ":             "https://s3.amazonaws.com",
+	}
+	for in, want := range good {
+		got, err := ValidateRemoteEndpoint(in)
+		if err != nil {
+			t.Errorf("ValidateRemoteEndpoint(%q) = %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ValidateRemoteEndpoint(%q) = %q, want %q", in, got, want)
+		}
+	}
+	bad := []string{
+		"", "s3.wasabisys.com", "ftp://x.example.com", "file:///etc/passwd",
+		"https://user:pw@s3.example.com", "https://s3.example.com/bucket", "https://s3.example.com/?x=1",
+		"https://s3.example.com/#frag", "http://169.254.169.254", "http://[fe80::1]:80", "http://0.0.0.0",
+		"http://s3.example.com:70000", "http://-bad.example.com", "https://exa mple.com",
+	}
+	for _, s := range bad {
+		if _, err := ValidateRemoteEndpoint(s); err == nil {
+			t.Errorf("ValidateRemoteEndpoint(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestValidateRemoteNameRegionProviderBucket(t *testing.T) {
+	for _, s := range []string{"wasabi", "wasabi-sg", "b2", "a"} {
+		if err := ValidateRemoteName(s); err != nil {
+			t.Errorf("ValidateRemoteName(%q) = %v", s, err)
+		}
+	}
+	for _, s := range []string{"", "-x", "Wasabi", "has space", "a/b", "..", strings.Repeat("a", 33)} {
+		if err := ValidateRemoteName(s); err == nil {
+			t.Errorf("ValidateRemoteName(%q) = nil, want an error", s)
+		}
+	}
+	for _, s := range []string{"us-east-1", "garage", "ap-southeast-1"} {
+		if err := ValidateRegion(s); err != nil {
+			t.Errorf("ValidateRegion(%q) = %v", s, err)
+		}
+	}
+	for _, s := range []string{"", "US-EAST-1", "a b", strings.Repeat("a", 33)} {
+		if err := ValidateRegion(s); err == nil {
+			t.Errorf("ValidateRegion(%q) = nil, want an error", s)
+		}
+	}
+	for _, s := range []string{"Wasabi", "AWS", "Minio", "Other"} {
+		if err := ValidateProvider(s); err != nil {
+			t.Errorf("ValidateProvider(%q) = %v", s, err)
+		}
+	}
+	if err := ValidateProvider("wasabi"); err == nil {
+		t.Error("provider names are case-sensitive rclone values")
+	}
+	for _, s := range []string{"my.bucket", "abc", "my-bucket-1"} {
+		if err := ValidateRemoteBucketName(s); err != nil {
+			t.Errorf("ValidateRemoteBucketName(%q) = %v", s, err)
+		}
+	}
+	for _, s := range []string{"", "ab", "1.2.3.4", "a..b", "a.-b", "-x", "UP", "a/b", strings.Repeat("a", 64)} {
+		if err := ValidateRemoteBucketName(s); err == nil {
+			t.Errorf("ValidateRemoteBucketName(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestValidateJobPrefixFolderAndBaseNames(t *testing.T) {
+	for _, s := range []string{"", "photos/", "a/b/"} {
+		if err := ValidateJobPrefix(s); err != nil {
+			t.Errorf("ValidateJobPrefix(%q) = %v", s, err)
+		}
+	}
+	for _, s := range []string{"photos", "/photos/", "../x/"} {
+		if err := ValidateJobPrefix(s); err == nil {
+			t.Errorf("ValidateJobPrefix(%q) = nil, want an error", s)
+		}
+	}
+	for _, s := range []string{"Foto 2026", "laporan..final", "ünïcode"} {
+		if err := ValidateFolderName(s); err != nil {
+			t.Errorf("ValidateFolderName(%q) = %v", s, err)
+		}
+	}
+	for _, s := range []string{"", ".", "..", "a/b", `a\b`, " lead", "trail ", "a\nb", "a\x00b", strings.Repeat("a", 256)} {
+		if err := ValidateFolderName(s); err == nil {
+			t.Errorf("ValidateFolderName(%q) = nil, want an error", s)
+		}
+	}
+	ext, ct, err := ValidateObjectBaseName("Foto Liburan.JPG")
+	if err != nil || ext != ".jpg" || ct != "image/jpeg" {
+		t.Errorf("ValidateObjectBaseName = (%q, %q, %v)", ext, ct, err)
+	}
+	for _, s := range []string{".htaccess", "shell.sh", "dir/a.jpg", "noext", "../a.jpg"} {
+		if _, _, err := ValidateObjectBaseName(s); err == nil {
+			t.Errorf("ValidateObjectBaseName(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestValidateJobIDTransfersModeAndSort(t *testing.T) {
+	if err := ValidateJobID("0123456789abcdef"); err != nil {
+		t.Error(err)
+	}
+	for _, s := range []string{"", "../x", "0123456789ABCDEF", "0123456789abcde", "0123456789abcdef0"} {
+		if err := ValidateJobID(s); err == nil {
+			t.Errorf("ValidateJobID(%q) = nil, want an error", s)
+		}
+	}
+	for _, n := range []int{0, -1, MaxTransfers + 1} {
+		if err := ValidateTransfers(n); err == nil {
+			t.Errorf("ValidateTransfers(%d) = nil, want an error", n)
+		}
+	}
+	if err := ValidateTransfers(4); err != nil {
+		t.Error(err)
+	}
+	for _, m := range []string{"skip-existing", "update-if-different", "overwrite"} {
+		if err := ValidateSyncMode(m); err != nil {
+			t.Errorf("ValidateSyncMode(%q) = %v", m, err)
+		}
+	}
+	if err := ValidateSyncMode("mirror"); err == nil {
+		t.Error("unknown mode accepted")
+	}
+	if s, d := SortParams("size", "desc"); s != "size" || d != "desc" {
+		t.Errorf("SortParams = %s %s", s, d)
+	}
+	if s, d := SortParams("<script>", "sideways"); s != "name" || d != "asc" {
+		t.Errorf("SortParams fallback = %s %s", s, d)
+	}
+}

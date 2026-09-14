@@ -447,9 +447,8 @@ func readIfExists(path string) ([]byte, bool, error) {
 	return data, true, nil
 }
 
-// writeOrRemove writes content atomically, or removes the file when content is
-// nil. The temp file is created in the same directory with a leading dot so
-// Caddy's "import sites/*.caddy" never picks up a half-written file.
+// writeOrRemove writes a site file atomically, or removes it when content is
+// nil.
 func writeOrRemove(path string, content []byte) error {
 	if content == nil {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -457,9 +456,17 @@ func writeOrRemove(path string, content []byte) error {
 		}
 		return nil
 	}
+	return writeFileAtomic(path, content, siteFileMode)
+}
 
+// writeFileAtomic writes content to path through a temp file in the same
+// directory: write, chmod, fsync, close, rename. A reader (Caddy's
+// "import sites/*.caddy", or the panel itself after a crash) therefore sees
+// either the old file or the whole new one, never a half-written one. The
+// temp name starts with a dot and ends in ".part" so no glob picks it up.
+func writeFileAtomic(path string, content []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*.caddy-part")
+	tmp, err := os.CreateTemp(dir, ".tmp-*.part")
 	if err != nil {
 		return fmt.Errorf("tidak bisa menulis di %s (pastikan user panel punya akses tulis): %w", dir, err)
 	}
@@ -470,7 +477,7 @@ func writeOrRemove(path string, content []byte) error {
 		tmp.Close()
 		return fmt.Errorf("tidak bisa menulis %s: %w", tmpName, err)
 	}
-	if err := tmp.Chmod(siteFileMode); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return fmt.Errorf("tidak bisa set permission %s: %w", tmpName, err)
 	}
