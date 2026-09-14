@@ -1214,6 +1214,14 @@ tersimpan. Kalau panel di belakang Caddy, pastikan diakses lewat `https://`:
 saat `X-Forwarded-Proto: https` diteruskan, cookie ditandai `Secure` dan browser
 tidak akan mengirimkannya kembali lewat `http://` biasa.
 
+**`ambiguous site definition: <domain>`** — satu alamat dideklarasikan dua kali
+di config Caddy. Paling sering karena domain yang sama dipakai sebagai domain
+bucket **dan** sebagai `S3_API_DOMAIN`. Panel sekarang menolak kombinasi itu
+sebelum menulis, tapi kalau bentroknya ada di Caddyfile utama (di luar
+jangkauan panel), cari dengan `grep -rn '<domain>' /etc/caddy/`. Pakai subdomain
+terpisah: misalnya `s3.domainmu.com` untuk S3 API dan `cdn.domainmu.com` untuk
+bucket.
+
 **Kartu kredensial masih menampilkan `http://127.0.0.1:3900` sebagai Endpoint** —
 itu alamat yang dipakai panel sendiri untuk bicara ke Garage, dan tidak berguna
 untuk aplikasi di mesin lain. Endpoint publik diambil dari `S3_API_DOMAIN`, bukan

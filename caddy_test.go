@@ -317,3 +317,108 @@ func TestPreExistingBreakageIsNotReportedAsFailedRollback(t *testing.T) {
 		t.Errorf("pesan tidak mengarahkan ke penyebab sebenarnya:\n%s", msg)
 	}
 }
+
+// Caddy menolak config yang mendefinisikan satu alamat site dua kali dengan
+// "ambiguous site definition". Panel harus menangkapnya sebelum menulis,
+// bukan menyerahkannya ke reload lalu rollback.
+func TestSiteAddressCollisionIsRefusedBeforeWriting(t *testing.T) {
+	t.Run("domain bentrok dengan file domain lain", func(t *testing.T) {
+		c := newTestCaddy(t, reloadOK)
+		// File dengan nama berbeda, tapi mendeklarasikan alamat yang sama.
+		if err := os.WriteFile(filepath.Join(c.dir, "lain.caddy"),
+			[]byte("cdn.example.com {\n\trespond \"hai\"\n}\n"), 0o640); err != nil {
+			t.Fatal(err)
+		}
+
+		err := c.AddDomain(context.Background(), "cdn.example.com", "media")
+		if err == nil {
+			t.Fatal("tabrakan alamat harus ditolak")
+		}
+		if !strings.Contains(err.Error(), "lain.caddy") {
+			t.Errorf("pesan tidak menyebut file yang bentrok: %v", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(c.dir, "cdn.example.com.caddy")); !os.IsNotExist(statErr) {
+			t.Error("tidak boleh ada file yang ditulis")
+		}
+	})
+
+	// Persis kasus yang dilaporkan: sebuah domain sudah dilayani, lalu
+	// S3_API_DOMAIN diisi domain yang sama dan whitelist ditulis.
+	t.Run("S3_API_DOMAIN bentrok dengan domain yang sudah ada", func(t *testing.T) {
+		c := newTestCaddy(t, reloadOK)
+		if err := c.AddDomain(context.Background(), "s3.example.com", "media"); err != nil {
+			t.Fatal(err)
+		}
+
+		err := c.WriteWhitelist(context.Background(), "s3.example.com",
+			[]WhitelistEntry{{Value: "203.0.113.10", Label: "app"}})
+		if err == nil {
+			t.Fatal("tabrakan alamat harus ditolak")
+		}
+		if !strings.Contains(err.Error(), "s3.example.com.caddy") {
+			t.Errorf("pesan tidak menyebut file yang bentrok: %v", err)
+		}
+		if !strings.Contains(err.Error(), "S3_API_DOMAIN") {
+			t.Errorf("pesan tidak menjelaskan sumber masalahnya: %v", err)
+		}
+		if _, statErr := os.Stat(c.WhitelistPath()); !os.IsNotExist(statErr) {
+			t.Error("whitelist tidak boleh ditulis")
+		}
+	})
+
+	// Menulis ulang whitelist yang sudah ada tidak boleh dianggap bentrok
+	// dengan dirinya sendiri.
+	t.Run("menulis ulang whitelist sendiri bukan tabrakan", func(t *testing.T) {
+		c := newTestCaddy(t, reloadOK)
+		ctx := context.Background()
+		if err := c.WriteWhitelist(ctx, "s3.example.com", []WhitelistEntry{{Value: "203.0.113.10"}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.WriteWhitelist(ctx, "s3.example.com", []WhitelistEntry{
+			{Value: "203.0.113.10"}, {Value: "198.51.100.0/24"},
+		}); err != nil {
+			t.Fatalf("menambah entri ke whitelist sendiri ditolak: %v", err)
+		}
+	})
+}
+
+func TestSiteAddresses(t *testing.T) {
+	dir := t.TempDir()
+	body := "# bucket: media\n" +
+		"cdn.example.com {\n" +
+		"\treverse_proxy 127.0.0.1:3902 {\n" + // menjorok: bukan deklarasi site
+		"\t\theader_up Host media\n" +
+		"\t}\n" +
+		"}\n" +
+		"a.example.com, b.example.com {\n" + // beberapa alamat sekaligus
+		"\trespond \"x\"\n" +
+		"}\n"
+	path := filepath.Join(dir, "x.caddy")
+	if err := os.WriteFile(path, []byte(body), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	got, err := siteAddresses(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"cdn.example.com", "a.example.com", "b.example.com"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("siteAddresses = %v, want %v", got, want)
+	}
+}
+
+// Kalau bentroknya ada di Caddyfile utama (di luar jangkauan panel), Caddy yang
+// menangkapnya — dan pesannya harus diterjemahkan jadi langkah konkret.
+func TestAmbiguousSiteHintIsAdded(t *testing.T) {
+	hint := reloadHint(`Error: adapting config using caddyfile: ambiguous site definition: s3.audiensi.com
+caddy.service: Control process exited`)
+	if !strings.Contains(hint, "s3.audiensi.com") {
+		t.Errorf("hint tidak menyebut alamatnya: %q", hint)
+	}
+	if !strings.Contains(hint, "grep -rn") {
+		t.Errorf("hint tidak memberi cara mencarinya: %q", hint)
+	}
+	if reloadHint("error lain yang tidak relevan") != "" {
+		t.Error("hint tidak boleh muncul untuk error lain")
+	}
+}

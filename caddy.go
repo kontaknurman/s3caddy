@@ -69,6 +69,9 @@ type ReloadError struct {
 	Journal     string
 	RolledBack  bool
 	RollbackErr error
+	// Hint berisi penjelasan tambahan untuk pesan Caddy yang sering muncul tapi
+	// tidak langsung memberi tahu apa yang harus dilakukan.
+	Hint string
 	// StillBroken diisi kalau file sudah berhasil dikembalikan tapi Caddy tetap
 	// menolak config-nya. Itu berarti kerusakannya ada di luar perubahan ini —
 	// misalnya file lain yang diedit manual — jadi jangan dilaporkan seolah
@@ -90,6 +93,9 @@ func (e *ReloadError) Error() string {
 		if t := strings.TrimSpace(part.text); t != "" {
 			fmt.Fprintf(&b, "\n\n%s:\n%s", part.label, t)
 		}
+	}
+	if e.Hint != "" {
+		fmt.Fprintf(&b, "\n\n%s", e.Hint)
 	}
 	switch {
 	case e.RollbackErr != nil:
@@ -234,6 +240,81 @@ func FirstDomainForBucket(sites []Site, bucket string) string {
 	return domains[0]
 }
 
+// --- deteksi tabrakan alamat site ----------------------------------------
+
+// siteAddresses membaca alamat site yang dideklarasikan sebuah file .caddy.
+//
+// Blok site di Caddyfile selalu dimulai di kolom paling kiri dan diakhiri "{",
+// sedangkan isi bloknya menjorok. Itu cukup untuk mengenali deklarasi tanpa
+// perlu parser Caddyfile lengkap; kalau ada bentuk yang luput, Caddy tetap
+// menangkapnya saat reload dan perubahan akan di-rollback seperti biasa.
+func siteAddresses(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 8192), 64*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Baris menjorok berarti masih di dalam blok, bukan deklarasi site.
+		if line == "" || line[0] == ' ' || line[0] == '\t' || line[0] == '#' {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasSuffix(trimmed, "{") {
+			continue
+		}
+		addrs := strings.TrimSuffix(trimmed, "{")
+		for _, addr := range strings.FieldsFunc(addrs, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t'
+		}) {
+			if addr != "" {
+				out = append(out, strings.ToLower(addr))
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// conflictingFile mencari file lain di direktori sites yang sudah
+// mendeklarasikan alamat yang sama. Caddy menolak config dengan pesan
+// "ambiguous site definition" kalau satu alamat dideklarasikan dua kali, dan
+// lebih baik itu ketahuan sebelum menulis daripada lewat rollback.
+func (c *CaddyManager) conflictingFile(addr, ignorePath string) string {
+	entries, err := os.ReadDir(c.dir)
+	if err != nil {
+		return ""
+	}
+	want := strings.ToLower(addr)
+	ignore := filepath.Clean(ignorePath)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".caddy") {
+			continue
+		}
+		full := filepath.Join(c.dir, entry.Name())
+		if full == ignore {
+			continue
+		}
+		addrs, err := siteAddresses(full)
+		if err != nil {
+			continue
+		}
+		for _, got := range addrs {
+			if got == want {
+				return entry.Name()
+			}
+		}
+	}
+	return ""
+}
+
 // --- writing --------------------------------------------------------------
 
 // sitePath builds the absolute path of a domain file after validating that the
@@ -290,6 +371,13 @@ func (c *CaddyManager) AddDomain(ctx context.Context, domain, bucket string) err
 		return fmt.Errorf("file %s sudah ada — hapus domain itu dulu kalau mau mengubah tujuannya", filepath.Base(path))
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("tidak bisa memeriksa %s: %w", path, err)
+	}
+
+	if other := c.conflictingFile(domain, path); other != "" {
+		return fmt.Errorf("domain %s sudah dideklarasikan di %s. "+
+			"Caddy menolak config yang mendefinisikan satu alamat dua kali "+
+			"(\"ambiguous site definition\"), jadi hapus dulu yang di %s atau pakai domain lain",
+			domain, other, other)
 	}
 
 	return c.applyLocked(ctx, path, c.renderSite(domain, bucket))
@@ -428,10 +516,23 @@ func (c *CaddyManager) reload(ctx context.Context) *ReloadError {
 	if strings.Contains(re.Stderr, "a password is required") || strings.Contains(re.Stderr, "no tty present") {
 		re.Stderr += "\n(sudoers belum dipasang? lihat README bagian sudoers)"
 	}
+	re.Hint = reloadHint(re.Stderr + "\n" + re.Journal)
 	// "systemctl reload" only prints a generic pointer to the journal, so pull
 	// the actual Caddy error out of the journal when we are allowed to read it.
 	re.Journal = readCaddyJournal(ctx)
 	return re
+}
+
+// reloadHint menerjemahkan pesan Caddy yang sering bikin bingung menjadi
+// langkah yang bisa ditindaklanjuti.
+func reloadHint(output string) string {
+	if idx := strings.Index(output, "ambiguous site definition:"); idx >= 0 {
+		addr := strings.TrimSpace(strings.SplitN(output[idx+len("ambiguous site definition:"):], "\n", 2)[0])
+		return fmt.Sprintf("Artinya alamat %s dideklarasikan lebih dari sekali di config Caddy — "+
+			"mungkin di Caddyfile utama, bukan di direktori sites. Cari dengan:\n"+
+			"  grep -rn '%s' /etc/caddy/", addr, addr)
+	}
+	return ""
 }
 
 // readCaddyJournal is a best-effort fetch of the last Caddy log lines. It needs
@@ -587,7 +688,16 @@ func (c *CaddyManager) WriteWhitelist(ctx context.Context, domain string, entrie
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.applyLocked(ctx, c.WhitelistPath(), c.renderWhitelist(domain, clean))
+
+	path := c.WhitelistPath()
+	if other := c.conflictingFile(domain, path); other != "" {
+		return fmt.Errorf("S3_API_DOMAIN (%s) sudah dipakai sebagai alamat site di %s. "+
+			"Caddy menolak config yang mendefinisikan satu alamat dua kali "+
+			"(\"ambiguous site definition\"), jadi pilih salah satu: hapus domain itu di halaman Domains, "+
+			"atau ganti S3_API_DOMAIN ke subdomain lain lalu restart panel",
+			domain, other)
+	}
+	return c.applyLocked(ctx, path, c.renderWhitelist(domain, clean))
 }
 
 // DeleteWhitelist removes _s3api.caddy entirely. After this the S3 API is no
