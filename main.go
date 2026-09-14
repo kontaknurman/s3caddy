@@ -280,6 +280,14 @@ func main() {
 
 	if app.s3 == nil {
 		log.Printf("PERINGATAN: GARAGE_S3_ACCESS_KEY/GARAGE_S3_SECRET_KEY belum diisi — halaman objek dinonaktifkan")
+	} else {
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if d := app.diagnoseS3Credentials(checkCtx); d != "" && !strings.Contains(d, "SUDAH COCOK") {
+			for _, line := range strings.Split(d, "\n") {
+				log.Printf("PERINGATAN: %s", line)
+			}
+		}
+		checkCancel()
 	}
 	if cfg.S3APIDomain == "" {
 		log.Printf("PERINGATAN: S3_API_DOMAIN belum diisi — halaman IP whitelist dinonaktifkan")
@@ -1031,6 +1039,45 @@ func (a *App) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
+// diagnoseS3Credentials membandingkan kredensial S3 panel dengan yang benar-benar
+// dimiliki Garage untuk access key itu.
+//
+// Panel sudah memegang token Admin API, jadi ia bisa menanyakan langsung —
+// dan itu mengubah "Invalid signature" dari tebak-tebakan jadi jawaban pasti:
+// kalau secret-nya memang cocok, penyebabnya pasti bukan secret.
+// Mengembalikan "" kalau tidak ada yang perlu dilaporkan.
+func (a *App) diagnoseS3Credentials(ctx context.Context) string {
+	if a.cfg.S3AccessKey == "" || a.cfg.S3SecretKey == "" {
+		return ""
+	}
+	info, err := a.garage.GetKeyInfo(ctx, a.cfg.S3AccessKey, true)
+	if err != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.NotFound() {
+			return fmt.Sprintf("Diagnosis panel: GARAGE_S3_ACCESS_KEY (%s) tidak dikenal Garage.\n"+
+				"Lihat daftar key yang ada dengan: garage key list", a.cfg.S3AccessKey)
+		}
+		return "" // Admin API sedang tidak bisa ditanya; jangan menambah kebisingan.
+	}
+
+	got := info.Secret()
+	if got == "" {
+		return "Diagnosis panel: Garage tidak mau menunjukkan secret key untuk dibandingkan.\n" +
+			"Kalau kamu memakai admin token ber-scope, tambahkan scope GetKeyInfo."
+	}
+	if got == a.cfg.S3SecretKey {
+		return "Diagnosis panel: GARAGE_S3_SECRET_KEY SUDAH COCOK dengan yang dimiliki Garage,\n" +
+			"jadi penyebabnya bukan secret key. Tersisa dua kemungkinan: region tidak cocok\n" +
+			"(poin 2 di atas — ini yang paling mungkin), atau jam server meleset (poin 3)."
+	}
+	return fmt.Sprintf("Diagnosis panel: GARAGE_S3_SECRET_KEY TIDAK COCOK dengan yang dimiliki Garage\n"+
+		"untuk key %s. Yang di file env panjangnya %d karakter, milik Garage %d karakter.\n"+
+		"Ambil nilai yang benar dengan:\n"+
+		"  garage key info --show-secret %s\n"+
+		"lalu perbarui GARAGE_S3_SECRET_KEY dan restart panel.",
+		a.cfg.S3AccessKey, len(a.cfg.S3SecretKey), len(got), info.Name)
+}
+
 // --- page 1: buckets ------------------------------------------------------
 
 type bucketRow struct {
@@ -1456,7 +1503,17 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 
 	result, err := a.s3.ListObjectsV2(ctx, bucket, prefix, token, "/", objectsPerPage)
 	if err != nil {
-		data["Error"] = err.Error()
+		msg := err.Error()
+		// Untuk penolakan tanda tangan, tanyakan langsung ke Garage supaya
+		// user tidak perlu menebak penyebabnya satu per satu.
+		var s3err *S3Error
+		if errors.As(err, &s3err) && s3err.StatusCode == http.StatusForbidden &&
+			strings.Contains(strings.ToLower(s3err.Message+s3err.Body), "signature") {
+			if d := a.diagnoseS3Credentials(ctx); d != "" {
+				msg += "\n\n" + d
+			}
+		}
+		data["Error"] = msg
 		a.render(w, r, "objects.html", data)
 		return
 	}

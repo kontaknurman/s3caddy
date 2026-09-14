@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,11 +29,12 @@ type fakeGarage struct {
 	calls   []string
 	allowed []string // access key ids passed to AllowBucketKey
 	failOps map[string]string
+	keys    map[string]string // access key id -> secret
 	nextID  int
 }
 
 func newFakeGarage() *fakeGarage {
-	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}}
+	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}, keys: map[string]string{}}
 }
 
 func (f *fakeGarage) addBucket(name string, objects, size int64, public bool) string {
@@ -169,6 +171,22 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 			}
 			writeJSON(b)
 
+		case "GetKeyInfo":
+			id := r.URL.Query().Get("id")
+			secret, ok := f.keys[id]
+			if !ok {
+				fail(http.StatusNotFound, "key tidak ada")
+				return
+			}
+			out := map[string]any{
+				"accessKeyId": id, "name": "key-" + id, "expired": false,
+				"permissions": map[string]bool{"createBucket": false}, "buckets": []any{},
+			}
+			if r.URL.Query().Get("showSecretKey") == "true" {
+				out["secretAccessKey"] = secret
+			}
+			writeJSON(out)
+
 		case "CreateKey":
 			var body struct {
 				Name string `json:"name"`
@@ -215,6 +233,8 @@ type testPanel struct {
 	sitesDir string
 	garage   *fakeGarage
 	s3Store  map[string][]byte
+	// s3Deny, kalau diisi, membuat S3 tiruan menjawab 403 dengan body ini.
+	s3Deny string
 }
 
 func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
@@ -226,9 +246,15 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 
 	store := map[string][]byte{}
 	var storeMu sync.Mutex
+	panel := &testPanel{}
 	s3Srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		storeMu.Lock()
 		defer storeMu.Unlock()
+		if panel.s3Deny != "" {
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, panel.s3Deny)
+			return
+		}
 		parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
 		key := ""
 		if len(parts) == 2 {
@@ -327,7 +353,13 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 		},
 	}
 
-	return &testPanel{app: app, srv: srv, client: client, sitesDir: dir, garage: fg, s3Store: store}
+	panel.app = app
+	panel.srv = srv
+	panel.client = client
+	panel.sitesDir = dir
+	panel.garage = fg
+	panel.s3Store = store
+	return panel
 }
 
 func (p *testPanel) get(t *testing.T, path string) (*http.Response, string) {
@@ -1419,4 +1451,76 @@ func TestCredentialsShowReachableS3Endpoint(t *testing.T) {
 			t.Error("endpoint internal harus tetap tersedia sebagai alternatif")
 		}
 	})
+}
+
+// Panel memegang token Admin API, jadi saat tanda tangan ditolak ia bisa
+// bertanya langsung ke Garage: apakah secret-nya memang cocok? Itu mengubah
+// "Invalid signature" dari tebak-tebakan jadi jawaban pasti.
+func TestDiagnoseS3Credentials(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("secret cocok", func(t *testing.T) {
+		p := newTestPanel(t)
+		// Fake Garage membuat secret sebagai "SECRET-"+nama; daftarkan key
+		// panel dengan secret yang sama seperti config.
+		p.garage.keys = map[string]string{p.app.cfg.S3AccessKey: p.app.cfg.S3SecretKey}
+
+		d := p.app.diagnoseS3Credentials(ctx)
+		if !strings.Contains(d, "SUDAH COCOK") {
+			t.Errorf("secret yang cocok tidak dilaporkan cocok: %q", d)
+		}
+		if !strings.Contains(d, "region") {
+			t.Error("saat secret cocok, panel harus mengarahkan ke kemungkinan berikutnya")
+		}
+	})
+
+	t.Run("secret beda", func(t *testing.T) {
+		p := newTestPanel(t)
+		p.garage.keys = map[string]string{p.app.cfg.S3AccessKey: "secret-yang-lain-sama-sekali"}
+
+		d := p.app.diagnoseS3Credentials(ctx)
+		if !strings.Contains(d, "TIDAK COCOK") {
+			t.Errorf("secret yang beda tidak terdeteksi: %q", d)
+		}
+		if !strings.Contains(d, "garage key info") {
+			t.Error("panel tidak memberi cara mengambil nilai yang benar")
+		}
+		// Panjang keduanya berguna, tapi nilainya tidak boleh bocor.
+		if strings.Contains(d, "secret-yang-lain-sama-sekali") || strings.Contains(d, p.app.cfg.S3SecretKey) {
+			t.Error("diagnosis membocorkan nilai secret")
+		}
+	})
+
+	t.Run("access key tidak dikenal", func(t *testing.T) {
+		p := newTestPanel(t)
+		p.garage.keys = map[string]string{} // tidak ada key sama sekali
+
+		d := p.app.diagnoseS3Credentials(ctx)
+		if !strings.Contains(d, "tidak dikenal") {
+			t.Errorf("access key tak dikenal tidak dilaporkan: %q", d)
+		}
+	})
+
+	t.Run("tanpa kredensial tidak berisik", func(t *testing.T) {
+		p := newTestPanel(t, func(c *Config) { c.S3AccessKey = ""; c.S3SecretKey = "" })
+		if d := p.app.diagnoseS3Credentials(ctx); d != "" {
+			t.Errorf("tidak boleh melapor apa-apa: %q", d)
+		}
+	})
+}
+
+// Diagnosisnya harus muncul di halaman Objek, tepat di bawah pesan Garage.
+func TestObjectsPageShowsCredentialDiagnosis(t *testing.T) {
+	p := newTestPanel(t)
+	p.garage.addBucket("media", 0, 0, true)
+	p.garage.keys = map[string]string{p.app.cfg.S3AccessKey: "secret-yang-berbeda"}
+	p.s3Deny = `<Error><Code>AccessDenied</Code><Message>Forbidden: Invalid signature</Message></Error>`
+
+	_, body := p.get(t, "/objects?bucket=media")
+	if !strings.Contains(body, "Invalid signature") {
+		t.Fatalf("pesan Garage tidak tampil: %s", firstLines(body))
+	}
+	if !strings.Contains(body, "TIDAK COCOK") {
+		t.Errorf("diagnosis tidak ikut ditampilkan: %s", firstLines(body))
+	}
 }

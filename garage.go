@@ -321,6 +321,21 @@ func (g *Garage) AllowBucketKey(ctx context.Context, bucketID, accessKeyID strin
 	return g.do(ctx, http.MethodPost, "AllowBucketKey", nil, body, nil)
 }
 
+// GetKeyInfo looks an access key up. showSecret asks Garage to include the
+// secret, which is what makes it possible to tell a wrong GARAGE_S3_SECRET_KEY
+// apart from every other reason a signature can be refused.
+func (g *Garage) GetKeyInfo(ctx context.Context, accessKeyID string, showSecret bool) (*KeyInfo, error) {
+	q := url.Values{"id": {accessKeyID}}
+	if showSecret {
+		q.Set("showSecretKey", "true")
+	}
+	var out KeyInfo
+	if err := g.do(ctx, http.MethodGet, "GetKeyInfo", q, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Health checks that the Admin API answers and the token is accepted.
 func (g *Garage) Health(ctx context.Context) error {
 	var out map[string]any
