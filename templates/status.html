@@ -1,0 +1,341 @@
+{{define "content"}}
+{{$s := .S}}
+
+<div class="sync-strip status-strip" id="status-root" data-keys="{{$s.Keys}}">
+  <div><span class="k">Host</span><strong>{{$s.Host.Hostname}}</strong></div>
+  <div><span class="k">OS</span>{{if $s.Host.OS}}{{$s.Host.OS}}{{else}}—{{end}} · kernel <span class="mono">{{$s.Host.Kernel}}</span> · {{$s.Host.Arch}}</div>
+  <div><span class="k">Uptime</span><span data-field="host.uptimeH">{{$s.Host.UptimeH}}</span> <span class="muted">(sejak <span data-field="host.bootedH">{{$s.Host.BootedH}}</span>)</span></div>
+  <div class="strip-right">
+    <label class="check small"><input type="checkbox" id="status-auto" checked> perbarui otomatis tiap 5 detik</label>
+    <span class="muted small">diperbarui <span data-field="at">{{$s.At}}</span> · rata-rata <span data-field="interval">{{$s.Interval}}</span></span>
+  </div>
+</div>
+
+{{range $s.Warnings}}
+<div class="notice warn">{{.}}</div>
+{{end}}
+
+<div class="status-grid">
+  {{/* ------------------------------------------------------------ CPU */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>CPU</h3>
+        <p class="muted small">{{if $s.Host.CPUModel}}{{$s.Host.CPUModel}} · {{end}}{{$s.Host.Cores}} core</p>
+      </div>
+      <div class="big {{$s.CPU.Level}}" data-field="cpu.pctH" data-level="cpu.level">{{$s.CPU.PctH}}</div>
+    </div>
+    <div class="meter"><div class="meter-fill {{$s.CPU.Level}}" data-meter="cpu.pct" data-level="cpu.level" style="width: {{printf "%.1f" $s.CPU.Pct}}%"></div></div>
+    <dl class="facts">
+      <dt>user / system</dt><dd><span data-field="cpu.userH">{{$s.CPU.UserH}}</span> / <span data-field="cpu.systemH">{{$s.CPU.SystemH}}</span></dd>
+      <dt>menunggu I/O</dt><dd data-field="cpu.ioWaitH">{{$s.CPU.IOWaitH}}</dd>
+      <dt>steal (hypervisor)</dt><dd data-field="cpu.stealH">{{$s.CPU.StealH}}</dd>
+      <dt>load 1 / 5 / 15 menit</dt><dd class="lvl {{$s.CPU.LoadLevel}}" data-level="cpu.loadLevel"><span data-field="cpu.load1H">{{$s.CPU.Load1H}}</span> / <span data-field="cpu.load5H">{{$s.CPU.Load5H}}</span> / <span data-field="cpu.load15H">{{$s.CPU.Load15H}}</span> <span class="muted">(dari {{$s.Host.Cores}} core)</span></dd>
+      <dt>proses</dt><dd><span data-field="cpu.running">{{$s.CPU.Running}}</span> berjalan dari <span data-field="cpu.tasks">{{$s.CPU.Tasks}}</span></dd>
+    </dl>
+    {{if $s.CPU.PerCore}}
+    <div class="cores" data-list="cpu.perCore">
+      {{range $s.CPU.PerCore}}
+      <div class="core" data-row="{{.Key}}">#{{.Index}} <em data-field="pctH">{{.PctH}}</em>
+        <div class="meter mini"><div class="meter-fill {{.Level}}" data-meter="pct" data-level="level" style="width: {{printf "%.1f" .Pct}}%"></div></div>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+    {{if $s.Pressure}}
+    <p class="small muted" style="margin: 12px 0 4px;">Tekanan (PSI, % waktu ada tugas yang menunggu): 10 dtk / 60 dtk</p>
+    <dl class="facts" data-list="pressure">
+      {{range $s.Pressure}}
+      <dt data-row="{{.Key}}">{{.Label}}</dt><dd data-row="{{.Key}}" class="lvl {{.Level}}" data-level="level">sebagian <span data-field="some10H">{{.Some10H}}</span> / <span data-field="some60H">{{.Some60H}}</span>{{if ne .Key "cpu"}} · penuh <span data-field="full10H">{{.Full10H}}</span> / <span data-field="full60H">{{.Full60H}}</span>{{end}}</dd>
+      {{end}}
+    </dl>
+    {{end}}
+  </div>
+
+  {{/* --------------------------------------------------------- memori */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>Memori</h3>
+        <p class="muted small"><span data-field="memory.usedH">{{$s.Memory.UsedH}}</span> dipakai dari <span data-field="memory.totalH">{{$s.Memory.TotalH}}</span></p>
+      </div>
+      <div class="big {{$s.Memory.Level}}" data-field="memory.pctH" data-level="memory.level">{{$s.Memory.PctH}}</div>
+    </div>
+    <div class="meter"><div class="meter-fill {{$s.Memory.Level}}" data-meter="memory.pct" data-level="memory.level" style="width: {{printf "%.1f" $s.Memory.Pct}}%"></div></div>
+    <dl class="facts">
+      <dt>tersedia</dt><dd data-field="memory.availableH">{{$s.Memory.AvailableH}}</dd>
+      <dt>bebas</dt><dd data-field="memory.freeH">{{$s.Memory.FreeH}}</dd>
+      <dt>cache / buffer</dt><dd><span data-field="memory.cachedH">{{$s.Memory.CachedH}}</span> / <span data-field="memory.buffersH">{{$s.Memory.BuffersH}}</span></dd>
+      <dt>shared (tmpfs)</dt><dd data-field="memory.sharedH">{{$s.Memory.SharedH}}</dd>
+    </dl>
+    {{if $s.Memory.HasSwap}}
+    <div class="usage-row" style="margin-top: 10px; border-bottom: 0;">
+      <div class="between"><span>Swap</span><span><span data-field="memory.swapUsedH">{{$s.Memory.SwapUsedH}}</span> / <span data-field="memory.swapTotalH">{{$s.Memory.SwapTotalH}}</span> · <strong class="lvl {{$s.Memory.SwapLevel}}" data-field="memory.swapPctH" data-level="memory.swapLevel">{{$s.Memory.SwapPctH}}</strong></span></div>
+      <div class="meter"><div class="meter-fill {{$s.Memory.SwapLevel}}" data-meter="memory.swapPct" data-level="memory.swapLevel" style="width: {{printf "%.1f" $s.Memory.SwapPct}}%"></div></div>
+    </div>
+    {{else}}
+    <p class="small muted" style="margin: 10px 0 0;">Tanpa swap.</p>
+    {{end}}
+    <p class="small muted" style="margin: 10px 0 0;">"Dipakai" = total − tersedia; page cache tidak dihitung karena kernel melepasnya kapan saja.</p>
+  </div>
+
+  {{/* ----------------------------------------------------------- disk */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>Disk</h3>
+        <p class="muted small">Filesystem yang terpasang. Persentase dihitung seperti <span class="mono">df</span>.</p>
+      </div>
+    </div>
+    {{if not $s.Disks}}
+      <div class="empty-hint">Tidak ada filesystem yang bisa dibaca.</div>
+    {{else}}
+    <div data-list="disks">
+      {{range $s.Disks}}
+      <div class="usage-row" data-row="{{.Key}}">
+        <div class="between">
+          <span><strong class="mono">{{.Mount}}</strong> <span class="muted small">{{.Device}} · {{.FSType}}</span></span>
+          <span><span data-field="usedH">{{.UsedH}}</span> / <span data-field="totalH">{{.TotalH}}</span> · <strong class="lvl {{.Level}}" data-field="pctH" data-level="level">{{.PctH}}</strong></span>
+        </div>
+        <div class="meter"><div class="meter-fill {{.Level}}" data-meter="pct" data-level="level" style="width: {{printf "%.1f" .Pct}}%"></div></div>
+        <div class="small muted">tersisa <span data-field="availH">{{.AvailH}}</span> · inode <span data-field="inodesH">{{.InodesH}}</span></div>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+
+  {{/* ------------------------------------------------------- jaringan */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>Jaringan</h3>
+        <p class="muted small">Laju rata-rata sejak pembaruan terakhir; total sejak boot.</p>
+      </div>
+    </div>
+    {{if not $s.Net}}
+      <div class="empty-hint">Tidak ada antarmuka jaringan (selain lo) yang terbaca.</div>
+    {{else}}
+    <div data-list="net">
+      {{range $s.Net}}
+      <div class="usage-row" data-row="{{.Key}}">
+        <div class="between">
+          <span><strong class="mono">{{.Name}}</strong></span>
+          <span>↓ <strong data-field="rxH">{{.RxH}}</strong> · ↑ <strong data-field="txH">{{.TxH}}</strong></span>
+        </div>
+        <div class="small muted">total ↓ <span data-field="rxTotalH">{{.RxTotalH}}</span> · ↑ <span data-field="txTotalH">{{.TxTotalH}}</span> · <span class="lvl {{.Level}}" data-field="errorsH" data-level="level">{{.ErrorsH}}</span></div>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+</div>
+
+<div class="status-grid">
+  {{/* ------------------------------------------------------- disk I/O */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>Disk I/O</h3>
+        <p class="muted small">Per perangkat blok; "sibuk" = bagian waktu perangkat sedang melayani I/O.</p>
+      </div>
+    </div>
+    {{if not $s.DiskIO}}
+      <div class="empty-hint">Belum ada aktivitas disk yang terbaca.</div>
+    {{else}}
+    <div class="table-wrap">
+    <table class="status-table" data-list="diskIO">
+      <thead><tr><th>Perangkat</th><th>Baca</th><th>Tulis</th><th>IOPS b/t</th><th>Sibuk</th></tr></thead>
+      <tbody>
+        {{range $s.DiskIO}}
+        <tr data-row="{{.Key}}">
+          <td class="mono">{{.Name}}</td>
+          <td data-field="readH">{{.ReadH}}</td>
+          <td data-field="writeH">{{.WriteH}}</td>
+          <td><span data-field="readIOPSH">{{.ReadIOPSH}}</span> / <span data-field="writeIOPSH">{{.WriteIOPSH}}</span></td>
+          <td><span class="lvl {{.Level}}" data-field="utilH" data-level="level">{{.UtilH}}</span><div class="meter mini"><div class="meter-fill {{.Level}}" data-meter="utilPct" data-level="level" style="width: {{printf "%.1f" .UtilPct}}%"></div></div></td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    </div>
+    {{end}}
+  </div>
+
+  {{/* ----------------------------------------------------------- suhu */}}
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <h3>Suhu</h3>
+        <p class="muted small">Sensor dari <span class="mono">/sys/class/hwmon</span>.</p>
+      </div>
+    </div>
+    {{if not $s.Temps}}
+      <div class="empty-hint">Tidak ada sensor suhu yang terbaca. Di VPS ini normal; di server fisik pastikan modul <span class="mono">coretemp</span>/<span class="mono">k10temp</span> dimuat.</div>
+    {{else}}
+    <div data-list="temps">
+      {{range $s.Temps}}
+      <div class="usage-row" data-row="{{.Key}}">
+        <div class="between"><span>{{.Label}}</span><strong class="lvl {{.Level}}" data-field="celsiusH" data-level="level">{{.CelsiusH}}</strong></div>
+        <div class="meter mini"><div class="meter-fill {{.Level}}" data-meter="pct" data-level="level" style="width: {{printf "%.1f" .Pct}}%"></div></div>
+      </div>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+</div>
+
+{{/* ------------------------------------------------------------ proses */}}
+<div class="card" style="margin-top: 20px;">
+  <div class="card-head">
+    <div>
+      <h3>Proses penting</h3>
+      <p class="muted small">garage, caddy, garagepanel, dan rclone yang sedang jalan, dibaca dari <span class="mono">/proc</span>. CPU% = rata-rata sejak pembaruan terakhir; RSS = memori residen.</p>
+    </div>
+  </div>
+  {{if not $s.Procs}}
+    <div class="empty-hint">Tidak satu pun dari garage, caddy, atau rclone terlihat berjalan.</div>
+  {{else}}
+  <div class="table-wrap">
+  <table class="status-table" data-list="procs">
+    <thead><tr><th>Proses</th><th>PID</th><th>Status</th><th>CPU</th><th>RSS</th><th>Thread</th><th>Sejak</th></tr></thead>
+    <tbody>
+      {{range $s.Procs}}
+      <tr data-row="{{.Key}}">
+        <td><strong class="mono">{{.Name}}</strong>{{if .Self}} <span class="badge private">panel ini</span>{{end}}</td>
+        <td class="mono">{{.PID}}</td>
+        <td data-field="state">{{.State}}</td>
+        <td data-field="cpuH">{{.CPUH}}</td>
+        <td data-field="rssH">{{.RSSH}}</td>
+        <td data-field="threads">{{.Threads}}</td>
+        <td class="wrap"><span data-field="startedH">{{.StartedH}}</span> <span class="muted">(<span data-field="uptimeH">{{.UptimeH}}</span>)</span></td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+</div>
+
+{{/* ------------------------------------------------------------ garage */}}
+<div class="card">
+  <div class="card-head">
+    <div>
+      <h3>Garage</h3>
+      <p class="muted small">Dari Admin API <span class="mono">{{$s.Garage.AdminURL}}</span>: <span class="mono">GetClusterHealth</span> dan <span class="mono">GetClusterStatus</span>.</p>
+    </div>
+    {{with $s.Garage.Health}}<div><span class="dot {{.Level}}" data-level="garage.health.level"></span><strong class="lvl {{.Level}}" data-field="garage.health.statusLabel" data-level="garage.health.level">{{.StatusLabel}}</strong></div>{{end}}
+  </div>
+  {{with $s.Garage.HealthErr}}<div class="notice err">Kesehatan cluster tidak bisa dibaca.<pre>{{.}}</pre></div>{{end}}
+  {{with $s.Garage.Health}}
+  <dl class="facts" style="margin-bottom: 14px;">
+    <dt>node terhubung</dt><dd><span data-field="garage.health.connectedNodes">{{.ConnectedNodes}}</span> dari <span data-field="garage.health.knownNodes">{{.KnownNodes}}</span> yang dikenal</dd>
+    <dt>node storage aktif</dt><dd><span data-field="garage.health.storageNodesUp">{{.StorageNodesUp}}</span> dari <span data-field="garage.health.storageNodes">{{.StorageNodes}}</span></dd>
+    <dt>partisi</dt><dd><span data-field="garage.health.partitionsAllOk">{{.PartitionsAllOK}}</span> lengkap · <span data-field="garage.health.partitionsQuorum">{{.PartitionsQuorum}}</span> kuorum · <span data-field="garage.health.partitions">{{.Partitions}}</span> total</dd>
+  </dl>
+  {{end}}
+  {{with $s.Garage.ScopeHint}}<div class="notice warn">{{.}}</div>{{end}}
+  {{if and $s.Garage.NodesErr (not $s.Garage.ScopeHint)}}<div class="notice err">Daftar node tidak bisa dibaca.<pre>{{$s.Garage.NodesErr}}</pre></div>{{end}}
+  {{if $s.Garage.Nodes}}
+  <div class="table-wrap">
+  <table class="status-table" data-list="garage.nodes">
+    <thead><tr><th>Node</th><th>Zona</th><th>Kapasitas</th><th>Status</th><th>Disk data</th><th>Disk metadata</th><th>Versi</th></tr></thead>
+    <tbody>
+      {{range $s.Garage.Nodes}}
+      <tr data-row="{{.Key}}">
+        <td class="wrap"><strong>{{if .Hostname}}{{.Hostname}}{{else}}(tanpa hostname){{end}}</strong><div class="small muted mono">{{.ShortID}}{{if .Addr}} · {{.Addr}}{{end}}</div>{{with .Tags}}<div class="small muted">{{.}}</div>{{end}}</td>
+        <td>{{if .Zone}}{{.Zone}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{.CapacityH}}</td>
+        <td class="wrap"><span class="dot {{.Level}}" data-level="level"></span><span data-field="statusLabel">{{.StatusLabel}}</span></td>
+        <td><span data-field="dataH">{{.DataH}}</span><div class="meter mini"><div class="meter-fill {{.DataLevel}}" data-meter="dataPct" data-level="dataLevel" style="width: {{printf "%.1f" .DataPct}}%"></div></div></td>
+        <td><span data-field="metaH">{{.MetaH}}</span><div class="meter mini"><div class="meter-fill {{.MetaLevel}}" data-meter="metaPct" data-level="metaLevel" style="width: {{printf "%.1f" .MetaPct}}%"></div></div></td>
+        <td class="mono">{{if .Version}}{{.Version}}{{else}}—{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  <p class="small muted" style="margin: 10px 0 0;">Layout versi {{$s.Garage.LayoutVersion}}. Disk data/metadata adalah partisi tempat Garage menyimpan datanya di masing-masing node, menurut Garage sendiri.</p>
+  {{end}}
+</div>
+
+{{/* ------------------------------------------------------------- panel */}}
+<div class="card">
+  <div class="card-head">
+    <div>
+      <h3>Panel ini</h3>
+      <p class="muted small">garagepanel yang sedang kamu buka.</p>
+    </div>
+  </div>
+  <dl class="facts">
+    <dt>versi</dt><dd class="mono">{{$s.Panel.Version}}</dd>
+    <dt>Go</dt><dd class="mono">{{$s.Panel.GoVersion}}</dd>
+    <dt>listen</dt><dd class="mono">{{$s.Panel.Listen}}</dd>
+    <dt>uptime panel</dt><dd data-field="panel.uptimeH">{{$s.Panel.UptimeH}}</dd>
+    <dt>goroutine / heap Go</dt><dd><span data-field="panel.goroutines">{{$s.Panel.Goroutines}}</span> / <span data-field="panel.heapH">{{$s.Panel.HeapH}}</span></dd>
+    {{if $s.Panel.SyncEnabled}}
+    <dt>Sync</dt><dd>rclone v{{$s.Panel.RcloneVersion}} · <span data-field="panel.jobsRunning">{{$s.Panel.JobsRunning}}</span> job berjalan dari <span data-field="panel.jobsTotal">{{$s.Panel.JobsTotal}}</span> · <span data-field="panel.schedules">{{$s.Panel.Schedules}}</span> jadwal · <span data-field="panel.remotes">{{$s.Panel.Remotes}}</span> remote · <a href="/sync">buka</a></dd>
+    {{else}}
+    <dt>Sync</dt><dd class="lvl warn">nonaktif — <span class="muted">{{$s.Panel.SyncDisabled}}</span></dd>
+    {{end}}
+  </dl>
+</div>
+
+<script>
+(function () {
+  var root = document.getElementById('status-root');
+  var auto = document.getElementById('status-auto');
+  if (!root) { return; }
+  function get(o, path) {
+    var parts = path.split('.');
+    for (var i = 0; i < parts.length; i++) { if (o === null || o === undefined) { return undefined; } o = o[parts[i]]; }
+    return o;
+  }
+  function setLevel(el, lvl) {
+    if (typeof lvl !== 'string') { return; }
+    el.classList.remove('ok', 'warn', 'bad');
+    el.classList.add(lvl);
+  }
+  // Fill every data-field / data-meter / data-level inside scope from obj.
+  // Elements inside a data-row are left to the row pass (unless scope is
+  // that row itself).
+  function fill(scope, obj, rowScoped) {
+    scope.querySelectorAll('[data-field], [data-meter], [data-level]').forEach(function (el) {
+      var row = el.closest('[data-row]');
+      if (rowScoped ? row !== scope : row !== null) { return; }
+      var f = el.getAttribute('data-field');
+      if (f) { var v = get(obj, f); if (v !== undefined && v !== null) { el.textContent = String(v); } }
+      var m = el.getAttribute('data-meter');
+      if (m) { var p = get(obj, m); if (typeof p === 'number') { el.style.width = Math.max(0, Math.min(100, p)).toFixed(1) + '%'; } }
+      var l = el.getAttribute('data-level');
+      if (l) { setLevel(el, get(obj, l)); }
+    });
+  }
+  function apply(data) {
+    if (data.keys !== root.getAttribute('data-keys')) { window.location.reload(); return; }
+    fill(document, data, false);
+    document.querySelectorAll('[data-list]').forEach(function (list) {
+      var items = get(data, list.getAttribute('data-list')) || [];
+      var byKey = {};
+      items.forEach(function (it) { byKey[it.key] = it; });
+      list.querySelectorAll('[data-row]').forEach(function (row) {
+        var it = byKey[row.getAttribute('data-row')];
+        if (it) { fill(row, it, true); }
+      });
+    });
+  }
+  var timer = null;
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(tick, ms); }
+  function tick() {
+    if (!auto.checked || document.hidden) { schedule(2000); return; }
+    fetch('/status.json', { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })
+      .then(function (data) { apply(data); schedule(5000); })
+      .catch(function () { schedule(15000); });
+  }
+  auto.addEventListener('change', function () { if (auto.checked) { schedule(200); } });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden && auto.checked) { schedule(200); } });
+  schedule(5000);
+})();
+</script>
+{{end}}

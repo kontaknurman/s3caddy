@@ -233,7 +233,7 @@ func TestSecretsDoNotLeakIntoPages(t *testing.T) {
 		p.app.cfg.PasswordHash,
 		testPassword,
 	}
-	for _, path := range []string{"/buckets", "/domains", "/objects?bucket=media", "/whitelist"} {
+	for _, path := range []string{"/buckets", "/domains", "/objects?bucket=media", "/whitelist", "/status", "/status.json"} {
 		_, body := p.get(t, path)
 		for _, s := range secrets {
 			if s == "" {

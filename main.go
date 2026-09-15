@@ -251,6 +251,9 @@ type App struct {
 	// syncDisabled berisi alasan halaman Sync tidak aktif (STATE_DIR tidak
 	// bisa ditulis, rclone tidak ada, kredensial S3 kosong). Kosong = aktif.
 	syncDisabled string
+
+	// sys membaca /proc dan /sys untuk halaman Status.
+	sys *sysMonitor
 }
 
 func main() {
@@ -510,6 +513,7 @@ func newApp(cfg *Config) (*App, error) {
 		flashes:  newFlashStore(),
 		sessions: newSessionStore(),
 		logins:   newLoginLimiter(),
+		sys:      newSysMonitor(),
 	}
 
 	if cfg.S3AccessKey != "" && cfg.S3SecretKey != "" {
@@ -603,7 +607,7 @@ func prepareStateDir(dir string) error {
 // shared layout. html/template is used throughout so every value is
 // contextually auto-escaped.
 func (a *App) parseTemplates() error {
-	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html", "sync.html", "sync_failed.html"}
+	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html", "sync.html", "sync_failed.html", "status.html"}
 	a.pages = make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.New("layout.html").Funcs(templateFuncs()).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -688,6 +692,9 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /sync/schedules/toggle", a.handleScheduleToggle)
 	mux.HandleFunc("POST /sync/schedules/delete", a.handleScheduleDelete)
 	mux.HandleFunc("POST /sync/schedules/run", a.handleScheduleRun)
+
+	mux.HandleFunc("GET /status", a.handleStatus)
+	mux.HandleFunc("GET /status.json", a.handleStatusJSON)
 
 	mux.HandleFunc("GET /whitelist", a.handleWhitelist)
 	mux.HandleFunc("POST /whitelist/add", a.handleWhitelistAdd)

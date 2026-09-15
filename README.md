@@ -47,6 +47,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Restart, jeda, dan key yang gagal](#restart-jeda-dan-key-yang-gagal)
   - [Biaya request dan batasan](#biaya-request-dan-batasan)
 - [File manager di halaman Objek](#file-manager-di-halaman-objek)
+- [Halaman Status](#halaman-status)
 - [Update ke versi baru](#update-ke-versi-baru)
   - [1. Catat versi yang sedang berjalan](#1-catat-versi-yang-sedang-berjalan)
   - [2. Build versi baru](#2-build-versi-baru)
@@ -69,6 +70,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 | **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
 | **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
+| **Status** | Kondisi server: CPU per core, load, memori/swap, disk dan inode, I/O disk, jaringan, suhu, proses garage/caddy/rclone; kesehatan cluster Garage dan pemakaian disk tiap node. Diperbarui tiap 5 detik |
 
 ## Cara kerja
 
@@ -410,13 +412,17 @@ sudo grep '^admin_token' /etc/garage.toml
 ```
 
 *Pilihan B — token khusus panel (disarankan).* Bisa dibatasi scope-nya dan bisa
-dicabut tanpa mengganggu yang lain. Panel hanya memakai delapan operasi:
+dicabut tanpa mengganggu yang lain. Panel hanya memakai sembilan operasi:
 
 ```bash
 garage admin-token create --expires-in 365d \
-  --scope GetClusterHealth,ListBuckets,GetBucketInfo,CreateBucket,DeleteBucket,UpdateBucket,CreateKey,AllowBucketKey \
+  --scope GetClusterHealth,GetClusterStatus,ListBuckets,GetBucketInfo,CreateBucket,DeleteBucket,UpdateBucket,CreateKey,AllowBucketKey \
   garagepanel
 ```
+
+`GetClusterStatus` hanya dipakai halaman Status (daftar node dan pemakaian
+disk Garage); tanpa scope itu halaman lain tetap jalan dan kartu Garage di
+halaman Status menjelaskan scope yang kurang.
 
 > Garage menampilkan token ini **sekali saja** — salin sekarang.
 >
@@ -1336,6 +1342,47 @@ Halaman Objek adalah file manager per bucket:
   dan pindah memakai `CopyObject` server-side di dalam Garage (rclone dengan
   remote yang sama di kedua sisi), jadi datanya tidak keluar-masuk server.
 
+## Halaman Status
+
+Halaman **Status** menampilkan kondisi server dan cluster tanpa perlu SSH:
+
+| Kartu | Isi | Sumber |
+|---|---|---|
+| CPU | pemakaian total dan per core, rincian user/system/menunggu I/O/steal, load average 1/5/15 menit, jumlah proses, tekanan PSI | `/proc/stat`, `/proc/loadavg`, `/proc/pressure/*` |
+| Memori | dipakai (total − tersedia), tersedia, bebas, cache/buffer, shared, swap | `/proc/meminfo` |
+| Disk | tiap filesystem nyata (ext4, xfs, zfs, btrfs, nfs, …): terpakai/total seperti `df`, sisa, inode | `/proc/mounts` + `statfs` |
+| Jaringan | laju ↓/↑ per antarmuka sejak pembaruan terakhir, total sejak boot, error/drop | `/proc/net/dev` |
+| Disk I/O | baca/tulis per perangkat blok, IOPS, persentase sibuk | `/proc/diskstats` |
+| Suhu | sensor hwmon (coretemp, k10temp, nvme, …) atau thermal zone | `/sys/class/hwmon`, `/sys/class/thermal` |
+| Proses penting | garage, caddy, garagepanel, rclone: PID, status, CPU %, RSS, thread, sejak kapan | `/proc/<pid>/{comm,stat,status}` |
+| Garage | kesehatan cluster (node terhubung, node storage aktif, partisi kuorum/lengkap) dan tiap node: zona, kapasitas, status, pemakaian disk data dan metadata, versi | Admin API `GetClusterHealth`, `GetClusterStatus` |
+| Panel ini | versi, Go, uptime, goroutine/heap, ringkasan Sync | proses panel sendiri |
+
+Angka diperbarui tiap 5 detik selama tab terbuka (checkbox di atas
+mematikannya; tab yang tidak terlihat juga berhenti memuat). Laju dan
+persentase CPU adalah rata-rata sejak pembaruan sebelumnya. Warna: hijau
+normal; kuning perlu diperhatikan (CPU ≥ 70 %, memori ≥ 80 %, disk ≥ 80 %,
+suhu ≥ 70 °C, swap ≥ 30 %); merah kritis (CPU ≥ 90 %, memori ≥ 95 %, disk
+≥ 90 %, inode ≥ 95 %, suhu ≥ 85 °C, swap ≥ 70 %). Load average dibandingkan
+dengan jumlah core.
+
+Semuanya dibaca dari `/proc` dan `/sys` sebagai user `garagepanel`: tidak ada
+perintah yang dijalankan, tidak ada hak tambahan, dan unit systemd tidak perlu
+diubah. Yang perlu diketahui:
+
+- **Daftar node Garage** memakai `GetClusterStatus`. Token ber-scope
+  (Pilihan B di Langkah 0c) harus memuat scope itu; kalau tidak, kartu Garage
+  tetap menampilkan kesehatan cluster dan menyebutkan scope yang kurang.
+- **Proses garage dan caddy** hanya terlihat kalau `/proc` tidak dipasang
+  dengan `hidepid=`. Kalau dipasang, halaman menampilkan peringatan; proses
+  panel sendiri tetap terlihat.
+- **Suhu** hanya ada di server fisik dengan modul sensor yang dimuat
+  (`coretemp`, `k10temp`, NVMe). Di VPS kartunya kosong, dan itu normal.
+- **Mount jaringan yang macet** (NFS/CIFS) tidak menggantung halaman: `statfs`
+  dibatasi 2 detik dan mount itu dilaporkan "tidak menjawab".
+- Memori "dipakai" mengikuti definisi `free`: total dikurangi `MemAvailable`,
+  jadi page cache tidak dihitung — kernel melepasnya kapan saja.
+
 ## Update ke versi baru
 
 State panel kecil dan tidak butuh migrasi: file `.caddy` di `/etc/caddy/sites`
@@ -1609,6 +1656,12 @@ yang ditulis Tes koneksi dan pemeriksaan sebelum job bernama
 penghapusannya gagal, pesannya menyebut nama objek itu supaya bisa dihapus
 manual. Jadwal hanya menyimpan nama remote dan setelan job, tanpa kredensial.
 
+**Status.** Halaman Status hanya membaca file teks kernel di `/proc` dan
+`/sys` serta memanggil dua operasi baca Admin API; tidak ada perintah shell,
+tidak ada `systemctl`, tidak ada akses `/dev`, dan tidak ada hak tambahan di
+unit systemd. Nama proses dan mount dari kernel dirender lewat
+`html/template` seperti nilai lainnya.
+
 **File manager.** Ganti nama tidak bisa memperkenalkan ekstensi di luar
 whitelist (menghindari `.jpg` → `.html` yang lalu dilayani web endpoint).
 Operasi massal dibatasi 1000 objek per request; operasi folder dijalankan
@@ -1650,11 +1703,13 @@ tokennya baru diubah. Uji tokennya langsung:
 
 **Sebagian halaman jalan, satu operasi menjawab 403** — kalau kamu memakai token
 ber-scope (Pilihan B di [Langkah 0c](#langkah-0--periksa-garage-dan-caddy)),
-scope-nya kurang. Panel memakai delapan operasi:
-`GetClusterHealth`, `ListBuckets`, `GetBucketInfo`, `CreateBucket`,
-`DeleteBucket`, `UpdateBucket`, `CreateKey`, `AllowBucketKey`. Buat ulang
-tokennya dengan daftar lengkap itu. Gejala yang sama muncul kalau token
-ber-`--expires-in` sudah kedaluwarsa.
+scope-nya kurang. Panel memakai sembilan operasi:
+`GetClusterHealth`, `GetClusterStatus`, `ListBuckets`, `GetBucketInfo`,
+`CreateBucket`, `DeleteBucket`, `UpdateBucket`, `CreateKey`,
+`AllowBucketKey`. Buat ulang tokennya dengan daftar lengkap itu. Gejala yang
+sama muncul kalau token ber-`--expires-in` sudah kedaluwarsa. Khusus
+`GetClusterStatus` (halaman Status, daftar node Garage): tanpa scope itu
+halaman Status tetap tampil dan menyebutkan scope yang kurang.
 
 **Caddy menolak reload karena pola `import` tidak cocok** — `/etc/caddy/sites`
 masih kosong. Isi placeholder:
@@ -1873,6 +1928,8 @@ sync.go               iterator listing terurut, merge-join, penulis chunk
 jobs.go               job: state di disk, siklus hidup, resume saat start, shutdown
 schedules.go          jadwal berulang (schedules.json), ticker 30 detik, riwayat run
 sync_http.go          halaman Sync, jobs.json, handler remote, job, dan jadwal
+sysinfo.go            pembaca /proc dan /sys untuk halaman Status (CPU, memori, disk, I/O, jaringan, suhu, proses)
+status_http.go        halaman Status, status.json, kesehatan dan node cluster Garage
 auth.go               hash password, session, pembatas percobaan login
 validate.go           semua validasi input
 templates/            *.html, di-embed dengan //go:embed

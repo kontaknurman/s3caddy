@@ -316,6 +316,42 @@ details.editor[open] > summary .btn { border-color: var(--accent); color: var(--
 .tab .cnt { margin-left: 3px; font-variant-numeric: tabular-nums; opacity: .8; }
 .sched-table td { vertical-align: top; }
 
+/* --- halaman Status --- */
+.status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 20px; }
+.status-grid > .card { margin-bottom: 0; min-width: 0; }
+.status-grid + .status-grid, .status-grid + .card { margin-top: 20px; }
+.big { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.big.ok { color: var(--ok); }
+.big.warn { color: var(--warn); }
+.big.bad { color: var(--err); }
+.meter { height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin: 8px 0; }
+.meter.mini { height: 5px; margin: 3px 0; }
+.meter-fill { height: 100%; width: 0; background: var(--ok); transition: width .4s; }
+.meter-fill.warn { background: var(--warn); }
+.meter-fill.bad { background: var(--err); }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 13px; margin: 0; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; font-variant-numeric: tabular-nums; word-break: break-word; }
+.cores { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px 10px; margin-top: 10px; }
+.core { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.core em { font-style: normal; color: var(--text); }
+.usage-row { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.usage-row:last-child { border-bottom: 0; }
+.usage-row .between { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+.usage-row .meter { margin: 5px 0 3px; }
+.lvl.ok { color: var(--ok); }
+.lvl.warn { color: var(--warn); }
+.lvl.bad { color: var(--err); }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--err); }
+.status-table td, .status-table th { white-space: nowrap; }
+.status-table td.wrap { white-space: normal; }
+.status-table .meter { width: 120px; margin: 4px 0 0; }
+.status-strip label.check { display: inline-flex; margin: 0; }
+.status-strip .strip-right { margin-left: auto; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+
 @media (max-width: 760px) {
   .flow { grid-template-columns: 1fr; }
   .flow-arrow { transform: rotate(90deg); }
@@ -337,6 +373,7 @@ details.editor[open] > summary .btn { border-color: var(--accent); color: var(--
     <a href="/objects" {{if eq .Page "objects"}}class="active"{{end}}>Objek</a>
     <a href="/sync" {{if eq .Page "sync"}}class="active"{{end}}>Sync</a>
     <a href="/whitelist" {{if eq .Page "whitelist"}}class="active"{{end}}>IP Whitelist</a>
+    <a href="/status" {{if eq .Page "status"}}class="active"{{end}}>Status</a>
   </nav>
   {{end}}
   {{if .User}}

@@ -338,8 +338,73 @@ func (g *Garage) GetKeyInfo(ctx context.Context, accessKeyID string, showSecret 
 
 // Health checks that the Admin API answers and the token is accepted.
 func (g *Garage) Health(ctx context.Context) error {
-	var out map[string]any
-	return g.do(ctx, http.MethodGet, "GetClusterHealth", nil, nil, &out)
+	_, err := g.GetClusterHealth(ctx)
+	return err
+}
+
+// ClusterHealth is the answer of GetClusterHealth.
+type ClusterHealth struct {
+	Status           string `json:"status"` // healthy, degraded, unavailable
+	KnownNodes       int    `json:"knownNodes"`
+	ConnectedNodes   int    `json:"connectedNodes"`
+	StorageNodes     int    `json:"storageNodes"`
+	StorageNodesUp   int    `json:"storageNodesUp"`
+	Partitions       int    `json:"partitions"`
+	PartitionsQuorum int    `json:"partitionsQuorum"`
+	PartitionsAllOK  int    `json:"partitionsAllOk"`
+}
+
+// GetClusterHealth reports how the cluster is doing from this node's view.
+func (g *Garage) GetClusterHealth(ctx context.Context) (*ClusterHealth, error) {
+	var out ClusterHealth
+	if err := g.do(ctx, http.MethodGet, "GetClusterHealth", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ClusterStatus is the answer of GetClusterStatus: every node the cluster
+// knows, with the disks behind it.
+type ClusterStatus struct {
+	LayoutVersion int           `json:"layoutVersion"`
+	Nodes         []ClusterNode `json:"nodes"`
+}
+
+// ClusterNode is one node in ClusterStatus. Nullable strings decode to "".
+type ClusterNode struct {
+	ID                string          `json:"id"`
+	Hostname          string          `json:"hostname"`
+	Addr              string          `json:"addr"`
+	IsUp              bool            `json:"isUp"`
+	LastSeenSecsAgo   *int64          `json:"lastSeenSecsAgo"`
+	Draining          bool            `json:"draining"`
+	GarageVersion     string          `json:"garageVersion"`
+	Role              *NodeRole       `json:"role"`
+	DataPartition     *PartitionUsage `json:"dataPartition"`
+	MetadataPartition *PartitionUsage `json:"metadataPartition"`
+}
+
+// NodeRole is what the layout assigns to a node; nil for nodes outside it.
+type NodeRole struct {
+	Zone     string   `json:"zone"`
+	Capacity *int64   `json:"capacity"` // nil for gateway nodes
+	Tags     []string `json:"tags"`
+}
+
+// PartitionUsage is the free/total bytes of a node's data or metadata disk.
+type PartitionUsage struct {
+	Available int64 `json:"available"`
+	Total     int64 `json:"total"`
+}
+
+// GetClusterStatus lists the nodes. It needs its own scope on a restricted
+// admin token; the Status page says so when the call is refused.
+func (g *Garage) GetClusterStatus(ctx context.Context) (*ClusterStatus, error) {
+	var out ClusterStatus
+	if err := g.do(ctx, http.MethodGet, "GetClusterStatus", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // BucketDetails is a bucket plus the per-bucket statistics that ListBuckets

@@ -29,12 +29,13 @@ type fakeGarage struct {
 	calls   []string
 	allowed []string // access key ids passed to AllowBucketKey
 	failOps map[string]string
+	noScope map[string]bool   // operations the token is not allowed to call (403)
 	keys    map[string]string // access key id -> secret
 	nextID  int
 }
 
 func newFakeGarage() *fakeGarage {
-	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}, keys: map[string]string{}}
+	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}, noScope: map[string]bool{}, keys: map[string]string{}}
 }
 
 func (f *fakeGarage) addBucket(name string, objects, size int64, public bool) string {
@@ -92,10 +93,28 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 			fail(http.StatusInternalServerError, msg)
 			return
 		}
+		if f.noScope[op] {
+			fail(http.StatusForbidden, "Forbidden: token has no "+op+" scope")
+			return
+		}
 
 		switch op {
 		case "GetClusterHealth":
-			writeJSON(map[string]string{"status": "healthy"})
+			writeJSON(map[string]any{"status": "healthy", "knownNodes": 1, "connectedNodes": 1, "storageNodes": 1, "storageNodesUp": 1,
+				"partitions": 256, "partitionsQuorum": 256, "partitionsAllOk": 256})
+
+		case "GetClusterStatus":
+			writeJSON(map[string]any{"layoutVersion": 3, "nodes": []map[string]any{{
+				"id": "0123456789abcdef0123456789abcdef", "hostname": "node-a", "addr": "10.0.0.5:3901", "isUp": true,
+				"lastSeenSecsAgo": nil, "draining": false, "garageVersion": "v1.2.0",
+				"role":              map[string]any{"zone": "dc1", "capacity": int64(4 << 40), "tags": []string{"nvme"}},
+				"dataPartition":     map[string]any{"available": int64(1 << 40), "total": int64(4 << 40)},
+				"metadataPartition": map[string]any{"available": int64(90 << 30), "total": int64(100 << 30)},
+			}, {
+				"id": "fedcba9876543210fedcba9876543210", "hostname": "node-b", "addr": nil, "isUp": false,
+				"lastSeenSecsAgo": 3600, "draining": false, "garageVersion": nil, "role": nil,
+				"dataPartition": nil, "metadataPartition": nil,
+			}}})
 
 		case "ListBuckets":
 			out := []BucketListItem{}
