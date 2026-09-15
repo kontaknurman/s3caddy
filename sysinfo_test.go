@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -215,10 +216,15 @@ func TestSysMonitorReportsWhatItCannotRead(t *testing.T) {
 	if st.Memory.Pct != 50 || len(st.Disks) != 2 || len(st.Procs) != 2 {
 		t.Errorf("partial snapshot lost data: mem %+v disks %d procs %d", st.Memory, len(st.Disks), len(st.Procs))
 	}
-	// A mount whose statfs hangs is reported, not waited for.
+	// A mount whose statfs hangs is reported, not waited for, and is then
+	// left alone for a while instead of parking one goroutine per refresh.
+	// The abandoned statfs goroutine outlives the call, so the counter it
+	// bumps must be atomic for the race detector's sake.
 	slow := m.statfs
+	var rootCalls atomic.Int32
 	m.statfs = func(path string) (fsUsage, error) {
 		if path == "/" {
+			rootCalls.Add(1)
 			time.Sleep(statfsTimeout + 500*time.Millisecond)
 		}
 		return slow(path)
@@ -231,6 +237,17 @@ func TestSysMonitorReportsWhatItCannotRead(t *testing.T) {
 	}
 	if len(st.Disks) != 1 || !strings.Contains(strings.Join(st.Warnings, "\n"), "statfs /: tidak menjawab") {
 		t.Errorf("stuck mount: disks %+v warnings %v", st.Disks, st.Warnings)
+	}
+	*now = now.Add(5 * time.Second)
+	st = m.Snapshot()
+	if rootCalls.Load() != 1 || !strings.Contains(strings.Join(st.Warnings, "\n"), "dicoba lagi") {
+		t.Errorf("stuck mount retried too soon: %d calls, warnings %v", rootCalls.Load(), st.Warnings)
+	}
+	*now = now.Add(stuckMountRetry)
+	m.statfs = slow
+	st = m.Snapshot()
+	if len(st.Disks) != 2 {
+		t.Errorf("mount not retried after %v: disks %+v warnings %v", stuckMountRetry, st.Disks, st.Warnings)
 	}
 }
 

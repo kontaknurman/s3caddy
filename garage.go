@@ -338,8 +338,8 @@ func (g *Garage) GetKeyInfo(ctx context.Context, accessKeyID string, showSecret 
 
 // Health checks that the Admin API answers and the token is accepted.
 func (g *Garage) Health(ctx context.Context) error {
-	_, err := g.GetClusterHealth(ctx)
-	return err
+	var out map[string]any
+	return g.do(ctx, http.MethodGet, "GetClusterHealth", nil, nil, &out)
 }
 
 // ClusterHealth is the answer of GetClusterHealth.

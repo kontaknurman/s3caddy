@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -133,5 +134,48 @@ func TestBuildStatusViewLevels(t *testing.T) {
 	}
 	if v.Host.UptimeH != "1 hari 2 jam" || v.Interval != "5 detik" {
 		t.Errorf("host/interval = %+v %q", v.Host, v.Interval)
+	}
+}
+
+// The Status page is a read-only add-on: it needs the same login as every
+// other page, answers nothing but GET, and touches no state.
+func TestStatusPageIsReadOnlyAndBehindLogin(t *testing.T) {
+	p := newTestPanel(t, withLogin(t))
+	p.useFixtureMonitor(t)
+	for _, path := range []string{"/status", "/status.json"} {
+		resp, _ := p.get(t, path)
+		if resp.StatusCode != http.StatusSeeOther || !strings.HasPrefix(resp.Header.Get("Location"), "/login") {
+			t.Errorf("%s without login: %d %q", path, resp.StatusCode, resp.Header.Get("Location"))
+		}
+	}
+	p.login(t, "admin", testPassword)
+	before := len(p.garage.callLog())
+	for _, path := range []string{"/status", "/status.json"} {
+		resp, err := p.client.PostForm(p.srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			t.Errorf("POST %s answered 200; the page must not accept writes", path)
+		}
+	}
+	if got := p.garage.callLog()[before:]; len(got) != 0 {
+		t.Errorf("rejected POSTs still reached Garage: %v", got)
+	}
+	// A page view only reads: two Admin API calls, nothing else.
+	resp, _ := p.get(t, "/status")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := p.garage.callLog()[before:]; strings.Join(got, ",") != "GetClusterHealth,GetClusterStatus" {
+		t.Errorf("status page calls = %v, want only the two read operations", got)
+	}
+	if entries, _ := os.ReadDir(p.app.cfg.StateDir); len(entries) != 0 {
+		for _, e := range entries {
+			if e.Name() != "cache" && e.Name() != "jobs" {
+				t.Errorf("status page wrote %s into STATE_DIR", e.Name())
+			}
+		}
 	}
 }

@@ -217,7 +217,14 @@ type sysMonitor struct {
 	prev *sysSample
 	// hostCache holds the parts that never change while the panel runs.
 	hostCache *HostInfo
+	// stuck remembers mounts whose statfs timed out, and until when they
+	// are left alone, so a hung NFS share costs one blocked goroutine per
+	// stuckMountRetry rather than one per page refresh.
+	stuck map[string]time.Time
 }
+
+// stuckMountRetry is how long a mount that did not answer is skipped.
+const stuckMountRetry = 5 * time.Minute
 
 func newSysMonitor() *sysMonitor {
 	return &sysMonitor{
@@ -889,15 +896,21 @@ func (m *sysMonitor) readDisks(warnings []string) ([]DiskInfo, []string) {
 		return nil, append(warnings, fmt.Sprintf("/proc/mounts tidak bisa dibaca: %v", err))
 	}
 	var out []DiskInfo
+	now := m.now()
 	for _, mnt := range parseMounts(text) {
 		if len(out) >= sysMaxDisks {
 			break
+		}
+		if until, ok := m.stuck[mnt.mount]; ok && now.Before(until) {
+			warnings = append(warnings, fmt.Sprintf("statfs %s: tidak menjawab (mount macet?); dicoba lagi %s", mnt.mount, humanDuration(until.Sub(now))))
+			continue
 		}
 		u, err := m.statfsTimeout(mnt.mount)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("statfs %s: %v", mnt.mount, err))
 			continue
 		}
+		delete(m.stuck, mnt.mount)
 		d := DiskInfo{Mount: mnt.mount, Device: mnt.device, FSType: mnt.fstype, Total: u.Total, Used: u.Total - u.Free, Avail: u.Avail, InodesPct: -1}
 		d.Pct = pct(d.Used, d.Used+d.Avail)
 		if u.Inodes > 0 {
@@ -925,6 +938,10 @@ func (m *sysMonitor) statfsTimeout(path string) (fsUsage, error) {
 	case r := <-ch:
 		return r.u, r.err
 	case <-time.After(statfsTimeout):
+		if m.stuck == nil {
+			m.stuck = map[string]time.Time{}
+		}
+		m.stuck[path] = m.now().Add(stuckMountRetry)
 		return fsUsage{}, errors.New("tidak menjawab (mount macet?)")
 	}
 }
