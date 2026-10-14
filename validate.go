@@ -56,7 +56,18 @@ var (
 	jobIDRe = regexp.MustCompile(`^[0-9a-f]{16}$`)
 	// One DNS label.
 	dnsLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	// SSH login names, as useradd accepts them (uppercase too, which some
+	// distributions allow).
+	sshUserRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
 )
+
+// sftpSystemTop are top-level folders an SFTP job may never touch: system
+// files, kernel pseudo-filesystems, and the boot loader.
+var sftpSystemTop = map[string]bool{
+	"etc": true, "boot": true, "bin": true, "sbin": true, "lib": true, "lib32": true,
+	"lib64": true, "libx32": true, "usr": true, "proc": true, "sys": true, "dev": true,
+	"run": true, "snap": true,
+}
 
 // syncModes are the ways a sync job treats objects that already exist at the
 // destination.
@@ -402,6 +413,133 @@ func ValidateRemoteBucketName(s string) error {
 	}
 	if ipv4LikeRe.MatchString(s) {
 		return fmt.Errorf("nama bucket remote %q tidak boleh berbentuk alamat IP", s)
+	}
+	return nil
+}
+
+// ValidateSSHHost checks the server of an SFTP remote and returns it
+// normalised: an IP literal, or a DNS name in lowercase. Link-local and
+// unspecified addresses are refused like for S3 endpoints; loopback stays
+// allowed, so a folder on the panel's own server can be imported.
+func ValidateSSHHost(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = s[1 : len(s)-1]
+	}
+	if s == "" {
+		return "", errors.New("host tidak boleh kosong")
+	}
+	if strings.Contains(s, "@") {
+		return "", errors.New("host tidak boleh memuat user@ — user diisi di kolomnya sendiri")
+	}
+	if strings.Contains(s, "://") {
+		return "", errors.New("host diisi nama atau IP saja, tanpa sftp:// atau ssh://")
+	}
+	if ip := net.ParseIP(s); ip != nil {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+			return "", fmt.Errorf("alamat %s tidak boleh dipakai sebagai host", s)
+		}
+		return ip.String(), nil
+	}
+	if strings.Contains(s, ":") {
+		return "", errors.New("port diisi di kolomnya sendiri, bukan di host")
+	}
+	host := strings.ToLower(s)
+	if len(host) > 253 {
+		return "", errors.New("host terlalu panjang")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !dnsLabelRe.MatchString(label) {
+			return "", fmt.Errorf("host %q bukan nama DNS atau alamat IP yang valid", s)
+		}
+	}
+	return host, nil
+}
+
+// ValidateSSHPort checks an SSH port.
+func ValidateSSHPort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port %d tidak valid (1–65535; SSH biasanya 22)", port)
+	}
+	return nil
+}
+
+// ValidateSSHUser checks an SSH login name.
+func ValidateSSHUser(s string) error {
+	if s == "" {
+		return errors.New("user SSH tidak boleh kosong")
+	}
+	if !sshUserRe.MatchString(s) {
+		return fmt.Errorf("user SSH %q tidak valid: huruf, angka, titik, garis bawah, dan tanda hubung", s)
+	}
+	return nil
+}
+
+// NormalizeSFTPFolder turns an absolute folder typed by the user
+// ("/var/www/uploads", with or without trailing slash) into the form a job
+// stores: no leading slash, one trailing slash ("var/www/uploads/"). The
+// folder rules of ValidateSFTPFolder apply.
+func NormalizeSFTPFolder(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", errors.New("folder di VPS tidak boleh kosong")
+	}
+	if !strings.HasPrefix(s, "/") {
+		return "", fmt.Errorf("folder %q harus path absolut yang diawali \"/\", contoh /var/www/uploads", s)
+	}
+	trimmed := strings.Trim(s, "/")
+	if trimmed == "" {
+		return "", errors.New("folder tidak boleh \"/\": pilih folder data, misalnya /var/www/uploads")
+	}
+	for _, seg := range strings.Split(trimmed, "/") {
+		if seg == "" {
+			return "", fmt.Errorf("folder %q mengandung \"//\"", s)
+		}
+	}
+	prefix := trimmed + "/"
+	if err := ValidateSFTPFolder(prefix); err != nil {
+		return "", err
+	}
+	return prefix, nil
+}
+
+// ValidateSFTPFolder checks a stored SFTP folder ("var/www/uploads/"). Jobs
+// run with the SSH user's rights — often root — and copy whole trees in both
+// directions, so folders holding the system, kernel pseudo-files, service
+// state or SSH keys are refused: an export there could overwrite system
+// files or plant an authorized_keys, an import could copy secrets into a
+// bucket.
+func ValidateSFTPFolder(prefix string) error {
+	if prefix == "" {
+		return errors.New("folder tidak boleh \"/\": pilih folder data, misalnya /var/www/uploads")
+	}
+	if !strings.HasSuffix(prefix, "/") || strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("folder %q tidak dalam bentuk yang disimpan panel", prefix)
+	}
+	if err := ValidateJobPrefix(prefix); err != nil {
+		return fmt.Errorf("folder: %w", err)
+	}
+	segs := strings.Split(strings.TrimSuffix(prefix, "/"), "/")
+	display := "/" + strings.Join(segs, "/")
+	for _, seg := range segs {
+		if seg == "" {
+			return fmt.Errorf("folder %s mengandung \"//\"", display)
+		}
+		if seg == ".ssh" || seg == ".gnupg" {
+			return fmt.Errorf("folder %s berisi kunci rahasia; panel tidak menyalin dari atau ke sana", display)
+		}
+	}
+	if sftpSystemTop[segs[0]] {
+		return fmt.Errorf("folder %s adalah folder sistem; panel tidak menyalin dari atau ke sana. Pakai folder data, misalnya /var/www/uploads atau /srv/data", display)
+	}
+	joined := strings.Join(segs, "/")
+	switch {
+	case joined == "root" || joined == "home" || joined == "var":
+		return fmt.Errorf("folder %s terlalu umum (memuat folder sistem atau kunci SSH); pilih subfoldernya, misalnya /%s/backup", display, joined)
+	case len(segs) == 2 && segs[0] == "home":
+		return fmt.Errorf("folder %s adalah home directory (memuat .ssh); pilih subfoldernya, misalnya %s/public_html", display, display)
+	case joined == "var/lib" || strings.HasPrefix(joined, "var/lib/") || joined == "var/spool" || strings.HasPrefix(joined, "var/spool/"):
+		return fmt.Errorf("folder %s berisi state layanan (database, cron, kredensial); panel tidak menyalin dari atau ke sana", display)
 	}
 	return nil
 }

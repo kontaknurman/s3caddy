@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,6 +52,33 @@ func TestManualServe(t *testing.T) {
 
 	info := fmt.Sprintf("PANEL=%s\nGARAGE_ADMIN_URL=%s\nGARAGE_S3_URL=%s\nGARAGE_WEB_URL=%s\nREMOTE_URL=%s\nSITES_DIR=%s\nSTATE_DIR=%s\nRCLONE=%s\n",
 		p.srv.URL, p.app.cfg.AdminURL, p.app.cfg.S3URL, p.app.cfg.WebURL, p.remote.URL(), p.sitesDir, p.app.cfg.StateDir, rclone)
+	// With a real rclone, also a VPS to add as an SFTP remote: `rclone serve
+	// sftp` over a folder tree, user u with the test password.
+	if rclone != "" {
+		dir := t.TempDir()
+		root := filepath.Join(dir, "root")
+		hostPriv, hostPub, err := generateSFTPKey("manual-host")
+		if err != nil {
+			t.Fatal(err)
+		}
+		hostKeyFile := filepath.Join(dir, "ssh_host_ed25519_key")
+		authorized := filepath.Join(dir, "authorized_keys")
+		if err := os.WriteFile(hostKeyFile, []byte(hostPriv), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(authorized, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		port := startRcloneSFTPServer(t, rclone, root, hostKeyFile, authorized, filepath.Join(dir, "cache"))
+		files := map[string]string{"index.html": "<h1>situs lama</h1>"}
+		for i := 0; i < 40; i++ {
+			files[fmt.Sprintf("komik-%02d/cover.txt", i%4)] = "cover"
+			files[fmt.Sprintf("komik-%02d/hal-%03d.txt", i%4, i)] = fmt.Sprintf("halaman %d", i)
+		}
+		writeTree(t, filepath.Join(root, "var/www/uploads"), files)
+		info += fmt.Sprintf("SFTP_HOST=127.0.0.1\nSFTP_PORT=%d\nSFTP_USER=u\nSFTP_PASSWORD=%s\nSFTP_ROOT=%s\nSFTP_HOST_KEY=%s\n",
+			port, testSFTPPassword, root, hostKeyFingerprint(strings.Join(strings.Fields(hostPub)[:2], " ")))
+	}
 	if err := os.WriteFile(urlFile, []byte(info), 0o600); err != nil {
 		t.Fatal(err)
 	}

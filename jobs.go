@@ -107,6 +107,8 @@ func (s JobStatus) Label() string {
 }
 
 // Endpoint is one side of a job. Remote "" means the panel's own Garage.
+// On an SFTP remote there is no bucket: Prefix is the folder, stored
+// without its leading slash ("var/www/uploads/" for /var/www/uploads).
 type Endpoint struct {
 	Remote string `json:"remote"`
 	Bucket string `json:"bucket"`
@@ -116,13 +118,48 @@ type Endpoint struct {
 // IsGarage reports whether the side is the panel's own Garage.
 func (e Endpoint) IsGarage() bool { return e.Remote == "" }
 
+// IsFolder reports whether the side is a folder on an SFTP remote.
+func (e Endpoint) IsFolder() bool { return e.Remote != "" && e.Bucket == "" }
+
+// empty is the unused destination of a delete job.
+func (e Endpoint) empty() bool { return e.Remote == "" && e.Bucket == "" }
+
 // String renders the side the way rclone would name it.
 func (e Endpoint) String() string {
+	if e.IsFolder() {
+		return e.Remote + ":/" + e.Prefix
+	}
 	name := e.Remote
 	if name == "" {
 		name = garageRemoteName
 	}
 	return name + ":" + e.Bucket + "/" + e.Prefix
+}
+
+// rclonePath is the path part rclone gets after "alias:".
+func (e Endpoint) rclonePath() string {
+	if e.IsFolder() {
+		return "/" + e.Prefix
+	}
+	return e.Bucket + "/" + e.Prefix
+}
+
+// conflicts reports whether two sides would step on each other: the same
+// bucket, or nested folders on the same server.
+func (e Endpoint) conflicts(o Endpoint) bool {
+	if e.IsFolder() || o.IsFolder() {
+		return e.IsFolder() && o.IsFolder() && e.Remote == o.Remote &&
+			(strings.HasPrefix(e.Prefix, o.Prefix) || strings.HasPrefix(o.Prefix, e.Prefix))
+	}
+	return e.bucketKey() == o.bucketKey()
+}
+
+// conflictLabel names what is in use, for the refusal message.
+func (e Endpoint) conflictLabel() string {
+	if e.IsFolder() {
+		return "folder " + e.String()
+	}
+	return "bucket " + e.bucketKey()
 }
 
 // bucketKey identifies the bucket for conflict checks.
@@ -174,17 +211,20 @@ type JobState struct {
 	Status JobStatus `json:"status"`
 	// Checkpoint is the relative key of the last object whose chunk finished.
 	// Empty means "from the beginning".
-	Checkpoint    string      `json:"checkpoint"`
-	Counters      JobCounters `json:"counters"`
-	Speed         float64     `json:"speed"`
-	PauseReason   string      `json:"pauseReason"`
-	Error         string      `json:"error"`
-	LastLog       []string    `json:"lastLog"`
-	Runs          int         `json:"runs"`
-	StartedAt     time.Time   `json:"startedAt"`
-	UpdatedAt     time.Time   `json:"updatedAt"`
-	FinishedAt    *time.Time  `json:"finishedAt"`
-	RcloneVersion string      `json:"rcloneVersion"`
+	Checkpoint string      `json:"checkpoint"`
+	Counters   JobCounters `json:"counters"`
+	Speed      float64     `json:"speed"`
+	// Phase says what a running job does before its first chunk, e.g. while
+	// a folder on an SFTP server is being listed and sorted.
+	Phase         string     `json:"phase,omitempty"`
+	PauseReason   string     `json:"pauseReason"`
+	Error         string     `json:"error"`
+	LastLog       []string   `json:"lastLog"`
+	Runs          int        `json:"runs"`
+	StartedAt     time.Time  `json:"startedAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+	FinishedAt    *time.Time `json:"finishedAt"`
+	RcloneVersion string     `json:"rcloneVersion"`
 }
 
 // FailedKey is one line of <job>/failed.jsonl.
@@ -306,6 +346,8 @@ func NewJobManager(dir string, garage Remote, remotes *RemoteStore, rclone *rclo
 			log.Printf("PERINGATAN: file job %s rusak dan diabaikan", name)
 			continue
 		}
+		// A phase line only describes a run in progress; nothing runs yet.
+		state.Phase = ""
 		m.jobs[id] = &jobHandle{state: state}
 	}
 	return m, nil
@@ -359,8 +401,15 @@ func validateEndpoint(e Endpoint, remotes *RemoteStore) error {
 		if err := ValidateRemoteName(e.Remote); err != nil {
 			return err
 		}
-		if _, ok := remotes.Get(e.Remote); !ok {
+		r, ok := remotes.Get(e.Remote)
+		if !ok {
 			return fmt.Errorf("remote %q tidak ada", e.Remote)
+		}
+		if r.IsSFTP() {
+			if e.Bucket != "" {
+				return fmt.Errorf("remote %s adalah VPS (SFTP): isi folder, bukan bucket", e.Remote)
+			}
+			return ValidateSFTPFolder(e.Prefix)
 		}
 		if err := ValidateRemoteBucketName(e.Bucket); err != nil {
 			return err
@@ -423,14 +472,23 @@ func (m *JobManager) Create(ctx context.Context, spec JobSpec) (JobState, error)
 	if err != nil {
 		return JobState{}, err
 	}
+	// Refuse a bucket or folder in use before the probes touch it (a write
+	// probe creates a missing SFTP folder). Checked again below, because
+	// another job may start while the probes run.
+	m.mu.Lock()
+	err = m.checkLimitsLocked(spec, "")
+	m.mu.Unlock()
+	if err != nil {
+		return JobState{}, err
+	}
 	// The source only has to be readable; the destination is also written
 	// to and deleted from, so a read-only key is found out here, not after
 	// a chunk of failed transfers.
-	if _, err := probeRemote(ctx, src, spec.Src.Bucket, spec.Kind == JobDeletePrefix || spec.Kind == JobMovePrefix); err != nil {
+	if err := m.probeSide(ctx, src, spec.Src, spec.Kind == JobDeletePrefix || spec.Kind == JobMovePrefix); err != nil {
 		return JobState{}, fmt.Errorf("sumber tidak bisa diakses: %w", err)
 	}
 	if spec.Kind != JobDeletePrefix {
-		if _, err := probeRemote(ctx, dst, spec.Dst.Bucket, true); err != nil {
+		if err := m.probeSide(ctx, dst, spec.Dst, true); err != nil {
 			return JobState{}, fmt.Errorf("tujuan tidak bisa diakses: %w", err)
 		}
 	}
@@ -465,8 +523,19 @@ func (m *JobManager) Create(ctx context.Context, spec JobSpec) (JobState, error)
 	return h.snapshot(), nil
 }
 
-// checkLimitsLocked refuses a job that would touch a bucket another unfinished
-// job uses, or that would exceed the running limit.
+// probeSide checks one side of a job before it is created: an S3 bucket with
+// the panel's own client, a folder on an SFTP server through rclone.
+func (m *JobManager) probeSide(ctx context.Context, r Remote, e Endpoint, write bool) error {
+	if r.IsSFTP() {
+		_, err := probeSFTP(ctx, m.rclone, r, e.Prefix, write)
+		return err
+	}
+	_, err := probeRemote(ctx, r, e.Bucket, write)
+	return err
+}
+
+// checkLimitsLocked refuses a job that would touch a bucket (or SFTP folder)
+// another unfinished job uses, or that would exceed the running limit.
 func (m *JobManager) checkLimitsLocked(spec JobSpec, exceptID string) error {
 	running := 0
 	for id, other := range m.jobs {
@@ -481,12 +550,12 @@ func (m *JobManager) checkLimitsLocked(spec JobSpec, exceptID string) error {
 			running++
 		}
 		for _, mine := range []Endpoint{spec.Src, spec.Dst} {
-			if mine.Bucket == "" {
+			if mine.empty() {
 				continue
 			}
 			for _, theirs := range []Endpoint{s.Src, s.Dst} {
-				if theirs.Bucket != "" && theirs.bucketKey() == mine.bucketKey() {
-					return fmt.Errorf("bucket %s sedang dipakai job %s (%s); tunggu sampai selesai atau batalkan dulu", mine.bucketKey(), s.ID, s.Status.Label())
+				if !theirs.empty() && mine.conflicts(theirs) {
+					return fmt.Errorf("%s sedang dipakai job %s (%s); tunggu sampai selesai atau batalkan dulu", mine.conflictLabel(), s.ID, s.Status.Label())
 				}
 			}
 		}
@@ -545,6 +614,7 @@ func (m *JobManager) finish(ctx context.Context, h *jobHandle, err error) {
 	}
 	status := h.state.Status
 	reason := h.state.PauseReason
+	h.state.Phase = ""
 	h.cancel = nil
 	h.live = rcloneStats{}
 	h.liveListed, h.liveSkipped = 0, 0
@@ -574,12 +644,15 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 	if err != nil {
 		return err
 	}
-	srcC, err := srcRemote.Client()
-	if err != nil {
-		return err
+	// The panel's own S3 client lists S3 sides; SFTP sides are listed by
+	// rclone below.
+	var srcC, dstC *S3
+	if !srcRemote.IsSFTP() {
+		if srcC, err = srcRemote.Client(); err != nil {
+			return err
+		}
 	}
-	var dstC *S3
-	if spec.Kind != JobDeletePrefix {
+	if spec.Kind != JobDeletePrefix && !dstRemote.IsSFTP() {
 		if dstC, err = dstRemote.Client(); err != nil {
 			return err
 		}
@@ -589,13 +662,13 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 	var srcSpec, dstSpec string
 	if spec.Kind == JobSync {
 		env = append(srcRemote.rcloneEnv("src"), dstRemote.rcloneEnv("dst")...)
-		srcSpec = "src:" + spec.Src.Bucket + "/" + spec.Src.Prefix
-		dstSpec = "dst:" + spec.Dst.Bucket + "/" + spec.Dst.Prefix
+		srcSpec = "src:" + spec.Src.rclonePath()
+		dstSpec = "dst:" + spec.Dst.rclonePath()
 	} else {
 		env = m.garage.rcloneEnv(garageRemoteName)
-		srcSpec = garageRemoteName + ":" + spec.Src.Bucket + "/" + spec.Src.Prefix
+		srcSpec = garageRemoteName + ":" + spec.Src.rclonePath()
 		if spec.Kind != JobDeletePrefix {
-			dstSpec = garageRemoteName + ":" + spec.Dst.Bucket + "/" + spec.Dst.Prefix
+			dstSpec = garageRemoteName + ":" + spec.Dst.rclonePath()
 		}
 	}
 
@@ -613,8 +686,13 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		}
 		return prefix + checkpoint
 	}
+	srcIt, closeSrc, err := m.openListing(ctx, h, "sumber", "src", srcRemote, spec.Src, srcC, startAfter(spec.Src.Prefix))
+	if err != nil {
+		return err
+	}
+	defer closeSrc()
 	builder := &chunkBuilder{
-		src:  newKeyIterator(srcC, "sumber", spec.Src.Bucket, spec.Src.Prefix, startAfter(spec.Src.Prefix)),
+		src:  srcIt,
 		mode: spec.Mode,
 		max:  m.chunkKeys,
 		onInvalid: func(key, reason string) {
@@ -624,8 +702,18 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		},
 	}
 	if spec.Kind == JobSync && spec.Mode != "overwrite" {
-		builder.dst = newKeyIterator(dstC, "tujuan", spec.Dst.Bucket, spec.Dst.Prefix, startAfter(spec.Dst.Prefix))
+		dstIt, closeDst, err := m.openListing(ctx, h, "tujuan", "dst", dstRemote, spec.Dst, dstC, startAfter(spec.Dst.Prefix))
+		if err != nil {
+			return err
+		}
+		defer closeDst()
+		builder.dst = dstIt
 	}
+	// rclone's -M carries S3 metadata between S3 providers. A file system has
+	// none worth carrying (and would hand over owner ids and modes as
+	// x-amz-meta-*); rclone still sets Content-Type from the file name.
+	noMetadata := srcRemote.IsSFTP() || dstRemote.IsSFTP()
+	secrets := []string{srcRemote.SecretKey, dstRemote.SecretKey, srcRemote.Password, dstRemote.Password}
 
 	for {
 		if ctx.Err() != nil {
@@ -646,12 +734,13 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 
 		if res.Keys > 0 {
 			code, last, err := m.rclone.run(ctx, rcloneRun{
-				Verb:      spec.Kind.rcloneVerb(),
-				ChunkPath: chunkPath,
-				Src:       srcSpec,
-				Dst:       dstSpec,
-				Env:       env,
-				Transfers: spec.Transfers,
+				Verb:       spec.Kind.rcloneVerb(),
+				ChunkPath:  chunkPath,
+				Src:        srcSpec,
+				Dst:        dstSpec,
+				Env:        env,
+				Transfers:  spec.Transfers,
+				NoMetadata: noMetadata,
 			}, h.onRcloneEvent(spec.Src.Prefix, m.now))
 			if err != nil {
 				if ctx.Err() != nil {
@@ -661,7 +750,7 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 			}
 
 			h.mu.Lock()
-			h.state.LastLog = redactAll(last, srcRemote.SecretKey, dstRemote.SecretKey)
+			h.state.LastLog = redactAll(last, secrets...)
 			live := h.live
 			failedNow := h.chunkFailed
 			h.live = rcloneStats{}
@@ -700,7 +789,9 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 			h.mu.Unlock()
 		}
 
-		if len(res.Markers) > 0 {
+		// Folder markers are S3 objects; on a file system a folder exists as
+		// soon as a file is written into it, and an empty one is not kept.
+		if len(res.Markers) > 0 && !dstRemote.IsSFTP() {
 			m.handleMarkers(ctx, spec, res.Markers, srcC, dstC, h)
 		}
 
@@ -755,6 +846,58 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		}
 	}
 	return ctx.Err()
+}
+
+// openListing prepares one side of the merge-join. An S3 side is listed page
+// by page as the job goes. A folder on an SFTP server is listed completely
+// first and sorted on disk; the job's phase line shows the progress, and the
+// files are removed when the run ends. A destination folder that does not
+// exist yet is simply empty.
+func (m *JobManager) openListing(ctx context.Context, h *jobHandle, side, alias string, r Remote, e Endpoint, c *S3, startAfter string) (listing, func(), error) {
+	if !r.IsSFTP() {
+		return newKeyIterator(c, side, e.Bucket, e.Prefix, startAfter), func() {}, nil
+	}
+	dir := m.jobDir(h.snapshot().ID)
+	w := newSortedListingWriter(dir, "listing-"+alias)
+	h.setPhase(fmt.Sprintf("mendaftar isi %s …", e))
+	code, lines, err := m.rclone.listFiles(ctx, r.rcloneEnv(alias), alias+":"+e.rclonePath(), func(rel string, size int64) error {
+		if err := w.add(rel, size); err != nil {
+			return err
+		}
+		if w.count%listingProgressEvery == 0 {
+			h.setPhase(fmt.Sprintf("mendaftar isi %s: %d file …", e, w.count))
+		}
+		return nil
+	})
+	if err == nil && code != 0 && !(code == 3 && side == "tujuan") {
+		err = sftpError(r, "listing "+side+" "+e.String()+" gagal (exit "+fmt.Sprint(code)+")", redactAll(lines, r.Password))
+	}
+	if err != nil {
+		w.removeRuns()
+		h.setPhase("")
+		return nil, nil, err
+	}
+	h.setPhase(fmt.Sprintf("mengurutkan %d file dari %s …", w.count, e))
+	sorted, err := w.finish()
+	if err != nil {
+		h.setPhase("")
+		return nil, nil, err
+	}
+	it, err := openFileIterator(sorted, e.Prefix, startAfter)
+	if err != nil {
+		os.Remove(sorted)
+		h.setPhase("")
+		return nil, nil, err
+	}
+	h.setPhase("")
+	return it, func() { it.Close(); os.Remove(sorted) }, nil
+}
+
+// setPhase updates the job's "what am I doing" line.
+func (h *jobHandle) setPhase(s string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.state.Phase = s
 }
 
 // handleMarkers deals with the zero-byte "folder/" objects rclone is not

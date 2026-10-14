@@ -315,6 +315,17 @@ details.editor[open] > summary .btn { border-color: var(--accent); color: var(--
 .tab.active { background: var(--panel-2); color: var(--text); border-color: #3c4759; }
 .tab .cnt { margin-left: 3px; font-variant-numeric: tabular-nums; opacity: .8; }
 .sched-table td { vertical-align: top; }
+fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
+.flow fieldset.plain { background: transparent; }
+textarea {
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 8px 11px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); width: 100%; resize: vertical; min-width: 0;
+}
+textarea:focus { outline: 2px solid rgba(90,169,255,.45); outline-offset: 1px; }
+.keybox { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.keybox pre { margin: 0; white-space: pre-wrap; word-break: break-all; font-size: 12px; width: 100%; }
+.job-phase { color: var(--accent); margin-top: 4px; }
+.job-phase:empty { display: none; }
 
 /* --- halaman Status --- */
 .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 20px; }

@@ -126,6 +126,8 @@ type rcloneRun struct {
 	Dst       string // "dst:bucket/prefix/", empty for delete
 	Env       []string
 	Transfers int
+	// NoMetadata leaves out -M (an SFTP side has no S3 metadata to carry).
+	NoMetadata bool
 }
 
 // args renders the command line. Credentials are not in it.
@@ -149,13 +151,15 @@ func (r *rcloneRunner) args(spec rcloneRun) []string {
 		"--config", "",
 	}
 	if spec.Verb != "delete" {
-		args = append(args,
-			// The panel already decided which keys need copying, so rclone
-			// must not spend a request per object on checking the target.
-			"--no-check-dest",
+		// The panel already decided which keys need copying, so rclone must
+		// not spend a request per object on checking the target.
+		args = append(args, "--no-check-dest")
+		if !spec.NoMetadata {
 			// Carry Content-Type, Cache-Control, Content-Disposition and
 			// x-amz-meta-* across providers.
-			"-M",
+			args = append(args, "-M")
+		}
+		args = append(args,
 			// Anything above 8 MiB goes multipart in 8 MiB parts, two at a
 			// time per transfer, so no object is ever buffered whole:
 			// memory = transfers × 2 × 8 MiB.

@@ -86,7 +86,7 @@ func (a *App) jobViews() []jobView {
 
 func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
-		"Title":        "Sync dengan S3 lain",
+		"Title":        "Sync dengan S3 lain atau VPS",
 		"Page":         "sync",
 		"Providers":    providers,
 		"MaxTransfers": MaxTransfers,
@@ -161,8 +161,138 @@ func remoteFromForm(r *http.Request) Remote {
 	}
 }
 
+// sftpRemoteFromForm reads the SFTP add/edit form. It resolves what the form
+// leaves to the panel: a blank password or key on edit keeps the stored one,
+// "kunci SSH" with no key pasted makes the panel generate a key pair, and the
+// server's host keys are pasted by the operator or fetched now (trust on
+// first use). notes are told to the operator after saving.
+func sftpRemoteFromForm(ctx context.Context, r *http.Request, old *Remote) (Remote, []string, error) {
+	rem := Remote{
+		Type: RemoteTypeSFTP,
+		Name: strings.TrimSpace(r.PostFormValue("name")),
+		User: strings.TrimSpace(r.PostFormValue("user")),
+		Port: sftpDefaultPort,
+	}
+	if old != nil {
+		rem.Name = old.Name
+	}
+	if err := ValidateRemoteName(rem.Name); err != nil {
+		return rem, nil, err
+	}
+	host, err := ValidateSSHHost(r.PostFormValue("host"))
+	if err != nil {
+		return rem, nil, err
+	}
+	rem.Host = host
+	if p := strings.TrimSpace(r.PostFormValue("port")); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return rem, nil, fmt.Errorf("port %q harus angka", p)
+		}
+		rem.Port = n
+	}
+	if err := ValidateSSHPort(rem.Port); err != nil {
+		return rem, nil, err
+	}
+	if err := ValidateSSHUser(rem.User); err != nil {
+		return rem, nil, err
+	}
+
+	var notes []string
+	switch r.PostFormValue("auth") {
+	case "key":
+		pasted := strings.TrimSpace(r.PostFormValue("private_key"))
+		switch {
+		case pasted != "":
+			key, err := validatePrivateKey(pasted)
+			if err != nil {
+				return rem, nil, err
+			}
+			rem.PrivateKey = key
+		case old != nil && old.PrivateKey != "" && r.PostFormValue("new_key") != "1":
+			rem.PrivateKey, rem.PublicKey = old.PrivateKey, old.PublicKey
+		default:
+			priv, pub, err := generateSFTPKey(sftpKeyComment(rem.Name))
+			if err != nil {
+				return rem, nil, err
+			}
+			rem.PrivateKey, rem.PublicKey = priv, pub
+			notes = append(notes, "Panel membuat kunci SSH baru untuk remote ini. Pasang kunci publiknya di VPS dengan perintah di kartu remote (jalankan sebagai user "+rem.User+"), lalu klik Tes koneksi.")
+		}
+	case "password":
+		pw := strings.Trim(r.PostFormValue("password"), "\r\n")
+		if pw == "" && old != nil && old.Password != "" {
+			pw = old.Password
+		}
+		if pw == "" {
+			return rem, nil, errors.New("password harus diisi")
+		}
+		rem.Password = pw
+	default:
+		return rem, nil, errors.New("pilih cara login: password atau kunci SSH")
+	}
+
+	sameServer := old != nil && old.Host == rem.Host && old.Port == rem.Port
+	switch pasted := strings.TrimSpace(r.PostFormValue("host_keys")); {
+	case pasted != "":
+		keys, err := parseHostKeys(pasted)
+		if err != nil {
+			return rem, nil, err
+		}
+		if len(keys) == 0 {
+			return rem, nil, errors.New("tidak ada host key di kolom host key")
+		}
+		rem.HostKeys, rem.HostKeysAt = keys, time.Now().UTC().Truncate(time.Second)
+		notes = append(notes, "Host key yang ditempel disematkan: "+fingerprintList(keys)+".")
+	case sameServer && len(old.HostKeys) > 0 && r.PostFormValue("refresh_hostkey") != "1":
+		rem.HostKeys, rem.HostKeysAt = old.HostKeys, old.HostKeysAt
+	default:
+		fetchCtx, cancel := context.WithTimeout(ctx, 50*time.Second)
+		keys, err := fetchHostKeys(fetchCtx, rem.Host, rem.Port)
+		cancel()
+		switch {
+		case err == nil:
+			rem.HostKeys, rem.HostKeysAt = keys, time.Now().UTC().Truncate(time.Second)
+			notes = append(notes, "Host key server disematkan: "+fingerprintList(keys)+". Cocokkan dengan hasil `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` di VPS; mulai sekarang server lain yang mengaku sebagai VPS ini ditolak.")
+		case sameServer && len(old.HostKeys) > 0:
+			rem.HostKeys, rem.HostKeysAt = old.HostKeys, old.HostKeysAt
+			notes = append(notes, "Host key baru tidak bisa diambil ("+firstLine(err.Error())+"); host key lama tetap dipakai.")
+		default:
+			notes = append(notes, "Host key server belum bisa diambil: "+firstLine(err.Error())+". Remote tetap disimpan, tapi belum bisa dipakai sampai Tes koneksi berhasil mengambilnya (atau tempel host key lewat Edit).")
+		}
+	}
+	return rem, notes, nil
+}
+
+// fingerprintList renders pinned keys the way ssh-keygen -lf does.
+func fingerprintList(keys []string) string {
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, hostKeyLabel(k)+" "+hostKeyFingerprint(k))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func (a *App) handleRemoteAdd(w http.ResponseWriter, r *http.Request) {
 	if !a.syncGuard(w, r) {
+		return
+	}
+	if r.PostFormValue("type") == RemoteTypeSFTP {
+		remote, notes, err := sftpRemoteFromForm(r.Context(), r, nil)
+		if err == nil {
+			err = a.remotes.Add(remote)
+		}
+		if err != nil {
+			a.redirectErr(w, r, "/sync", fmt.Errorf("remote tidak disimpan: %w", err))
+			return
+		}
+		log.Printf("remote %q ditambahkan (sftp %s@%s)", remote.Name, remote.User, sshHostPort(remote.Host, remote.Port))
+		msg := fmt.Sprintf("Remote %q (VPS %s) disimpan di %s (mode 0600).", remote.Name, sshHostPort(remote.Host, remote.Port), filepath.Join(a.cfg.StateDir, remotesFileName))
+		if len(notes) > 0 {
+			msg += "\n" + strings.Join(notes, "\n")
+		}
+		msg += "\nKlik \"Tes koneksi\" dengan folder di VPS untuk memastikan login dan izin foldernya benar."
+		a.redirectOK(w, r, "/sync", msg)
 		return
 	}
 	remote := remoteFromForm(r)
@@ -189,6 +319,29 @@ func (a *App) handleRemoteUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.jobs.UsesRemote(name) {
 		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q sedang dipakai job yang belum selesai; jeda atau batalkan job itu dulu sebelum mengubah kredensialnya", name))
+		return
+	}
+	old, ok := a.remotes.Get(name)
+	if !ok {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q tidak ada", name))
+		return
+	}
+	if old.IsSFTP() {
+		remote, notes, err := sftpRemoteFromForm(r.Context(), r, &old)
+		if err == nil {
+			err = a.remotes.Update(name, remote)
+		}
+		if err != nil {
+			a.redirectErr(w, r, "/sync", fmt.Errorf("remote tidak diubah: %w", err))
+			return
+		}
+		log.Printf("remote %q diubah (sftp %s@%s)", name, remote.User, sshHostPort(remote.Host, remote.Port))
+		msg := fmt.Sprintf("Remote %q diperbarui.", name)
+		if len(notes) > 0 {
+			msg += "\n" + strings.Join(notes, "\n")
+		}
+		msg += "\nJalankan \"Tes koneksi\" lagi untuk memastikan setelan barunya bekerja."
+		a.redirectOK(w, r, "/sync", msg)
 		return
 	}
 	remote := remoteFromForm(r)
@@ -236,6 +389,10 @@ func (a *App) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 		a.redirectErr(w, r, "/sync", err)
 		return
 	}
+	if rem, ok := a.remotes.Get(name); ok && rem.IsSFTP() {
+		a.sftpTest(w, r, name, strings.TrimSpace(r.PostFormValue("path")), write)
+		return
+	}
 	report, err := a.remotes.Probe(r.Context(), name, bucket, write)
 	if err != nil {
 		msg := fmt.Errorf("tes koneksi gagal: %w", err)
@@ -257,8 +414,29 @@ func (a *App) handleRemoteTest(w http.ResponseWriter, r *http.Request) {
 	a.redirectOK(w, r, "/sync", msg)
 }
 
-// syncSpecFromForm reads the shared job/schedule form.
-func syncSpecFromForm(r *http.Request) (JobSpec, error) {
+// sftpTest is "Tes koneksi" for an SFTP remote: pin the host key if needed,
+// list the folder, and write + delete a test file.
+func (a *App) sftpTest(w http.ResponseWriter, r *http.Request, name, folder string, write bool) {
+	report, err := a.remotes.Probe(r.Context(), name, folder, write)
+	pinned := ""
+	if len(report.PinnedKeys) > 0 {
+		pinned = "\nHost key server disematkan: " + fingerprintList(report.PinnedKeys) + ". Cocokkan dengan `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` di VPS."
+	}
+	if err != nil {
+		a.redirectErr(w, r, "/sync", fmt.Errorf("tes koneksi gagal: %w%s", err, pinned))
+		return
+	}
+	msg := fmt.Sprintf("Remote %q bisa login dan membaca folder %s", name, folder)
+	if write {
+		msg += "; menulis dan menghapus file uji juga berhasil"
+	}
+	msg += ". Login, host key, dan izin foldernya benar." + pinned
+	a.redirectOK(w, r, "/sync", msg)
+}
+
+// syncSpecFromForm reads the shared job/schedule form. On an SFTP remote the
+// remote side is a folder ("remote_path"), not a bucket and prefix.
+func syncSpecFromForm(r *http.Request, lookup func(string) (Remote, bool)) (JobSpec, error) {
 	transfers, err := strconv.Atoi(strings.TrimSpace(r.PostFormValue("transfers")))
 	if err != nil {
 		return JobSpec{}, errors.New("jumlah transfer paralel harus angka")
@@ -267,6 +445,13 @@ func syncSpecFromForm(r *http.Request) (JobSpec, error) {
 		Remote: strings.TrimSpace(r.PostFormValue("remote")),
 		Bucket: strings.TrimSpace(r.PostFormValue("remote_bucket")),
 		Prefix: folderPrefix(r.PostFormValue("remote_prefix")),
+	}
+	if rem, ok := lookup(remoteSide.Remote); ok && rem.IsSFTP() {
+		folder, err := NormalizeSFTPFolder(r.PostFormValue("remote_path"))
+		if err != nil {
+			return JobSpec{}, err
+		}
+		remoteSide.Bucket, remoteSide.Prefix = "", folder
 	}
 	garageSide := Endpoint{
 		Bucket: strings.TrimSpace(r.PostFormValue("garage_bucket")),
@@ -288,7 +473,7 @@ func (a *App) handleJobCreate(w http.ResponseWriter, r *http.Request) {
 	if !a.syncGuard(w, r) {
 		return
 	}
-	spec, err := syncSpecFromForm(r)
+	spec, err := syncSpecFromForm(r, a.remotes.Get)
 	if err != nil {
 		a.redirectErr(w, r, "/sync", err)
 		return
@@ -340,7 +525,7 @@ func (a *App) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 	if !a.syncGuard(w, r) {
 		return
 	}
-	spec, err := syncSpecFromForm(r)
+	spec, err := syncSpecFromForm(r, a.remotes.Get)
 	if err != nil {
 		a.redirectErr(w, r, "/sync", err)
 		return
@@ -365,7 +550,7 @@ func (a *App) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 		a.redirectErr(w, r, "/sync", fmt.Errorf("jadwal tidak dibuat: %w", err))
 		return
 	}
-	a.redirectOK(w, r, "/sync", fmt.Sprintf("Jadwal %s dibuat: %s, %s. Run pertama %s. Setiap run memeriksa kedua sisi dulu; kalau bucket-nya masih dipakai job lain, run itu dilewati dan dicoba lagi pada jadwal berikutnya.",
+	a.redirectOK(w, r, "/sync", fmt.Sprintf("Jadwal %s dibuat: %s, %s. Run pertama %s. Setiap run memeriksa kedua sisi dulu; kalau bucket atau folder-nya masih dipakai job lain, run itu dilewati dan dicoba lagi pada jadwal berikutnya.",
 		item.ID, jobSummary(JobState{JobSpec: item.Spec}), item.Every.Human(), humanTime(item.NextRun)))
 }
 

@@ -7,7 +7,8 @@ Go murni, **tanpa dependency eksternal** — tidak ada framework web, tidak ada
 AWS SDK. Template di-embed dengan `//go:embed`, hasil build adalah satu binary
 statis tanpa file pendukung. Satu-satunya program tambahan adalah
 [rclone](https://rclone.org/), itu pun opsional dan hanya untuk fitur Sync
-(impor/ekspor bucket dari Wasabi dan layanan S3 lain).
+(impor/ekspor bucket dari Wasabi, layanan S3 lain, atau folder di VPS lewat
+SSH).
 
 ```
 $ go list -m all
@@ -46,6 +47,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Cara kerja job](#cara-kerja-job)
   - [Restart, jeda, dan key yang gagal](#restart-jeda-dan-key-yang-gagal)
   - [Biaya request dan batasan](#biaya-request-dan-batasan)
+  - [Sync dengan VPS lewat SSH (SFTP)](#sync-dengan-vps-lewat-ssh-sftp)
 - [File manager di halaman Objek](#file-manager-di-halaman-objek)
 - [Halaman Status](#halaman-status)
 - [Update ke versi baru](#update-ke-versi-baru)
@@ -68,7 +70,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 | **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi |
 | **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback |
 | **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
-| **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
+| **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain — dan dari/ke folder di VPS lewat SSH (SFTP), login dengan password (mis. root) atau kunci SSH, host key server disematkan. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
 | **Status** | Kondisi server: CPU per core, load, memori/swap, disk dan inode, I/O disk, jaringan, suhu, proses garage/caddy/rclone; kesehatan cluster Garage dan pemakaian disk tiap node. Diperbarui tiap 5 detik |
 
@@ -123,7 +125,9 @@ tanpa HEAD per objek, tanpa menahan daftar di memori. Key yang harus disalin
 ditulis ke file chunk (maksimal 10.000 key) dan diserahkan ke
 `rclone copy --files-from-raw`, yang menyalin persis daftar itu tanpa men-list
 apa pun. Setiap chunk selesai, key terakhirnya dicatat sebagai checkpoint di
-`/var/lib/garagepanel`. Detailnya di [Sync dengan S3 lain](#sync-dengan-s3-lain-wasabi-dll).
+`/var/lib/garagepanel`. Folder di VPS (SFTP) tidak punya listing terurut, jadi
+isinya di-list sekali per run lewat rclone dan diurutkan di disk dulu; sisanya
+sama. Detailnya di [Sync dengan S3 lain](#sync-dengan-s3-lain-wasabi-dll).
 
 **State yang ada hanya untuk Sync.** Selain file `.caddy`, panel menulis ke
 `/var/lib/garagepanel`: daftar remote (dengan secret-nya, mode 0600) dan
@@ -1085,9 +1089,11 @@ halaman Sync menampilkan alasannya beserta perintah perbaikannya.
 
 ### Menambah remote
 
-Remote = satu endpoint S3 beserta kredensialnya. Klik **+ Tambah remote** di
-kartu **Remote S3**. Memilih provider mengisi contoh endpoint dan region serta
-menampilkan catatan khas penyedianya:
+Remote = satu endpoint S3 beserta kredensialnya (atau satu VPS lewat SSH —
+lihat [Sync dengan VPS lewat SSH](#sync-dengan-vps-lewat-ssh-sftp)). Klik
+**+ Tambah remote** di kartu **Remote** dan biarkan pilihan **Layanan S3**.
+Memilih provider mengisi contoh endpoint dan region serta menampilkan catatan
+khas penyedianya:
 
 | Provider | Endpoint | Region | Catatan |
 |---|---|---|---|
@@ -1168,8 +1174,8 @@ ribuan `PutObject` pertama ditolak. Setelah itu tab boleh ditutup. Angka di
 kartu job diperbarui tiap 3 detik selama ada job berjalan; tab **Semua /
 Berjalan / Selesai / Gagal** menyaring daftarnya.
 
-Batas: satu job belum-selesai per bucket, dan maksimal 2 job berjalan
-bersamaan (memori rclone).
+Batas: satu job belum-selesai per bucket (atau per folder di VPS), dan
+maksimal 2 job berjalan bersamaan (memori rclone).
 
 ### Jadwal: jalankan berulang
 
@@ -1189,10 +1195,11 @@ menyalin objek yang baru muncul sejak run sebelumnya.
 
 Aturannya:
 
-- Panel memeriksa jadwal tiap 30 detik. Kalau saat jatuh tempo bucket-nya
-  masih dipakai job lain (misalnya run sebelumnya belum selesai), sudah ada 2
-  job berjalan, atau tes koneksinya gagal, run itu **dilewati** dan alasannya
-  dicatat di kolom "Run terakhir"; jadwal tetap maju ke waktu berikutnya.
+- Panel memeriksa jadwal tiap 30 detik. Kalau saat jatuh tempo bucket atau
+  folder-nya masih dipakai job lain (misalnya run sebelumnya belum selesai),
+  sudah ada 2 job berjalan, atau tes koneksinya gagal, run itu **dilewati** dan
+  alasannya dicatat di kolom "Run terakhir"; jadwal tetap maju ke waktu
+  berikutnya.
 - Run yang terlewat saat panel mati **tidak dirapel**: setelah start, run
   berikutnya jatuh pada kelipatan interval pertama setelah sekarang.
 - **Jalankan sekarang** membuat job seketika tanpa menggeser jadwal.
@@ -1308,6 +1315,144 @@ dibuat tahan restart. Lihat laju di kolom progres, dan batasi kalau perlu:
 
 Garage di belakang Cloudflare menolak tanda tangan rclone? Tambahkan
 `RCLONE_EXTRA_ARGS="--s3-sign-accept-encoding=false"`.
+
+### Sync dengan VPS lewat SSH (SFTP)
+
+Remote juga bisa berupa **folder di VPS atau server lain** yang bisa di-SSH:
+misalnya server web lama yang gambarnya mau dipindah ke Garage, atau VPS
+cadangan yang harus menerima salinan bucket. Di VPS tidak perlu memasang apa
+pun — SFTP sudah bagian dari OpenSSH (`sshd`).
+
+**Menambah remote VPS.** Klik **+ Tambah remote**, pilih **VPS lewat SSH**:
+
+| Kolom | Isi |
+|---|---|
+| Nama | seperti remote S3, misalnya `vps-lama` |
+| Host | IP atau nama DNS VPS saja — tanpa `root@`, tanpa `sftp://`, tanpa `:22` |
+| Port SSH | bawaan `22` |
+| User SSH | `root`, atau user lain yang boleh membaca (impor) atau menulis (ekspor) folder itu |
+| Login dengan | **password**, atau **kunci SSH** (disarankan) |
+| Host key server | opsional: isi `/etc/ssh/ssh_host_*_key.pub` dari VPS. Kosongkan supaya panel mengambilnya sendiri |
+
+**Login root dengan password** bisa, asal server-nya mengizinkan. Ubuntu dan
+Debian bawaannya menolak (`PermitRootLogin prohibit-password`), dan image cloud
+sering mematikan login password sama sekali; Tes koneksi lalu gagal dengan
+`unable to authenticate`. Periksa di VPS:
+
+```bash
+sudo sshd -T | grep -Ei '^(permitrootlogin|passwordauthentication)'
+```
+
+Yang disarankan adalah kunci SSH (di bawah). Kalau memang harus password: set
+`PermitRootLogin yes` dan `PasswordAuthentication yes` di
+`/etc/ssh/sshd_config` (periksa juga `/etc/ssh/sshd_config.d/*.conf` — setelan
+di sana didahulukan), lalu `sudo systemctl reload ssh`. Ingat bahwa root +
+password di port 22 adalah sasaran utama bot brute force.
+
+**Kunci SSH buatan panel.** Pilih **kunci SSH** dan biarkan kolom kunci kosong:
+panel membuat pasangan kunci ed25519 khusus untuk remote itu. Kunci privatnya
+disimpan di `remotes.json` (0600) dan tidak pernah ditampilkan; kartu remote
+menampilkan perintah yang dijalankan **sekali di VPS** sebagai user SSH tadi
+(tombol **Salin perintah**):
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo 'ssh-ed25519 AAAA… garagepanel-vps-lama@garage-origin' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+```
+
+Komentar `garagepanel-<remote>@<server panel>` di ujung baris memudahkan
+mencabut aksesnya nanti: hapus baris itu dari `~/.ssh/authorized_keys`. Root
+dengan kunci diizinkan oleh `prohibit-password`, jadi cara ini jalan di
+Ubuntu/Debian bawaan. Kunci milikmu sendiri juga boleh ditempel (format OpenSSH
+atau PEM, tanpa passphrase — kunci ber-passphrase ditolak, karena
+passphrase-nya terpaksa disimpan di sebelah kuncinya dan tidak melindungi apa
+pun).
+
+**Host key disematkan.** Saat remote disimpan, panel menghubungi server,
+mengambil host key-nya (ed25519, ecdsa, dan rsa, seperti `ssh-keyscan`), lalu
+menampilkan sidik jarinya. Cocokkan sekali dengan yang ada di VPS:
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+```
+
+Sejak itu setiap koneksi rclone ke remote ini diperiksa terhadap key tersebut
+(`/var/lib/garagepanel/known_hosts/<nama>`), jadi server lain yang menyamar
+sebagai VPS-mu ditolak sebelum password dikirim. Kalau server belum bisa
+dihubungi saat remote disimpan, remote tetap disimpan dengan tanda "host key
+belum disematkan" dan key-nya diambil pada **Tes koneksi** pertama yang
+terhubung; sebelum itu job tidak bisa memakainya. VPS diinstal ulang (host key
+berubah)? Tes koneksi dan job gagal dengan "Host key server TIDAK SAMA …"; klik
+**Edit**, centang **ambil ulang host key**, dan cocokkan sidik jari yang baru.
+
+**Tes koneksi.** Di kartu remote VPS, isi folder (path absolut, misalnya
+`/var/www/uploads`): panel login, membaca isi folder itu satu tingkat, lalu —
+kecuali "hanya baca" dipilih — menulis dan menghapus file
+`.garagepanel-probe-<acak>`. Folder yang belum ada dibuat dulu, karena tujuan
+ekspor memang boleh belum ada; pada tes "hanya baca" folder yang tidak ada
+dilaporkan sebagai error.
+
+**Job.** Pilih remote VPS di form job: kolom bucket dan folder remote berganti
+jadi **Folder di VPS**. Folder itu beserta seluruh subfoldernya yang disalin,
+dan path relatif di bawahnya menjadi key:
+
+| Arah | Contoh | Hasil |
+|---|---|---|
+| Impor | `vps-lama:/var/www/uploads/` → `garage:media/uploads/` | file `/var/www/uploads/komik-a/001.jpg` jadi objek `uploads/komik-a/001.jpg` |
+| Ekspor | `garage:media/` → `vps-cadangan:/srv/backup/media/` | objek `komik-a/001.jpg` jadi file `/srv/backup/media/komik-a/001.jpg`; folder dibuat kalau belum ada |
+
+Mode Lewati / Perbarui kalau beda / Timpa semua, jadwal, checkpoint, jeda dan
+lanjut, key yang gagal, dan "tidak pernah menghapus di tujuan" berlaku sama
+seperti remote S3.
+
+Bedanya dengan remote S3:
+
+- **Listing di depan.** S3 memberi daftar terurut per halaman; folder di SFTP
+  tidak. Jadi tiap run (juga setelah restart atau Lanjutkan) panel men-list
+  seluruh folder sekali dengan `rclone lsjson -R --files-only`, mengurutkannya
+  di disk (merge sort eksternal per 100.000 entri; file sementara di
+  `/var/lib/garagepanel/jobs/<id>/listing-*`, dihapus setelah run), baru
+  merge-join seperti biasa. Kartu job menampilkan progresnya ("mendaftar isi …:
+  120000 file …"). Memori tetap kecil; disk sementara ±150 MB per sejuta file.
+  Listing sejuta file lewat SSH bisa makan beberapa menit sebelum transfer
+  pertama dimulai.
+- **Metadata.** Tanpa `-M`, karena file system tidak punya metadata S3. Saat
+  impor, Content-Type ditebak rclone dari ekstensi (`.jpg` → `image/jpeg`,
+  `.webp` → `image/webp`); pemilik dan izin file tidak dibawa. Saat ekspor,
+  yang ditulis adalah isi file beserta waktu modifikasinya.
+- **Folder kosong** tidak ikut di kedua arah: di file system folder ada karena
+  isinya, dan objek marker `nama/` tidak dijadikan folder kosong di VPS.
+- **Verifikasi MD5.** Di kedua arah rclone menjalankan `md5sum <file>` lewat
+  SSH di VPS untuk **setiap file** dan mencocokkannya dengan MD5 di sisi S3
+  (kalau user itu punya shell): impor membaca tiap file di VPS dua kali, ekspor
+  memeriksa file yang baru ditulis sebelum diberi nama akhirnya. Ekspor menulis
+  ke `<nama>.<acak>.partial` lalu me-rename-nya (rclone 1.63+), jadi web server
+  di VPS tidak pernah melayani file setengah jadi; kalau job dihentikan paksa,
+  sisa `*.partial` aman dihapus. Untuk jutaan file kecil atau VPS lemah,
+  verifikasi ini bisa dimatikan supaya lebih cepat (ukuran tetap dicek):
+  `RCLONE_EXTRA_ARGS="--sftp-disable-hashcheck"`. Server lama yang hanya bicara
+  cipher usang: `RCLONE_EXTRA_ARGS="--sftp-use-insecure-cipher"` (argumen
+  tambahan ini berlaku juga untuk Tes koneksi dan listing).
+- **Firewall.** VPS harus menerima SSH dari IP server panel, bukan dari
+  laptopmu. Dengan ufw di VPS:
+  `sudo ufw allow from <IP server panel> to any port 22 proto tcp`.
+
+**Folder yang ditolak.** Job berjalan dengan hak user SSH — sering root — dan
+menyalin seluruh pohon folder. Ekspor ke folder sistem bisa menimpa file sistem
+atau menanam `authorized_keys`; impor darinya menyalin rahasia ke bucket. Jadi
+folder berikut ditolak di kedua arah, sebelum ada koneksi ke VPS:
+
+| Folder | Alasan |
+|---|---|
+| `/` | seluruh disk |
+| `/etc`, `/boot`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/libx32`, `/usr`, `/proc`, `/sys`, `/dev`, `/run`, `/snap` beserta isinya | sistem, boot loader, file semu kernel |
+| tepat `/root`, `/home`, atau `/var` | terlalu umum; subfoldernya boleh (`/root/backup`, `/var/www`) |
+| tepat `/home/<user>` | home directory memuat `.ssh`; subfoldernya boleh (`/home/budi/public_html`) |
+| `/var/lib/…`, `/var/spool/…` | state layanan: database, cron, kredensial |
+| path apa pun yang memuat segmen `.ssh` atau `.gnupg` | kunci rahasia |
+
+Path juga harus absolut, tanpa `//`, tanpa segmen `.`/`..`, dan tanpa karakter
+kontrol. Dua job yang belum selesai tidak boleh memakai folder yang sama atau
+bertumpuk (`/srv/data` dan `/srv/data/sub`) di remote yang sama.
 
 ## File manager di halaman Objek
 
@@ -1510,7 +1655,7 @@ State panel kecil. Yang perlu di-backup:
 |---|---|---|
 | Konfigurasi panel | `/etc/garagepanel/garagepanel.env` | token admin, key S3, hash password login |
 | Pemetaan domain | `/etc/caddy/sites/*.caddy` | domain → bucket, whitelist IP S3 API |
-| Remote, jadwal, dan job Sync | `/var/lib/garagepanel/` | `remotes.json` (kredensial remote, 0600), `schedules.json` (jadwal), `jobs/*.json` (checkpoint), `jobs/<id>/failed.jsonl` |
+| Remote, jadwal, dan job Sync | `/var/lib/garagepanel/` | `remotes.json` (kredensial remote termasuk password/kunci SSH VPS, 0600), `schedules.json` (jadwal), `jobs/*.json` (checkpoint), `jobs/<id>/failed.jsonl`, `known_hosts/` (host key VPS; ditulis ulang dari `remotes.json` setiap start) |
 
 ```bash
 sudo tar czf garagepanel-backup-$(date +%F).tar.gz \
@@ -1521,8 +1666,8 @@ sudo tar czf garagepanel-backup-$(date +%F).tar.gz \
   /var/lib/garagepanel
 ```
 
-Arsip ini memuat token admin Garage, secret key S3, dan secret key setiap
-remote dalam bentuk terbaca. Simpan seperti kamu menyimpan kunci SSH — jangan
+Arsip ini memuat token admin Garage, secret key S3, secret key setiap remote,
+dan password atau kunci SSH setiap remote VPS dalam bentuk terbaca. Simpan seperti kamu menyimpan kunci SSH — jangan
 ke object storage yang dikelola panel ini sendiri, dan jangan ke remote yang
 kredensialnya ada di dalam arsip itu. Direktori `cache/` di dalamnya boleh
 dilewati.
@@ -1621,6 +1766,12 @@ divalidasi lebih dulu:
 | Endpoint remote | `http`/`https`, host + port saja: tanpa path, query, fragment, atau user:password; alamat link-local/metadata (`169.254.0.0/16`, `fe80::/10`) dan `0.0.0.0` ditolak |
 | Region | `^[a-z0-9-]{1,32}$`; provider dari whitelist (`Wasabi`, `AWS`, `Backblaze`, `Hetzner`, `Cloudflare`, `DigitalOcean`, `Scaleway`, `Ceph`, `Minio`, `Other`); gaya alamat `auto`/`path`/`virtual` |
 | Bucket remote | aturan AWS (3–63, boleh titik, bukan alamat IP) — tidak pernah jadi nama file |
+| Host VPS (SFTP) | alamat IP lewat `net.ParseIP` (link-local/metadata, multicast, dan `0.0.0.0`/`::` ditolak) atau nama DNS yang dicek per label; tanpa `user@`, skema, atau port |
+| Port / user SSH | port 1–65535; user `^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$` (tidak bisa diawali `-`) |
+| Folder di VPS | path absolut dengan aturan object key, ditambah daftar folder terlarang di [Sync dengan VPS lewat SSH](#sync-dengan-vps-lewat-ssh-sftp) |
+| Host key | `ssh-ed25519`, `ecdsa-sha2-nistp256/384/521`, atau `ssh-rsa`; base64 valid dan jenis di dalam blob harus sama dengan jenis di depannya; maksimal 16 |
+| Kunci privat SSH | PEM/OpenSSH tanpa passphrase, maks 16 KB, dibaca dengan `crypto/x509` sebelum disimpan |
+| Password SSH | maks 1024 byte, tanpa baris baru atau NUL |
 | Nama folder / nama file | satu komponen: tanpa `/` `\`, bukan `.`/`..`, tanpa karakter kontrol, maks 255 byte; nama file juga lewat whitelist ekstensi |
 | ID job / ID jadwal | `^[0-9a-f]{16}$`, diperiksa sebelum dijadikan path di `STATE_DIR` |
 | Interval jadwal | `<angka>` + `m`/`h`/`d`, 15 menit sampai 30 hari; run pertama harus berbentuk `YYYY-MM-DDTHH:MM` |
@@ -1655,6 +1806,18 @@ yang ditulis Tes koneksi dan pemeriksaan sebelum job bernama
 `.garagepanel-probe-<8 hex acak>` dan dihapus di request berikutnya; kalau
 penghapusannya gagal, pesannya menyebut nama objek itu supaya bisa dihapus
 manual. Jadwal hanya menyimpan nama remote dan setelan job, tanpa kredensial.
+
+**Sync ke VPS (SFTP).** Password dan kunci privat SSH diperlakukan seperti
+secret S3: hanya ada di `remotes.json` dan di environment proses rclone
+(`RCLONE_CONFIG_<ALIAS>_PASS` dalam format `rclone obscure` — rclone menolak
+password polos, dan itu penyamaran, bukan enkripsi — atau `..._KEY_PEM`),
+tidak pernah di argumen, file lain, log, atau halaman. rclone selalu diberi
+`known_hosts_file` milik remote itu dan `key_use_agent=false`; remote yang
+host key-nya belum disematkan diberi file tanpa key, jadi rclone menolak
+server itu alih-alih melewati pemeriksaan. Host key diambil dengan klien SSH
+kecil di dalam panel yang hanya melakukan pertukaran kunci — tanpa login dan
+tanpa kredensial. Folder sistem, home directory, dan `.ssh` ditolak sebelum
+ada koneksi (lihat [daftarnya](#sync-dengan-vps-lewat-ssh-sftp)).
 
 **Status.** Halaman Status hanya membaca file teks kernel di `/proc` dan
 `/sys` serta memanggil dua operasi baca Admin API; tidak ada perintah shell,
@@ -1869,6 +2032,32 @@ ganti endpoint + region sepasang.
 di akun/region lain. Nama bucket Backblaze bersifat global dan harus persis;
 bucket Hetzner terikat project.
 
+**Tes koneksi VPS: `unable to authenticate`** — login SSH ditolak. Dengan root +
+password hampir selalu karena `PermitRootLogin prohibit-password` (bawaan
+Ubuntu/Debian) atau `PasswordAuthentication no`; periksa dengan
+`sudo sshd -T | grep -Ei '^(permitrootlogin|passwordauthentication)'` di VPS,
+atau pindah ke kunci SSH buatan panel (**Edit** → kunci SSH, kolom kunci
+kosong, lalu jalankan perintah di kartu remote). Dengan kunci: barisnya belum
+ada di `~/.ssh/authorized_keys` milik user itu, atau izin `~/.ssh` terlalu
+longgar (harus 700, `authorized_keys` 600, pemiliknya user itu sendiri).
+
+**Tes koneksi VPS: "Host key server TIDAK SAMA" (`knownhosts: key mismatch`)** —
+server menunjukkan host key lain dari yang disematkan. Wajar setelah VPS
+diinstal ulang atau IP-nya dipindah ke mesin lain: **Edit** → centang **ambil
+ulang host key**, lalu cocokkan sidik jarinya dengan
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` di VPS. Kalau tidak ada yang
+berubah di VPS, jangan diterima — ada yang menyadap jalurnya.
+
+**Tes koneksi VPS: `connection refused` / `i/o timeout` / "tidak bisa
+menghubungi"** — port SSH salah, sshd mati, atau firewall VPS (ufw, security
+group penyedia) tidak menerima IP server panel.
+
+**Job VPS lama di "mendaftar isi …"** — folder besar sedang di-list lewat SSH,
+direktori demi direktori; jumlah filenya bertambah di kartu job. Kalau listing
+gagal (misalnya `permission denied` di salah satu subfolder), job berhenti
+sebelum menyalin apa pun — perbaiki izinnya atau pakai user yang berhak, lalu
+Lanjutkan.
+
 **Job gagal dengan `PutObject … 403 AccessDenied` padahal tes koneksi lulus** —
 izin key atau kebijakan bucket tujuan berubah di tengah jalan. Jalankan Tes
 koneksi lagi (dengan uji tulis) untuk melihat pesan aslinya, lalu Lanjutkan.
@@ -1922,8 +2111,11 @@ garage.go             client Garage Admin API v2
 s3.go                 SigV4, ListObjectsV2 (start-after), Put/Get/Head/Delete, CopyObject, DeleteObjects
 caddy.go              tulis/hapus file site + reload + rollback, file whitelist, writeFileAtomic
 providers.go          preset provider S3 (endpoint, region, gaya alamat bawaan, catatan)
-remotes.go            daftar remote S3 (remotes.json), env rclone per remote, probe baca/tulis + deteksi gaya alamat
+remotes.go            daftar remote S3 dan SFTP (remotes.json, known_hosts/), env rclone per remote, probe baca/tulis + deteksi gaya alamat
 rclone.go             deteksi versi rclone, menjalankan satu chunk, parser log JSON
+sftp.go               remote SFTP: validasi, obscure password ala rclone, kunci ed25519, probe lewat rclone, petunjuk error SSH
+sshhostkey.go         klien SSH minimal (hanya pertukaran kunci) untuk mengambil host key, format known_hosts
+listing.go            listing folder SFTP lewat rclone lsjson, merge sort eksternal di disk, iterator untuk merge-join
 sync.go               iterator listing terurut, merge-join, penulis chunk
 jobs.go               job: state di disk, siklus hidup, resume saat start, shutdown
 schedules.go          jadwal berulang (schedules.json), ticker 30 detik, riwayat run
@@ -1946,6 +2138,12 @@ rclone tiruan (`rclone_fake_test.go`: binary test meng-exec dirinya sendiri,
 memenuhi kontrak `--files-from-raw` dengan client S3 panel, mengeluarkan log
 JSON yang sama, dan merekam argv + env untuk asersi). Tes resume, jeda,
 pembatalan, jeda otomatis, dan batas job semuanya lewat rclone tiruan itu.
+Untuk SFTP, rclone tiruan yang sama melayani folder lokal sebagai "VPS" dan
+memeriksa known_hosts serta password/kunci seperti sshd; `sshhostkey_test.go`
+punya server SSH tiruan untuk pengambilan host key; dan
+`rclone_sftp_real_test.go` menjalankan rclone sungguhan terhadap
+`rclone serve sftp` (penyematan host key, login password dan kunci, impor,
+ekspor, pesan error).
 
 ```bash
 go test ./...          # cepat
@@ -1953,7 +2151,7 @@ go test -race ./...    # dengan race detector
 go test -cover ./...   # ~80% statement coverage
 
 # Dengan rclone sungguhan (dilewati kalau tidak ada): 302 objek termasuk satu
-# 20 MiB multipart, antar dua S3 tiruan
+# 20 MiB multipart antar dua S3 tiruan, plus impor/ekspor lewat rclone serve sftp
 GARAGEPANEL_TEST_RCLONE=/usr/bin/rclone go test -run TestRealRclone ./...
 ```
 

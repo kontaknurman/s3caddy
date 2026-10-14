@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,7 +28,10 @@ const (
 
 // Remote is one saved endpoint. The JSON tags are the on-disk format.
 type Remote struct {
-	Name      string `json:"name"`
+	Name string `json:"name"`
+	// Type is "s3" (also when empty, in files written before SFTP existed) or
+	// "sftp".
+	Type      string `json:"type,omitempty"`
 	Provider  string `json:"provider"`
 	Endpoint  string `json:"endpoint"`
 	Region    string `json:"region"`
@@ -34,15 +39,37 @@ type Remote struct {
 	SecretKey string `json:"secretKey"`
 	// Addressing is auto (provider default, other style tried on failure),
 	// path or virtual. The probe rewrites auto to whatever worked.
-	Addressing string    `json:"addressing,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt,omitempty"`
+	Addressing string `json:"addressing,omitempty"`
+
+	// SFTP: a server reached over SSH. Exactly one of Password and
+	// PrivateKey is set.
+	Host       string `json:"host,omitempty"`
+	Port       int    `json:"port,omitempty"`
+	User       string `json:"user,omitempty"`
+	Password   string `json:"password,omitempty"`
+	PrivateKey string `json:"privateKey,omitempty"`
+	// PublicKey is the authorized_keys line of a key the panel generated.
+	PublicKey string `json:"publicKey,omitempty"`
+	// HostKeys are the server's pinned host keys, "type base64" each.
+	HostKeys   []string  `json:"hostKeys,omitempty"`
+	HostKeysAt time.Time `json:"hostKeysAt,omitempty"`
+
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt,omitempty"`
+
+	// knownHostsPath is where RemoteStore wrote HostKeys for rclone.
+	knownHostsPath string
 }
+
+// IsSFTP reports whether the remote is a folder on an SSH server.
+func (r Remote) IsSFTP() bool { return r.Type == RemoteTypeSFTP }
 
 // RemoteView is what templates and JSON answers see. It has no secret field,
 // so a template cannot print one by accident.
 type RemoteView struct {
 	Name            string
+	Type            string // s3 | sftp
+	IsSFTP          bool
 	Provider        string
 	ProviderLabel   string
 	Endpoint        string
@@ -51,12 +78,40 @@ type RemoteView struct {
 	Addressing      string // auto | path | virtual, as stored
 	AddressingLabel string // the style actually used, in words
 	Insecure        bool   // plain http: objects travel unencrypted
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+
+	// SFTP
+	Host          string
+	Port          int
+	User          string
+	UsesKey       bool
+	PublicKey     string // authorized_keys line of a generated key
+	InstallCmd    string // command that adds PublicKey on the server
+	HostKeys      []HostKeyView
+	HostKeysAt    time.Time
+	HostKeyPinned bool
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// HostKeyView is one pinned host key, the way ssh-keygen -lf shows it.
+type HostKeyView struct {
+	Type        string
+	Fingerprint string
 }
 
 // Validate checks every field before the remote is saved or used.
 func (r Remote) Validate() error {
+	switch r.Type {
+	case RemoteTypeSFTP:
+		return r.validateSFTP()
+	case "", RemoteTypeS3:
+	default:
+		return fmt.Errorf("jenis remote %q tidak dikenal", r.Type)
+	}
+	if r.Host != "" || r.Password != "" || r.PrivateKey != "" {
+		return errors.New("remote S3 tidak memakai host/password/kunci SSH")
+	}
 	if err := ValidateRemoteName(r.Name); err != nil {
 		return err
 	}
@@ -104,6 +159,31 @@ func (r Remote) virtualHost() bool {
 
 // View strips the secret.
 func (r Remote) View() RemoteView {
+	if r.IsSFTP() {
+		v := RemoteView{
+			Name:          r.Name,
+			Type:          RemoteTypeSFTP,
+			IsSFTP:        true,
+			ProviderLabel: "VPS lewat SSH (SFTP)",
+			Endpoint:      "sftp://" + r.User + "@" + sshHostPort(r.Host, r.Port),
+			Host:          r.Host,
+			Port:          r.Port,
+			User:          r.User,
+			UsesKey:       r.PrivateKey != "",
+			PublicKey:     r.PublicKey,
+			HostKeysAt:    r.HostKeysAt,
+			HostKeyPinned: len(r.HostKeys) > 0,
+			CreatedAt:     r.CreatedAt,
+			UpdatedAt:     r.UpdatedAt,
+		}
+		if r.PublicKey != "" {
+			v.InstallCmd = sftpInstallCommand(r.PublicKey)
+		}
+		for _, k := range r.HostKeys {
+			v.HostKeys = append(v.HostKeys, HostKeyView{Type: hostKeyLabel(k), Fingerprint: hostKeyFingerprint(k)})
+		}
+		return v
+	}
 	label := r.Provider
 	if p, ok := providerByName(r.Provider); ok {
 		label = p.Label
@@ -114,6 +194,7 @@ func (r Remote) View() RemoteView {
 	}
 	return RemoteView{
 		Name:            r.Name,
+		Type:            RemoteTypeS3,
 		Provider:        r.Provider,
 		ProviderLabel:   label,
 		Endpoint:        r.Endpoint,
@@ -125,6 +206,18 @@ func (r Remote) View() RemoteView {
 		CreatedAt:       r.CreatedAt,
 		UpdatedAt:       r.UpdatedAt,
 	}
+}
+
+// sshHostPort writes host:port the way ssh users read it (port 22 implied).
+func sshHostPort(host string, port int) string {
+	h := host
+	if strings.Contains(h, ":") {
+		h = "[" + h + "]"
+	}
+	if port == 0 || port == 22 {
+		return h
+	}
+	return h + ":" + strconv.Itoa(port)
 }
 
 // maskAccessKey keeps just enough of an access key to recognise it.
@@ -178,6 +271,9 @@ func garageRemote(cfg *Config) Remote {
 // config file: RCLONE_CONFIG_<ALIAS>_<OPTION>.
 func (r Remote) rcloneEnv(alias string) []string {
 	prefix := "RCLONE_CONFIG_" + strings.ToUpper(strings.ReplaceAll(alias, "-", "_")) + "_"
+	if r.IsSFTP() {
+		return r.sftpEnv(prefix)
+	}
 	rcloneProvider := r.Provider
 	if p, ok := providerByName(r.Provider); ok {
 		rcloneProvider = p.Rclone
@@ -206,6 +302,42 @@ type RemoteStore struct {
 	path    string
 	mu      sync.Mutex
 	remotes []Remote
+	// rclone talks to SFTP remotes for probes; set once rclone was found.
+	rclone *rcloneRunner
+}
+
+// SetRclone gives the store the rclone it needs to probe SFTP remotes.
+func (s *RemoteStore) SetRclone(rc *rcloneRunner) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rclone = rc
+}
+
+// knownHostsDir holds one known_hosts file per SFTP remote, next to
+// remotes.json.
+func (s *RemoteStore) knownHostsDir() string {
+	return filepath.Join(filepath.Dir(s.path), knownHostsDirName)
+}
+
+func (s *RemoteStore) knownHostsFile(name string) string {
+	return filepath.Join(s.knownHostsDir(), name)
+}
+
+// writeKnownHosts writes the pinned host keys of an SFTP remote where rclone
+// will read them. A remote without pinned keys gets an empty file, which
+// makes rclone refuse the server rather than skip the check.
+func (s *RemoteStore) writeKnownHosts(r Remote) error {
+	if !r.IsSFTP() {
+		return nil
+	}
+	if err := os.MkdirAll(s.knownHostsDir(), 0o700); err != nil {
+		return fmt.Errorf("direktori known_hosts: %w", err)
+	}
+	path := s.knownHostsFile(r.Name)
+	if err := writeFileAtomic(path, []byte(knownHostsContent(r.HostKeys, r.Port)), remotesFileMode); err != nil {
+		return err
+	}
+	return os.Chmod(path, remotesFileMode)
 }
 
 type remotesFile struct {
@@ -236,6 +368,11 @@ func NewRemoteStore(path string) (*RemoteStore, error) {
 			return nil, fmt.Errorf("%s: remote %q tercantum dua kali", path, r.Name)
 		}
 		seen[r.Name] = true
+		// The known_hosts files are derived data: rewrite them from the
+		// source of truth on every start.
+		if err := s.writeKnownHosts(r); err != nil {
+			return nil, err
+		}
 	}
 	s.remotes = doc.Remotes
 	return s, nil
@@ -259,6 +396,9 @@ func (s *RemoteStore) Get(name string) (Remote, bool) {
 	defer s.mu.Unlock()
 	for _, r := range s.remotes {
 		if r.Name == name {
+			if r.IsSFTP() {
+				r.knownHostsPath = s.knownHostsFile(r.Name)
+			}
 			return r, true
 		}
 	}
@@ -282,6 +422,9 @@ func (s *RemoteStore) Add(r Remote) error {
 			return fmt.Errorf("remote %q sudah ada; pakai tombol Edit untuk mengubahnya", r.Name)
 		}
 	}
+	if err := s.writeKnownHosts(r); err != nil {
+		return err
+	}
 	updated := append(append([]Remote{}, s.remotes...), r)
 	if err := s.saveLocked(updated); err != nil {
 		return err
@@ -292,6 +435,17 @@ func (s *RemoteStore) Add(r Remote) error {
 
 // normaliseRemote trims, normalises and validates user input for a remote.
 func normaliseRemote(r Remote) (Remote, error) {
+	if r.Type == RemoteTypeSFTP {
+		r, err := normaliseSFTP(r)
+		if err != nil {
+			return r, err
+		}
+		if r.Name == garageRemoteName {
+			return r, fmt.Errorf("nama %q dipakai untuk Garage panel sendiri; pilih nama lain", garageRemoteName)
+		}
+		return r, nil
+	}
+	r.Type = RemoteTypeS3
 	r.Name = strings.TrimSpace(r.Name)
 	r.Provider = strings.TrimSpace(r.Provider)
 	r.Region = strings.TrimSpace(r.Region)
@@ -333,6 +487,29 @@ func (s *RemoteStore) Update(name string, r Remote) error {
 	}
 	old := s.remotes[idx]
 	r.Name = name
+	if r.IsSFTP() || old.IsSFTP() {
+		// The handler resolved "keep the stored password/key" already;
+		// the type of a remote cannot change, its jobs depend on it.
+		if r.Type != old.Type {
+			return errors.New("jenis remote tidak bisa diubah; buat remote baru")
+		}
+		r, err := normaliseRemote(r)
+		if err != nil {
+			return err
+		}
+		r.CreatedAt = old.CreatedAt
+		r.UpdatedAt = time.Now().UTC().Truncate(time.Second)
+		if err := s.writeKnownHosts(r); err != nil {
+			return err
+		}
+		updated := append([]Remote{}, s.remotes...)
+		updated[idx] = r
+		if err := s.saveLocked(updated); err != nil {
+			return err
+		}
+		s.remotes = updated
+		return nil
+	}
 	r.AccessKey = strings.Trim(r.AccessKey, " \t\r\n")
 	r.SecretKey = strings.Trim(r.SecretKey, " \t\r\n")
 	if r.AccessKey == "" {
@@ -400,7 +577,32 @@ func (s *RemoteStore) Delete(name string) error {
 		return err
 	}
 	s.remotes = kept
+	if err := os.Remove(s.knownHostsFile(name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	return nil
+}
+
+// setHostKeys pins the host keys a probe fetched.
+func (s *RemoteStore) setHostKeys(name string, keys []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	updated := append([]Remote{}, s.remotes...)
+	for i := range updated {
+		if updated[i].Name == name {
+			updated[i].HostKeys = keys
+			updated[i].HostKeysAt = time.Now().UTC().Truncate(time.Second)
+			if err := s.writeKnownHosts(updated[i]); err != nil {
+				return err
+			}
+			if err := s.saveLocked(updated); err != nil {
+				return err
+			}
+			s.remotes = updated
+			return nil
+		}
+	}
+	return fmt.Errorf("remote %q tidak ada", name)
 }
 
 func (s *RemoteStore) saveLocked(remotes []Remote) error {
@@ -425,16 +627,45 @@ type ProbeReport struct {
 	Switched bool   // the other style than configured had to be used
 	WriteOK  bool   // a test object could be written and deleted
 	Leftover string // key of a test object that could not be deleted
+	// PinnedKeys are the SFTP host keys this probe fetched and pinned.
+	PinnedKeys []string
 }
 
 // Probe checks a bucket on the remote: read (list one key), and when write is
 // set, write + delete a tiny test object. If the configured addressing style
 // fails and the other one works, the remote is switched to it and the report
 // says so. The error carries the provider's own message plus the panel's hint.
+//
+// For an SFTP remote, bucket is the folder ("/var/www/uploads"), and a remote
+// without pinned host keys gets them now (trust on first use).
 func (s *RemoteStore) Probe(ctx context.Context, name, bucket string, write bool) (ProbeReport, error) {
 	r, ok := s.Get(name)
 	if !ok {
 		return ProbeReport{}, fmt.Errorf("remote %q tidak ada", name)
+	}
+	if r.IsSFTP() {
+		folder, err := NormalizeSFTPFolder(bucket)
+		if err != nil {
+			return ProbeReport{}, err
+		}
+		var pinned []string
+		if len(r.HostKeys) == 0 {
+			keys, err := fetchHostKeys(ctx, r.Host, r.Port)
+			if err != nil {
+				return ProbeReport{}, fmt.Errorf("remote %s: %w", r.Name, err)
+			}
+			if err := s.setHostKeys(name, keys); err != nil {
+				return ProbeReport{}, err
+			}
+			r, _ = s.Get(name)
+			pinned = keys
+		}
+		s.mu.Lock()
+		rc := s.rclone
+		s.mu.Unlock()
+		report, err := probeSFTP(ctx, rc, r, folder, write)
+		report.PinnedKeys = pinned
+		return report, err
 	}
 	if err := ValidateRemoteBucketName(bucket); err != nil {
 		return ProbeReport{}, err

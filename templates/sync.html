@@ -24,8 +24,8 @@
 <div class="card" id="remotes">
   <div class="card-head">
     <div>
-      <h3>Remote S3</h3>
-      <p class="muted small">Layanan S3 lain yang jadi sumber impor atau tujuan ekspor. Kredensialnya disimpan di <span class="mono">{{.StateDir}}/remotes.json</span> (mode 0600) dan tidak pernah ditampilkan lagi.</p>
+      <h3>Remote</h3>
+      <p class="muted small">Layanan S3 lain atau folder di VPS (lewat SSH/SFTP) yang jadi sumber impor atau tujuan ekspor. Kredensialnya disimpan di <span class="mono">{{.StateDir}}/remotes.json</span> (mode 0600) dan tidak pernah ditampilkan lagi.</p>
     </div>
     <a class="btn" href="#remote-add" data-open="remote-add">+ Tambah remote</a>
   </div>
@@ -33,14 +33,90 @@
   {{if .Remotes}}
   <div class="remote-grid">
     {{range $r := .Remotes}}
-    <div class="remote-card" id="remote-{{$r.Name}}">
+    <div class="remote-card" id="remote-{{$r.Name}}" data-type="{{$r.Type}}">
       <div class="remote-head">
         <div>
           <div class="remote-name mono">{{$r.Name}}</div>
           <div class="small muted">{{$r.ProviderLabel}}</div>
         </div>
         {{if $r.Insecure}}<span class="badge warn" title="Isi objek lewat jaringan tanpa enkripsi">tanpa TLS</span>{{end}}
+        {{if and $r.IsSFTP (not $r.HostKeyPinned)}}<span class="badge warn" title="Server belum diverifikasi">host key belum disematkan</span>{{end}}
       </div>
+      {{if $r.IsSFTP}}
+      <dl class="kv">
+        <dt>Server</dt><dd class="mono">{{$r.User}}@{{$r.Host}}{{if ne $r.Port 22}}:{{$r.Port}}{{end}}</dd>
+        <dt>Login</dt><dd>{{if $r.UsesKey}}kunci SSH{{if $r.PublicKey}} (dibuat panel){{end}}{{else}}password{{end}}</dd>
+        <dt>Host key</dt><dd>{{if $r.HostKeyPinned}}{{range $r.HostKeys}}<div class="mono small">{{.Type}} {{.Fingerprint}}</div>{{end}}{{else}}<span class="warn-text">belum disematkan — klik Tes koneksi</span>{{end}}</dd>
+      </dl>
+      {{with $r.InstallCmd}}
+      <div class="keybox">
+        <div class="small muted">Kunci publik panel — jalankan sekali di VPS sebagai user <span class="mono">{{$r.User}}</span>:</div>
+        <pre class="mono">{{.}}</pre>
+        <button type="button" class="small" data-copy="{{.}}">Salin perintah</button>
+      </div>
+      {{end}}
+
+      <form method="post" action="/sync/remotes/test" class="remote-test">
+        <input type="hidden" name="csrf" value="{{$.CSRF}}">
+        <input type="hidden" name="name" value="{{$r.Name}}">
+        <input type="text" name="path" placeholder="folder di VPS, mis. /var/www/uploads" aria-label="Folder untuk tes" required>
+        <select name="write" aria-label="Jenis tes">
+          <option value="1">baca + tulis file uji</option>
+          <option value="0">hanya baca</option>
+        </select>
+        <button type="submit" class="small">Tes koneksi</button>
+      </form>
+
+      <div class="remote-actions">
+        <details class="editor">
+          <summary><span class="btn small">Edit</span></summary>
+          <form method="post" action="/sync/remotes/update" class="editor-body" data-auth-form>
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="name" value="{{$r.Name}}">
+            <input type="hidden" name="type" value="sftp">
+            <div class="field">
+              <label for="e-host-{{$r.Name}}">Host (nama atau IP)</label>
+              <input type="text" id="e-host-{{$r.Name}}" name="host" value="{{$r.Host}}" required>
+            </div>
+            <div class="row">
+              <div class="field" style="flex: 0 0 110px;">
+                <label for="e-port-{{$r.Name}}">Port</label>
+                <input type="number" id="e-port-{{$r.Name}}" name="port" value="{{$r.Port}}" min="1" max="65535" required>
+              </div>
+              <div class="field">
+                <label for="e-user-{{$r.Name}}">User SSH</label>
+                <input type="text" id="e-user-{{$r.Name}}" name="user" value="{{$r.User}}" required>
+              </div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <label>Login dengan</label>
+              <label class="check"><input type="radio" name="auth" value="password"{{if not $r.UsesKey}} checked{{end}}> password</label>
+              <label class="check"><input type="radio" name="auth" value="key"{{if $r.UsesKey}} checked{{end}}> kunci SSH</label>
+            </div>
+            <div class="field" data-auth="password">
+              <label for="e-pw-{{$r.Name}}">Password <span class="muted">(kosongkan = tetap)</span></label>
+              <input type="password" id="e-pw-{{$r.Name}}" name="password" autocomplete="new-password" placeholder="••••••••">
+            </div>
+            <div class="field" data-auth="key">
+              <label for="e-key-{{$r.Name}}">Kunci privat <span class="muted">(kosongkan = {{if $r.UsesKey}}tetap{{else}}panel membuatkan kunci baru{{end}})</span></label>
+              <textarea id="e-key-{{$r.Name}}" name="private_key" rows="3" autocomplete="off" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+              {{if $r.UsesKey}}<label class="check small"><input type="checkbox" name="new_key" value="1"> buat kunci baru (kunci lama harus dihapus manual dari authorized_keys)</label>{{end}}
+            </div>
+            <div class="field">
+              <label for="e-hk-{{$r.Name}}">Host key <span class="muted">(opsional; tempel isi /etc/ssh/ssh_host_*_key.pub)</span></label>
+              <textarea id="e-hk-{{$r.Name}}" name="host_keys" rows="2" spellcheck="false" placeholder="ssh-ed25519 AAAAC3…"></textarea>
+              <label class="check small"><input type="checkbox" name="refresh_hostkey" value="1"> ambil ulang host key dari server (hanya kalau VPS memang diinstal ulang)</label>
+            </div>
+            <button type="submit" class="primary small">Simpan perubahan</button>
+          </form>
+        </details>
+        <form method="post" action="/sync/remotes/delete" data-confirm="Hapus remote {{$r.Name}}? Password/kunci dan host key-nya ikut dihapus dari panel.">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="name" value="{{$r.Name}}">
+          <button type="submit" class="danger small">Hapus</button>
+        </form>
+      </div>
+      {{else}}
       <dl class="kv">
         <dt>Endpoint</dt><dd class="mono">{{$r.Endpoint}}</dd>
         <dt>Region</dt><dd class="mono">{{$r.Region}}</dd>
@@ -105,27 +181,73 @@
           <button type="submit" class="danger small">Hapus</button>
         </form>
       </div>
+      {{end}}
     </div>
     {{end}}
   </div>
   {{else}}
-  <div class="empty-hint">Belum ada remote. Tambahkan Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, atau layanan S3 lain di bawah, lalu klik <strong>Tes koneksi</strong> dengan nama bucket-nya.</div>
+  <div class="empty-hint">Belum ada remote. Tambahkan Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, layanan S3 lain, atau folder di VPS lewat SSH di bawah, lalu klik <strong>Tes koneksi</strong>.</div>
   {{end}}
 
   <details id="remote-add" class="panel-details">
     <summary>Tambah remote</summary>
-    <form method="post" action="/sync/remotes/add" data-remote-form data-fill>
+    <form method="post" action="/sync/remotes/add" data-remote-form data-fill data-auth-form id="remote-add-form">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="seg" role="radiogroup" aria-label="Jenis remote">
+        <label class="seg-opt"><input type="radio" name="type" value="s3" checked><span>Layanan S3<small>Wasabi, AWS, B2, R2, …</small></span></label>
+        <label class="seg-opt"><input type="radio" name="type" value="sftp"><span>VPS lewat SSH<small>folder di server (SFTP)</small></span></label>
+      </div>
+      <div class="field">
+        <label for="r-name">Nama remote (huruf kecil, angka, tanda hubung)</label>
+        <input type="text" id="r-name" name="name" placeholder="wasabi-sg atau vps-lama" required pattern="[a-z0-9][a-z0-9\-]{0,31}">
+      </div>
+
+      <fieldset class="plain" data-for-type="sftp" hidden disabled>
+        <div class="row">
+          <div class="field">
+            <label for="r-host">Host (nama atau IP VPS)</label>
+            <input type="text" id="r-host" name="host" placeholder="203.0.113.10 atau vps.domainmu.com" required>
+          </div>
+          <div class="field" style="flex: 0 0 110px;">
+            <label for="r-port">Port SSH</label>
+            <input type="number" id="r-port" name="port" value="22" min="1" max="65535" required>
+          </div>
+          <div class="field" style="flex: 0 0 180px;">
+            <label for="r-user">User SSH</label>
+            <input type="text" id="r-user" name="user" value="root" required>
+          </div>
+        </div>
+        <div class="field" style="margin-top: 12px;">
+          <label>Login dengan</label>
+          <label class="check"><input type="radio" name="auth" value="password" checked> password</label>
+          <label class="check"><input type="radio" name="auth" value="key"> kunci SSH <span class="muted">(disarankan; kosongkan kolomnya supaya panel membuatkan)</span></label>
+        </div>
+        <div class="field" data-auth="password">
+          <label for="r-pw">Password</label>
+          <input type="password" id="r-pw" name="password" autocomplete="new-password">
+          <p class="small muted" style="margin: 6px 0 0;">Ubuntu dan Debian bawaannya menolak login <span class="mono">root</span> dengan password (<span class="mono">PermitRootLogin prohibit-password</span>). Kalau Tes koneksi bilang "unable to authenticate", pakai kunci SSH.</p>
+        </div>
+        <div class="field" data-auth="key" hidden>
+          <label for="r-key">Kunci privat <span class="muted">(opsional)</span></label>
+          <textarea id="r-key" name="private_key" rows="3" autocomplete="off" spellcheck="false" placeholder="Kosongkan: panel membuat kunci ed25519 baru dan menampilkan perintah untuk memasang kunci publiknya di VPS."></textarea>
+        </div>
+        <details class="sched-opt">
+          <summary>Host key server (opsional)</summary>
+          <div class="field" style="margin-top: 8px;">
+            <textarea name="host_keys" rows="2" spellcheck="false" placeholder="ssh-ed25519 AAAAC3… (isi /etc/ssh/ssh_host_ed25519_key.pub di VPS)"></textarea>
+            <p class="small muted" style="margin: 6px 0 0;">Kosongkan: panel mengambil host key dari server sekarang dan menampilkan sidik jarinya untuk dicocokkan. Setelah itu setiap koneksi diverifikasi, jadi server palsu tidak bisa menyadap password.</p>
+          </div>
+        </details>
+        <p class="small muted" style="margin: 10px 0 12px;">Password/kunci disimpan di <span class="mono">remotes.json</span> (0600), hanya diberikan ke rclone lewat environment proses, dan tidak pernah ditampilkan lagi. Job berjalan dengan hak user SSH ini; folder sistem (<span class="mono">/etc</span>, <span class="mono">/usr</span>, <span class="mono">/root</span>, <span class="mono">.ssh</span>, …) ditolak.</p>
+      </fieldset>
+
+      <fieldset class="plain" data-for-type="s3">
       <div class="row">
         <div class="field" style="flex: 0 0 220px;">
           <label for="r-provider">Provider</label>
           <select id="r-provider" name="provider">
             {{range .Providers}}<option value="{{.Name}}" data-endpoint="{{.Endpoint}}" data-region="{{.Region}}" data-note="{{.Note}}" data-virtual="{{if .Virtual}}1{{else}}0{{end}}">{{.Label}}</option>{{end}}
           </select>
-        </div>
-        <div class="field">
-          <label for="r-name">Nama remote (huruf kecil, angka, tanda hubung)</label>
-          <input type="text" id="r-name" name="name" placeholder="wasabi-sg" required pattern="[a-z0-9][a-z0-9\-]{0,31}">
         </div>
       </div>
       <div class="row" style="margin-top: 12px;">
@@ -158,6 +280,7 @@
       </div>
       <p class="small muted" style="margin: 10px 0 0;" data-note></p>
       <p class="small muted" style="margin: 6px 0 12px;">Region harus cocok dengan endpoint, kalau tidak tanda tangan ditolak. Setelah disimpan, jalankan <strong>Tes koneksi</strong> dengan nama bucket: panel membaca bucket, menulis lalu menghapus satu objek uji, dan mengganti gaya alamat otomatis kalau provider hanya menerima salah satu.</p>
+      </fieldset>
       <button type="submit" class="primary">Simpan remote</button>
     </form>
   </details>
@@ -184,21 +307,30 @@
 
     <div class="flow">
       <fieldset data-side="remote">
-        <legend><b data-role="remote">Sumber</b> · remote S3</legend>
+        <legend><b data-role="remote">Sumber</b> · remote</legend>
         <div class="field">
           <label for="j-remote">Remote</label>
           <select id="j-remote" name="remote">
-            {{range .Remotes}}<option value="{{.Name}}">{{.Name}} — {{.ProviderLabel}}</option>{{end}}
+            {{range .Remotes}}<option value="{{.Name}}" data-type="{{.Type}}">{{.Name}} — {{.ProviderLabel}}</option>{{end}}
           </select>
         </div>
-        <div class="field">
-          <label for="j-rbucket">Bucket di remote</label>
-          <input type="text" id="j-rbucket" name="remote_bucket" placeholder="backup-2026" required>
-        </div>
-        <div class="field">
-          <label for="j-rprefix">Folder di remote (opsional)</label>
-          <input type="text" id="j-rprefix" name="remote_prefix" placeholder="foto/2026/">
-        </div>
+        <fieldset class="plain" data-remote-kind="s3">
+          <div class="field">
+            <label for="j-rbucket">Bucket di remote</label>
+            <input type="text" id="j-rbucket" name="remote_bucket" placeholder="backup-2026" required>
+          </div>
+          <div class="field">
+            <label for="j-rprefix">Folder di remote (opsional)</label>
+            <input type="text" id="j-rprefix" name="remote_prefix" placeholder="foto/2026/">
+          </div>
+        </fieldset>
+        <fieldset class="plain" data-remote-kind="sftp" hidden disabled>
+          <div class="field">
+            <label for="j-rpath">Folder di VPS (path absolut)</label>
+            <input type="text" id="j-rpath" name="remote_path" placeholder="/var/www/uploads" required>
+          </div>
+          <p class="small muted" style="margin: 0;">Isi folder (beserta subfoldernya) disalin; folder sistem ditolak. Di ekspor, folder dibuat kalau belum ada.</p>
+        </fieldset>
       </fieldset>
       <div class="flow-arrow" aria-hidden="true">→</div>
       <fieldset data-side="garage">
@@ -263,7 +395,7 @@
             <button type="submit" formaction="/sync/schedules/create">Simpan jadwal</button>
           </div>
         </div>
-        <p class="small muted" style="margin: 8px 0 0;">Tulis <span class="mono">30m</span>, <span class="mono">6h</span>, atau <span class="mono">2d</span> (minimal 15 menit, maksimal 30 hari). Tanpa run pertama, run pertama = sekarang + interval. Tiap run membuat job dengan setelan di atas; kalau bucket-nya masih dipakai job lain, run itu dilewati. Run yang terlewat saat panel mati tidak dirapel.</p>
+        <p class="small muted" style="margin: 8px 0 0;">Tulis <span class="mono">30m</span>, <span class="mono">6h</span>, atau <span class="mono">2d</span> (minimal 15 menit, maksimal 30 hari). Tanpa run pertama, run pertama = sekarang + interval. Tiap run membuat job dengan setelan di atas; kalau bucket atau folder-nya masih dipakai job lain, run itu dilewati. Run yang terlewat saat panel mati tidak dirapel.</p>
       </details>
     </div>
   </form>
@@ -374,6 +506,7 @@
         · chunk <span data-field="chunks">{{.Counters.Chunks}}</span> · checkpoint <span class="mono" data-field="checkpoint">{{if .Checkpoint}}{{.Checkpoint}}{{else}}—{{end}}</span>
         · diperbarui <span data-field="updatedH">{{.UpdatedH}}</span>
       </div>
+      <div class="small job-phase" data-field="phase">{{.Phase}}</div>
       {{if .Counters.Failed}}<div class="small" style="margin-top: 4px;"><a href="/sync/jobs/failed?id={{.ID}}">lihat key yang gagal</a></div>{{end}}
       {{with .PauseReason}}<pre class="job-note warn">{{.}}</pre>{{end}}
       {{with .ErrorShort}}<pre class="job-note err">{{.}}</pre>{{end}}
@@ -432,9 +565,53 @@
     });
   });
 
+  // Show one group of fields and switch the other off: a disabled fieldset is
+  // neither validated nor submitted.
+  function showGroup(groups, attr, value) {
+    groups.forEach(function (g) {
+      var on = g.getAttribute(attr) === value;
+      g.hidden = !on;
+      g.disabled = !on;
+    });
+  }
+
+  // Add form: S3 service or a folder on a VPS.
+  var addForm = document.getElementById('remote-add-form');
+  if (addForm) {
+    var typeGroups = Array.prototype.slice.call(addForm.querySelectorAll('[data-for-type]'));
+    var applyType = function () {
+      var t = addForm.querySelector('input[name=type]:checked');
+      showGroup(typeGroups, 'data-for-type', t ? t.value : 's3');
+    };
+    addForm.querySelectorAll('input[name=type]').forEach(function (r) { r.addEventListener('change', applyType); });
+    applyType();
+  }
+
+  // SFTP login: password or SSH key.
+  document.querySelectorAll('form[data-auth-form]').forEach(function (form) {
+    var blocks = Array.prototype.slice.call(form.querySelectorAll('[data-auth]'));
+    if (!blocks.length) { return; }
+    var apply = function () {
+      var a = form.querySelector('input[name=auth]:checked');
+      var v = a ? a.value : 'password';
+      blocks.forEach(function (b) { b.hidden = b.getAttribute('data-auth') !== v; });
+    };
+    form.querySelectorAll('input[name=auth]').forEach(function (r) { r.addEventListener('change', apply); });
+    apply();
+  });
+
   // Direction toggle: the source panel always sits on the left.
   var jobForm = document.getElementById('job-form');
   if (jobForm) {
+    // An SFTP remote is a folder, not a bucket and prefix.
+    var remoteSel = jobForm.querySelector('select[name=remote]');
+    var kindGroups = Array.prototype.slice.call(jobForm.querySelectorAll('[data-remote-kind]'));
+    var applyKind = function () {
+      var opt = remoteSel.options[remoteSel.selectedIndex];
+      showGroup(kindGroups, 'data-remote-kind', opt && opt.getAttribute('data-type') === 'sftp' ? 'sftp' : 's3');
+    };
+    remoteSel.addEventListener('change', applyKind);
+    applyKind();
     var flow = jobForm.querySelector('.flow');
     var applyDir = function () {
       var checked = jobForm.querySelector('input[name=direction]:checked');
@@ -476,7 +653,7 @@
   // buttons match.
   var root = document.getElementById('jobs');
   if (!root || root.getAttribute('data-active') !== '1') { return; }
-  var fields = ['statusLabel', 'updatedH', 'listed', 'transferred', 'skipped', 'failed', 'bytesH', 'speedH', 'chunks', 'checkpoint'];
+  var fields = ['statusLabel', 'updatedH', 'listed', 'transferred', 'skipped', 'failed', 'bytesH', 'speedH', 'chunks', 'checkpoint', 'phase'];
   function tick() {
     fetch('/sync/jobs.json', { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' })
       .then(function (r) { if (!r.ok) { throw new Error('HTTP ' + r.status); } return r.json(); })

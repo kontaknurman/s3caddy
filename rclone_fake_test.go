@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -79,6 +81,7 @@ func fakeRcloneMain(args []string) int {
 	verb := ""
 	chunkPath := ""
 	var positional []string
+	flags := map[string]bool{}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
@@ -90,13 +93,18 @@ func fakeRcloneMain(args []string) int {
 		case strings.HasPrefix(a, "-"):
 			// Flags with a value: skip it unless it is boolean.
 			switch a {
-			case "--no-traverse", "--no-check-dest", "-M", "--use-json-log":
+			case "--no-traverse", "--no-check-dest", "-M", "--use-json-log", "-R", "--files-only", "--no-mimetype", "--no-modtime":
+				flags[a] = true
 			default:
 				i++
 			}
 		default:
 			positional = append(positional, a)
 		}
+	}
+	switch verb {
+	case "lsjson", "mkdir", "rcat", "deletefile":
+		return fakeRcloneFileCommand(verb, positional, flags, args)
 	}
 	raw, err := os.ReadFile(chunkPath)
 	if err != nil {
@@ -122,68 +130,20 @@ func fakeRcloneMain(args []string) int {
 		sleepPerKey, _ = strconv.ParseFloat(s, 64)
 	}
 
-	remote := func(alias string) (Remote, error) {
-		prefix := "RCLONE_CONFIG_" + strings.ToUpper(alias) + "_"
-		// The fake always talks path-style: <bucket>.127.0.0.1 would not
-		// resolve. FORCE_PATH_STYLE is still recorded for assertions.
-		r := Remote{Name: alias, Addressing: AddressingPath}
-		for _, kv := range os.Environ() {
-			k, v, _ := strings.Cut(kv, "=")
-			switch strings.TrimPrefix(k, prefix) {
-			case "PROVIDER":
-				r.Provider = v
-			case "ENDPOINT":
-				r.Endpoint = v
-			case "REGION":
-				r.Region = v
-			case "ACCESS_KEY_ID":
-				r.AccessKey = v
-			case "SECRET_ACCESS_KEY":
-				r.SecretKey = v
-			}
-		}
-		if r.Endpoint == "" {
-			return r, fmt.Errorf("didn't find section in config file (%q)", alias)
-		}
-		return r, nil
-	}
-	parseSpec := func(spec string) (Remote, string, string, error) {
-		alias, rest, ok := strings.Cut(spec, ":")
-		if !ok {
-			return Remote{}, "", "", fmt.Errorf("bad remote spec %q", spec)
-		}
-		r, err := remote(alias)
-		if err != nil {
-			return Remote{}, "", "", err
-		}
-		bucket, prefix, _ := strings.Cut(rest, "/")
-		return r, bucket, prefix, nil
-	}
-
 	if len(positional) == 0 {
 		return fail("no source")
 	}
-	srcRemote, srcBucket, srcPrefix, err := parseSpec(positional[0])
+	src, err := fakeResolve(positional[0])
 	if err != nil {
 		return fail("Failed to create file system for " + strconv.Quote(positional[0]) + ": " + err.Error())
 	}
-	src, err := srcRemote.Client()
-	if err != nil {
-		return fail(err.Error())
-	}
-	var dst *S3
-	var dstBucket, dstPrefix string
+	var dst fakeSide
 	if verb != "delete" {
 		if len(positional) < 2 {
 			return fail("no destination")
 		}
-		dstRemote, b, p, err := parseSpec(positional[1])
-		if err != nil {
+		if dst, err = fakeResolve(positional[1]); err != nil {
 			return fail("Failed to create file system for " + strconv.Quote(positional[1]) + ": " + err.Error())
-		}
-		dstBucket, dstPrefix = b, p
-		if dst, err = dstRemote.Client(); err != nil {
-			return fail(err.Error())
 		}
 	}
 
@@ -207,29 +167,22 @@ func fakeRcloneMain(args []string) int {
 				return 143
 			}
 		}
-		srcKey := srcPrefix + key
 		var opErr error
 		switch {
 		case strings.HasPrefix(key, "fail-") || strings.Contains(key, "/fail-"):
 			opErr = fmt.Errorf("injected failure for %s", key)
 		case verb == "delete":
-			opErr = src.DeleteObject(ctx, srcBucket, srcKey)
+			opErr = src.remove(ctx, key)
 		default:
-			var body io.ReadCloser
-			var hdr map[string][]string
-			body, hdr, opErr = src.GetObject(ctx, srcBucket, srcKey)
+			var data []byte
+			var ct string
+			data, ct, opErr = src.read(ctx, key)
 			if opErr == nil {
-				data, _ := io.ReadAll(body)
-				body.Close()
-				ct := ""
-				if v := hdr["Content-Type"]; len(v) > 0 {
-					ct = v[0]
-				}
-				opErr = dst.PutObject(ctx, dstBucket, dstPrefix+key, data, ct)
+				opErr = dst.write(ctx, key, data, ct)
 				if opErr == nil {
 					stats.Bytes += int64(len(data))
 					if verb == "move" {
-						opErr = src.DeleteObject(ctx, srcBucket, srcKey)
+						opErr = src.remove(ctx, key)
 						if opErr == nil {
 							stats.Deletes++ // rclone counts a move as transfer + delete
 						}
@@ -238,8 +191,7 @@ func fakeRcloneMain(args []string) int {
 			}
 		}
 		if opErr != nil {
-			var s3err *S3Error
-			if isS3Err := asS3Error(opErr, &s3err); isS3Err && s3err.NotFound() && verb != "delete" {
+			if src.notFound(opErr) && verb != "delete" {
 				// rclone silently skips a listed key that no longer exists.
 				continue
 			}
@@ -261,6 +213,248 @@ func fakeRcloneMain(args []string) int {
 	return 0
 }
 
+// fakeSide is one side of a fake rclone run: a bucket/prefix on an S3 server,
+// or — for an sftp remote — a local directory standing in for the folder on
+// the server (FAKE_RCLONE_DIR/sftp/<host>/<path>).
+type fakeSide struct {
+	s3     *S3
+	bucket string
+	prefix string
+	dir    string
+}
+
+// fakeResolve turns "alias:path" plus RCLONE_CONFIG_<ALIAS>_* into a side,
+// checking SFTP credentials and host keys the way the real thing would.
+func fakeResolve(spec string) (fakeSide, error) {
+	alias, rest, ok := strings.Cut(spec, ":")
+	if !ok {
+		return fakeSide{}, fmt.Errorf("bad remote spec %q", spec)
+	}
+	prefix := "RCLONE_CONFIG_" + strings.ToUpper(alias) + "_"
+	env := map[string]string{}
+	for _, kv := range os.Environ() {
+		k, v, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, prefix) {
+			env[strings.TrimPrefix(k, prefix)] = v
+		}
+	}
+	if env["TYPE"] == "sftp" {
+		if err := fakeSFTPLogin(env); err != nil {
+			return fakeSide{}, fmt.Errorf("NewFs: couldn't connect SSH: %w", err)
+		}
+		if !strings.HasPrefix(rest, "/") {
+			return fakeSide{}, fmt.Errorf("fake rclone wants absolute sftp paths, got %q", rest)
+		}
+		root := filepath.Join(os.Getenv("FAKE_RCLONE_DIR"), "sftp", env["HOST"])
+		return fakeSide{dir: filepath.Join(root, filepath.FromSlash(rest))}, nil
+	}
+	// The fake always talks path-style: <bucket>.127.0.0.1 would not
+	// resolve. FORCE_PATH_STYLE is still recorded for assertions.
+	r := Remote{Name: alias, Addressing: AddressingPath, Provider: env["PROVIDER"], Endpoint: env["ENDPOINT"],
+		Region: env["REGION"], AccessKey: env["ACCESS_KEY_ID"], SecretKey: env["SECRET_ACCESS_KEY"]}
+	if r.Endpoint == "" {
+		return fakeSide{}, fmt.Errorf("didn't find section in config file (%q)", alias)
+	}
+	c, err := r.Client()
+	if err != nil {
+		return fakeSide{}, err
+	}
+	bucket, p, _ := strings.Cut(rest, "/")
+	return fakeSide{s3: c, bucket: bucket, prefix: p}, nil
+}
+
+// fakeSFTPLogin checks what the SSH handshake would: a known_hosts file with
+// the server's key (knob "sftp-hostkey"), and the password (knob
+// "sftp-password", which must arrive obscured) or a one-line key_pem.
+func fakeSFTPLogin(env map[string]string) error {
+	knob := func(name string) string {
+		b, _ := os.ReadFile(filepath.Join(os.Getenv("FAKE_RCLONE_DIR"), name))
+		return strings.TrimSpace(string(b))
+	}
+	kh, err := os.ReadFile(env["KNOWN_HOSTS_FILE"])
+	if err != nil {
+		return fmt.Errorf("couldn't parse known_hosts_file: %w", err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(kh), "\n") {
+		if l = strings.TrimSpace(l); l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) == 0 {
+		return errors.New("ssh: handshake failed: knownhosts: key is unknown")
+	}
+	if want := knob("sftp-hostkey"); want != "" && !strings.Contains(string(kh), want) {
+		return errors.New("ssh: handshake failed: knownhosts: key mismatch")
+	}
+	authFail := errors.New("ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain")
+	switch {
+	case env["KEY_PEM"] != "":
+		if strings.Contains(env["KEY_PEM"], "\n") {
+			return errors.New("pem key not formatted properly: invalid syntax")
+		}
+		if _, err := validatePrivateKey(strings.ReplaceAll(env["KEY_PEM"], `\n`, "\n")); err != nil {
+			return fmt.Errorf("failed to parse private key file: %w", err)
+		}
+		if knob("sftp-password") != "" && knob("sftp-accept-keys") == "" {
+			return authFail
+		}
+	case env["PASS"] != "":
+		pw, err := rcloneReveal(env["PASS"])
+		if err != nil {
+			return fmt.Errorf("failed to read password: %w", err)
+		}
+		if want := knob("sftp-password"); want != "" && pw != want {
+			return authFail
+		}
+	default:
+		return authFail
+	}
+	return nil
+}
+
+func (s fakeSide) path(rel string) string { return filepath.Join(s.dir, filepath.FromSlash(rel)) }
+
+func (s fakeSide) read(ctx context.Context, rel string) ([]byte, string, error) {
+	if s.s3 == nil {
+		data, err := os.ReadFile(s.path(rel))
+		// rclone guesses Content-Type from the name for an S3 destination.
+		return data, mime.TypeByExtension(filepath.Ext(rel)), err
+	}
+	body, hdr, err := s.s3.GetObject(ctx, s.bucket, s.prefix+rel)
+	if err != nil {
+		return nil, "", err
+	}
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	ct := ""
+	if v := hdr["Content-Type"]; len(v) > 0 {
+		ct = v[0]
+	}
+	return data, ct, err
+}
+
+func (s fakeSide) write(ctx context.Context, rel string, data []byte, ct string) error {
+	if s.s3 == nil {
+		if err := os.MkdirAll(filepath.Dir(s.path(rel)), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(s.path(rel), data, 0o644)
+	}
+	return s.s3.PutObject(ctx, s.bucket, s.prefix+rel, data, ct)
+}
+
+func (s fakeSide) remove(ctx context.Context, rel string) error {
+	if s.s3 == nil {
+		return os.Remove(s.path(rel))
+	}
+	return s.s3.DeleteObject(ctx, s.bucket, s.prefix+rel)
+}
+
+func (s fakeSide) notFound(err error) bool {
+	if s.s3 == nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	var s3err *S3Error
+	return asS3Error(err, &s3err) && s3err.NotFound()
+}
+
+// fakeRcloneFileCommand handles the short commands the panel runs against an
+// SFTP folder: lsjson (listing and probe), mkdir, rcat, deletefile. Errors
+// are written in rclone's plain-text log format.
+func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bool, args []string) int {
+	dir := os.Getenv("FAKE_RCLONE_DIR")
+	rec := fakeRcloneRecord{Args: args, Env: os.Environ()}
+	recBytes, _ := json.MarshalIndent(rec, "", " ")
+	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("cmd-%d-%d.json", time.Now().UnixNano(), os.Getpid())), recBytes, 0o600)
+	logf := func(level, format string, a ...any) {
+		fmt.Fprintf(os.Stderr, "2026/01/01 00:00:00 %-6s: %s\n", level, fmt.Sprintf(format, a...))
+	}
+	if len(positional) == 0 {
+		logf("CRITICAL", "no path")
+		return 1
+	}
+	side, err := fakeResolve(positional[0])
+	if err != nil {
+		logf("CRITICAL", "Failed to create file system for %q: %v", positional[0], err)
+		return 1
+	}
+	if side.s3 != nil {
+		logf("CRITICAL", "fake rclone only does %s on sftp remotes", verb)
+		return 1
+	}
+	switch verb {
+	case "mkdir":
+		if err := os.MkdirAll(side.dir, 0o755); err != nil {
+			logf("ERROR", "%v", err)
+			return 1
+		}
+	case "rcat":
+		data, _ := io.ReadAll(os.Stdin)
+		if err := os.WriteFile(side.dir, data, 0o644); err != nil {
+			logf("ERROR", "Failed to rcat: %v", err)
+			return 1
+		}
+	case "deletefile":
+		if err := os.Remove(side.dir); err != nil {
+			logf("ERROR", "Failed to deletefile: %v", err)
+			return 1
+		}
+	case "lsjson":
+		// Knob "lsjson-exit" breaks the recursive listing of a job, not the
+		// one-level listing of a probe: a subfolder the user may not read.
+		if code, _ := strconv.Atoi(readKnob(dir, "lsjson-exit")); code != 0 && flags["-R"] {
+			logf("ERROR", "private: error listing: permission denied")
+			return code
+		}
+		info, err := os.Stat(side.dir)
+		if err != nil || !info.IsDir() {
+			logf("ERROR", "error listing: directory not found")
+			logf("NOTICE", "Failed to lsjson with 2 errors: last error was: error in ListJSON: directory not found")
+			return 3
+		}
+		var items []string
+		walk := func(path string, d os.DirEntry, err error) error {
+			if err != nil || path == side.dir {
+				return err
+			}
+			rel, _ := filepath.Rel(side.dir, path)
+			rel = filepath.ToSlash(rel)
+			if d.IsDir() {
+				if !flags["--files-only"] {
+					b, _ := json.Marshal(map[string]any{"Path": rel, "Name": d.Name(), "Size": -1, "IsDir": true})
+					items = append(items, string(b))
+				}
+				if !flags["-R"] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			fi, _ := d.Info()
+			b, _ := json.Marshal(map[string]any{"Path": rel, "Name": d.Name(), "Size": fi.Size(), "ModTime": "", "IsDir": false})
+			items = append(items, string(b))
+			return nil
+		}
+		if err := filepath.WalkDir(side.dir, walk); err != nil {
+			logf("ERROR", "%v", err)
+			return 1
+		}
+		// rclone lists directory by directory, in no global order.
+		for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+			items[i], items[j] = items[j], items[i]
+		}
+		fmt.Println("[")
+		fmt.Println(strings.Join(items, ",\n"))
+		fmt.Println("]")
+	}
+	return 0
+}
+
+func readKnob(dir, name string) string {
+	b, _ := os.ReadFile(filepath.Join(dir, name))
+	return strings.TrimSpace(string(b))
+}
+
 func asS3Error(err error, target **S3Error) bool {
 	for e := err; e != nil; {
 		if s, ok := e.(*S3Error); ok {
@@ -279,7 +473,19 @@ func asS3Error(err error, target **S3Error) bool {
 // readFakeRcloneRecords returns every recorded run in dir, oldest first.
 func readFakeRcloneRecords(t *testing.T, dir string) []fakeRcloneRecord {
 	t.Helper()
-	paths, err := filepath.Glob(filepath.Join(dir, "run-*.json"))
+	return readFakeRcloneFiles(t, dir, "run-*.json")
+}
+
+// readFakeRcloneCommands returns the recorded short commands (lsjson, mkdir,
+// rcat, deletefile), oldest first.
+func readFakeRcloneCommands(t *testing.T, dir string) []fakeRcloneRecord {
+	t.Helper()
+	return readFakeRcloneFiles(t, dir, "cmd-*.json")
+}
+
+func readFakeRcloneFiles(t *testing.T, dir, pattern string) []fakeRcloneRecord {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, pattern))
 	if err != nil {
 		t.Fatal(err)
 	}

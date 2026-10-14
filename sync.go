@@ -184,8 +184,8 @@ type chunkResult struct {
 
 // chunkBuilder runs the merge-join and writes chunk files.
 type chunkBuilder struct {
-	src *keyIterator
-	dst *keyIterator // nil: copy everything (overwrite mode, prefix jobs)
+	src listing
+	dst listing // nil: copy everything (overwrite mode, prefix jobs)
 	// mode is skip-existing, update-if-different or overwrite.
 	mode string
 	// max keys per chunk.
@@ -236,7 +236,7 @@ func (b *chunkBuilder) next(ctx context.Context, path string) (chunkResult, bool
 			done = true
 			break
 		}
-		rel := obj.Key[len(b.src.prefix):]
+		rel := obj.Key[len(b.src.keyPrefix()):]
 		b.src.advance()
 		res.Listed++
 		res.Last = rel
@@ -295,7 +295,7 @@ func (b *chunkBuilder) presentAtDestination(ctx context.Context, rel string, obj
 		if d == nil {
 			return false, nil
 		}
-		drel := d.Key[len(b.dst.prefix):]
+		drel := d.Key[len(b.dst.keyPrefix()):]
 		switch {
 		case drel < rel:
 			b.dst.advance()

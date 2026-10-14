@@ -559,6 +559,8 @@ func (a *App) setupSync() {
 		log.Printf("PERINGATAN: %s", strings.ReplaceAll(a.syncDisabled, "\n", " "))
 		return
 	}
+	// SFTP remotes are tested through rclone.
+	remotes.SetRclone(rclone)
 	jobs, err := NewJobManager(filepath.Join(a.cfg.StateDir, "jobs"), garageRemote(a.cfg), remotes, rclone)
 	if err != nil {
 		a.syncDisabled = fmt.Sprintf("Job tidak bisa dimuat dari %s: %v", filepath.Join(a.cfg.StateDir, "jobs"), err)
