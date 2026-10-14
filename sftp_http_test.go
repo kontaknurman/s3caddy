@@ -313,6 +313,43 @@ func TestSFTPRemotePinsTheHostKeyOnFirstSuccessfulTest(t *testing.T) {
 	}
 }
 
+func TestSFTPEditReusesThePasswordOnlyForTheSameLogin(t *testing.T) {
+	p := newTestPanel(t)
+	key := testHostKey(t)
+	form := func(port, user, password string) url.Values {
+		return url.Values{"type": {"sftp"}, "name": {"vps"}, "host": {"127.0.0.1"}, "port": {port}, "user": {user},
+			"auth": {"password"}, "password": {password}, "host_keys": {key}}
+	}
+	if body := p.followFlash(t, p.post(t, "/sync/remotes/add", form("22", "root", "rahasia-lama"))); !strings.Contains(body, "disimpan") {
+		t.Fatalf("add: %s", firstLines(body))
+	}
+	// Same login, blank password: kept.
+	if body := p.followFlash(t, p.post(t, "/sync/remotes/update", form("22", "root", ""))); !strings.Contains(body, "diperbarui") {
+		t.Errorf("same login: %s", firstLines(body))
+	}
+	if r, _ := p.app.remotes.Get("vps"); r.Password != "rahasia-lama" {
+		t.Errorf("password = %q", r.Password)
+	}
+	// Another port or user with a blank password: refused, nothing changes,
+	// so the stored password never goes to a server it was not typed for.
+	for _, f := range []url.Values{form("2222", "root", ""), form("22", "deploy", "")} {
+		body := p.followFlash(t, p.post(t, "/sync/remotes/update", f))
+		if !strings.Contains(body, "remote tidak diubah") || !strings.Contains(body, "isi password-nya lagi") {
+			t.Errorf("changed login kept the password: %s", firstLines(body))
+		}
+	}
+	if r, _ := p.app.remotes.Get("vps"); r.Port != 22 || r.User != "root" || r.Password != "rahasia-lama" {
+		t.Errorf("refused edit changed the remote: %d %s %q", r.Port, r.User, r.Password)
+	}
+	// Typed again: fine.
+	if body := p.followFlash(t, p.post(t, "/sync/remotes/update", form("2222", "deploy", "rahasia-baru"))); !strings.Contains(body, "diperbarui") {
+		t.Errorf("changed login with password: %s", firstLines(body))
+	}
+	if r, _ := p.app.remotes.Get("vps"); r.Port != 2222 || r.User != "deploy" || r.Password != "rahasia-baru" {
+		t.Errorf("after edit: %d %s %q", r.Port, r.User, r.Password)
+	}
+}
+
 func TestSFTPRemoteFormRefusesBadInput(t *testing.T) {
 	p := newTestPanel(t)
 	base := url.Values{"type": {"sftp"}, "name": {"vps"}, "host": {"127.0.0.1"}, "port": {"22"}, "user": {"root"}, "auth": {"password"}, "password": {"pw"},

@@ -497,6 +497,67 @@ func TestSFTPRemoteWithAnIPv6Host(t *testing.T) {
 	}
 }
 
+func TestRcloneConfigEchoNeverReachesLogsOrPages(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"fail-a.txt": "a", "b.txt": "b"})
+	e.knob(t, "echo-config", "1") // what rclone 1.60 prints with -vv
+	r, _ := e.remotes.Get("vps")
+
+	// Job runs: LastLog keeps rclone's last lines, never the config echo.
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/data/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if len(s.LastLog) == 0 {
+		t.Fatal("no log lines kept; the test needs some")
+	}
+	for _, l := range s.LastLog {
+		if strings.Contains(l, "from environment variable") || strings.Contains(l, "Setting pass") {
+			t.Errorf("config echo kept: %s", l)
+		}
+	}
+	// Probe errors: the line explaining the failure, never the echo.
+	e.knob(t, "sftp-password", "changed")
+	_, err = probeSFTP(t.Context(), e.mgr.rclone, r, "srv/data/", false)
+	if err == nil || strings.Contains(err.Error(), "from environment variable") || !strings.Contains(err.Error(), "unable to authenticate") {
+		t.Errorf("probe error = %v", err)
+	}
+	lines := rcloneLogTail("2026/01/01 00:00:00 DEBUG : Setting key_pem=\"-----BEGIN PRIVATE KEY-----\\\\nAAAA\" for \"probe\" from environment variable RCLONE_CONFIG_PROBE_KEY_PEM\n")
+	if len(lines) != 0 {
+		t.Errorf("rcloneLogTail kept %q", lines)
+	}
+}
+
+func TestResumeAndRerunCheckTheSpecAgain(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.remote.put("backup", "in/a.txt", []byte("a"), "text/plain")
+	st, err := e.mgr.Create(t.Context(), e.importSpec("skip-existing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := waitJob(t, e.mgr, st.ID, terminal); s.Status != JobDone {
+		t.Fatalf("status = %s", s.Status)
+	}
+	// The S3 remote is replaced by a VPS of the same name: the stored job
+	// still names a bucket on it, which a VPS does not have.
+	if err := e.remotes.Delete("wasabi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.remotes.Add(Remote{Name: "wasabi", Type: RemoteTypeSFTP, Host: "vps.example.com", Port: 22, User: "root",
+		Password: testSFTPPassword, HostKeys: []string{testHostKey(t)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.mgr.Rerun(st.ID); err == nil || !strings.Contains(err.Error(), "isi folder, bukan bucket") {
+		t.Errorf("rerun = %v", err)
+	}
+	if s, _ := e.mgr.Get(st.ID); s.Status != JobDone || s.Runs != 1 {
+		t.Errorf("a refused rerun changed the job: %s runs=%d", s.Status, s.Runs)
+	}
+}
+
 func TestSFTPImportResumesFromCheckpoint(t *testing.T) {
 	e := newJobTestEnv(t)
 	root := e.addSFTPRemote(t, "vps")

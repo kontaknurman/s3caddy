@@ -94,7 +94,7 @@
               <label class="check"><input type="radio" name="auth" value="key"{{if $r.UsesKey}} checked{{end}}> kunci SSH</label>
             </div>
             <div class="field" data-auth="password">
-              <label for="e-pw-{{$r.Name}}">Password <span class="muted">(kosongkan = tetap)</span></label>
+              <label for="e-pw-{{$r.Name}}">Password <span class="muted">(kosongkan = tetap; wajib diisi lagi kalau host, port, atau user diganti)</span></label>
               <input type="password" id="e-pw-{{$r.Name}}" name="password" autocomplete="new-password" placeholder="••••••••">
             </div>
             <div class="field" data-auth="key">
@@ -238,7 +238,7 @@
             <p class="small muted" style="margin: 6px 0 0;">Kosongkan: panel mengambil host key dari server sekarang dan menampilkan sidik jarinya untuk dicocokkan. Setelah itu setiap koneksi diverifikasi, jadi server palsu tidak bisa menyadap password.</p>
           </div>
         </details>
-        <p class="small muted" style="margin: 10px 0 12px;">Password/kunci disimpan di <span class="mono">remotes.json</span> (0600), hanya diberikan ke rclone lewat environment proses, dan tidak pernah ditampilkan lagi. Job berjalan dengan hak user SSH ini; folder sistem (<span class="mono">/etc</span>, <span class="mono">/usr</span>, <span class="mono">/root</span>, <span class="mono">.ssh</span>, …) ditolak.</p>
+        <p class="small muted" style="margin: 10px 0 12px;">Password/kunci disimpan di <span class="mono">remotes.json</span> (0600), hanya diberikan ke rclone lewat environment proses, dan tidak pernah ditampilkan lagi. Job berjalan dengan hak user SSH ini; folder sistem (<span class="mono">/etc</span>, <span class="mono">/usr</span>, <span class="mono">/root</span>, <span class="mono">.ssh</span>, …) ditolak. Kalau foldernya bisa ditulis aplikasi web, pakai user SSH biasa yang cukup boleh membacanya, bukan root.</p>
       </fieldset>
 
       <fieldset class="plain" data-for-type="s3">

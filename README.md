@@ -1430,6 +1430,13 @@ Bedanya dengan remote S3:
   bucket. Folder yang dipilih sendiri boleh berupa link (misalnya
   `/var/www/uploads` yang menunjuk ke `/mnt/disk2/uploads`). Kalau memang perlu
   mengikuti link: `RCLONE_EXTRA_ARGS="--sftp-skip-links=false"`.
+  Batasnya: yang dilewati adalah link yang sudah ada saat listing. Server SFTP
+  sendiri selalu mengikuti link saat membuka file, jadi kalau user lain di VPS
+  — misalnya aplikasi web yang diretas — bisa menulis di folder itu, ia bisa
+  menukar sebuah file dengan link ke `/etc/shadow` di sela listing dan
+  penyalinan, dan job yang login sebagai root akan menyalin isinya. Untuk
+  folder yang bisa ditulis aplikasi, pakai user SSH yang hanya boleh membaca
+  folder itu (user aplikasinya, atau user khusus), bukan root.
 - **Metadata.** Tanpa `-M`, karena file system tidak punya metadata S3. Saat
   impor, Content-Type ditebak rclone dari ekstensi (`.jpg` → `image/jpeg`,
   `.webp` → `image/webp`); pemilik dan izin file tidak dibawa. Saat ekspor,
@@ -1467,6 +1474,8 @@ folder berikut ditolak di kedua arah, sebelum ada koneksi ke VPS:
 | tepat `/home/<user>` | home directory memuat `.ssh`; subfoldernya boleh (`/home/budi/public_html`) |
 | `/var/lib/…`, `/var/spool/…` | state layanan: database, cron, kredensial |
 | `/var/backups/…` | cadangan file sistem Debian/Ubuntu, termasuk `shadow` |
+| `/var/run/…`, `/var/lock/…` | link ke `/run` (file runtime sistem) |
+| `/var/mail/…` | kotak surat user |
 | path apa pun yang memuat segmen `.ssh` atau `.gnupg` | kunci rahasia |
 
 Path juga harus absolut, tanpa `//`, tanpa segmen `.`/`..`, dan tanpa karakter
@@ -1837,8 +1846,13 @@ server itu alih-alih melewati pemeriksaan. Host key diambil dengan klien SSH
 kecil di dalam panel yang hanya melakukan pertukaran kunci — tanpa login dan
 tanpa kredensial. Folder sistem, home directory, dan `.ssh` ditolak sebelum
 ada koneksi (lihat [daftarnya](#sync-dengan-vps-lewat-ssh-sftp)), dan listing
-tidak mengikuti symlink, jadi link di dalam folder tidak bisa membawa file dari
-luar folder itu ke bucket.
+tidak mengikuti symlink. Server SFTP sendiri tetap mengikuti link saat file
+dibuka, jadi folder yang bisa ditulis user lain sebaiknya disalin dengan user
+SSH tanpa hak root. Password tersimpan hanya dipakai ulang untuk host, port,
+dan user yang sama: mengganti salah satunya lewat Edit mewajibkan password
+diisi lagi, supaya password tidak bisa dialihkan ke server lain. Baris debug
+rclone yang mencetak setelan remote (`-vv` di `RCLONE_EXTRA_ARGS`; rclone
+lama mencetak nilainya apa adanya) dibuang sebelum log disimpan.
 
 **Status.** Halaman Status hanya membaca file teks kernel di `/proc` dan
 `/sys` serta memanggil dua operasi baca Admin API; tidak ada perintah shell,

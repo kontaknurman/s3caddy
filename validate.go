@@ -542,6 +542,10 @@ func ValidateSFTPFolder(prefix string) error {
 		return fmt.Errorf("folder %s berisi state layanan (database, cron, kredensial); panel tidak menyalin dari atau ke sana", display)
 	case joined == "var/backups" || strings.HasPrefix(joined, "var/backups/"):
 		return fmt.Errorf("folder %s berisi cadangan file sistem Debian/Ubuntu (passwd, shadow); panel tidak menyalin dari atau ke sana", display)
+	case joined == "var/run" || strings.HasPrefix(joined, "var/run/") || joined == "var/lock" || strings.HasPrefix(joined, "var/lock/"):
+		return fmt.Errorf("folder %s adalah link ke /run (file runtime sistem); panel tidak menyalin dari atau ke sana", display)
+	case joined == "var/mail" || strings.HasPrefix(joined, "var/mail/"):
+		return fmt.Errorf("folder %s berisi kotak surat user; panel tidak menyalin dari atau ke sana", display)
 	}
 	return nil
 }

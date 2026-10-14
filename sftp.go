@@ -369,7 +369,7 @@ func rcloneLogTail(stderr string) []string {
 	var out []string
 	for _, line := range strings.Split(stderr, "\n") {
 		line = strings.TrimSpace(rcloneLogStamp.ReplaceAllString(strings.TrimSpace(line), ""))
-		if line == "" {
+		if line == "" || rcloneEchoesConfig(line) {
 			continue
 		}
 		out = append(out, truncate(line, rcloneMaxLineLen))

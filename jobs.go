@@ -1092,6 +1092,11 @@ func (m *JobManager) Resume(id string) error {
 	}
 	spec := h.state.JobSpec
 	h.mu.Unlock()
+	// The rules at creation are checked again: the remote may have been
+	// deleted and recreated as another kind, or the rules got stricter.
+	if err := m.validateSpec(spec); err != nil {
+		return fmt.Errorf("job %s tidak bisa dilanjutkan: %w", id, err)
+	}
 	if err := m.checkLimitsLocked(spec, id); err != nil {
 		return err
 	}
@@ -1125,6 +1130,9 @@ func (m *JobManager) Rerun(id string) error {
 	}
 	spec := h.state.JobSpec
 	h.mu.Unlock()
+	if err := m.validateSpec(spec); err != nil {
+		return fmt.Errorf("job %s tidak bisa dijalankan ulang: %w", id, err)
+	}
 	if err := m.checkLimitsLocked(spec, id); err != nil {
 		return err
 	}
@@ -1294,7 +1302,11 @@ func (m *JobManager) ResumeInterrupted() {
 				_ = m.persist(h)
 				continue
 			}
-			if err := m.checkLimitsLocked(spec, id); err != nil {
+			err := m.validateSpec(spec)
+			if err == nil {
+				err = m.checkLimitsLocked(spec, id)
+			}
+			if err != nil {
 				h.mu.Lock()
 				h.state.Status = JobPaused
 				h.state.PauseReason = "dijeda saat panel start: " + err.Error()

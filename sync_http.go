@@ -222,6 +222,12 @@ func sftpRemoteFromForm(ctx context.Context, r *http.Request, old *Remote) (Remo
 	case "password":
 		pw := strings.Trim(r.PostFormValue("password"), "\r\n")
 		if pw == "" && old != nil && old.Password != "" {
+			// SSH sends the password itself to the server, so a stored one
+			// is only reused for the same login: editing the host would
+			// otherwise hand it to any server the editor points at.
+			if old.Host != rem.Host || old.Port != rem.Port || old.User != rem.User {
+				return rem, nil, errors.New("host, port, atau user diganti: isi password-nya lagi (password tersimpan tidak dikirim ke server lain)")
+			}
 			pw = old.Password
 		}
 		if pw == "" {

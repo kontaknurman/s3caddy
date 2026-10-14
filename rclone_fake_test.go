@@ -154,6 +154,15 @@ func fakeRcloneMain(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if readKnob(dir, "echo-config") != "" {
+		// rclone before ~1.69 with -vv prints every RCLONE_CONFIG_* value.
+		for _, kv := range os.Environ() {
+			if k, v, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "RCLONE_CONFIG_SRC_") {
+				opt := strings.ToLower(strings.TrimPrefix(k, "RCLONE_CONFIG_SRC_"))
+				logJSON(map[string]any{"level": "debug", "msg": fmt.Sprintf("Setting %s=%q for \"src\" from environment variable %s", opt, v, k)})
+			}
+		}
+	}
 	stats := rcloneStats{TotalTransfers: int64(len(keys))}
 	emitStats := func() {
 		logJSON(map[string]any{"level": "notice", "msg": "stats", "stats": stats})
@@ -380,6 +389,13 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 	_ = os.WriteFile(filepath.Join(dir, fmt.Sprintf("cmd-%d-%d.json", time.Now().UnixNano(), os.Getpid())), recBytes, 0o600)
 	logf := func(level, format string, a ...any) {
 		fmt.Fprintf(os.Stderr, "2026/01/01 00:00:00 %-6s: %s\n", level, fmt.Sprintf(format, a...))
+	}
+	if readKnob(dir, "echo-config") != "" {
+		for _, kv := range os.Environ() {
+			if k, v, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "RCLONE_CONFIG_") {
+				logf("DEBUG", "Setting %s=%q for %q from environment variable %s", k, v, "probe", k)
+			}
+		}
 	}
 	if len(positional) == 0 {
 		logf("CRITICAL", "no path")

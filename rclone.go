@@ -217,7 +217,7 @@ func (r *rcloneRunner) run(ctx context.Context, spec rcloneRun, onEvent func(rcl
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+		if line == "" || rcloneEchoesConfig(line) {
 			continue
 		}
 		ev, ok := parseRcloneLine(line)
@@ -245,6 +245,15 @@ func (r *rcloneRunner) run(ctx context.Context, spec rcloneRun, onEvent func(rcl
 		return exitErr.ExitCode(), ring, nil
 	}
 	return -1, ring, fmt.Errorf("rclone: %w", waitErr)
+}
+
+// rcloneEchoesConfig reports a debug line in which rclone prints a remote's
+// setting as read from RCLONE_CONFIG_* (only with -vv in RCLONE_EXTRA_ARGS).
+// rclone before about v1.69 prints the value itself — the S3 secret, the
+// obscured SFTP password, the whole SSH private key — so such a line is
+// never kept, logged, or shown.
+func rcloneEchoesConfig(line string) bool {
+	return strings.Contains(line, "from environment variable RCLONE_CONFIG_")
 }
 
 // parseRcloneLine decodes one --use-json-log line.
