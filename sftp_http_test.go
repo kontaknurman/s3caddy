@@ -350,6 +350,28 @@ func TestSFTPEditReusesThePasswordOnlyForTheSameLogin(t *testing.T) {
 	}
 }
 
+func TestSyncPageExplainsThatSFTPNeedsANewerRclone(t *testing.T) {
+	p := newTestPanel(t, func(c *Config) {
+		// Ubuntu 24.04's apt rclone; the knob is read when rclone is detected.
+		if err := os.WriteFile(filepath.Join(filepath.Dir(c.RcloneBin), "version"), []byte("rclone v1.60.1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	})
+	_, body := p.get(t, "/sync")
+	if !strings.Contains(body, "butuh rclone v1.63") || !strings.Contains(body, "rclone v1.60.1") {
+		t.Errorf("no notice on the form: %s", firstLines(body))
+	}
+	resp := p.post(t, "/sync/remotes/add", url.Values{"type": {"sftp"}, "name": {"vps"}, "host": {"127.0.0.1"}, "port": {"22"},
+		"user": {"root"}, "auth": {"password"}, "password": {"x"}, "host_keys": {testHostKey(t)}})
+	if body = p.followFlash(t, resp); !strings.Contains(body, "remote tidak disimpan") || !strings.Contains(body, "butuh rclone v1.63") {
+		t.Errorf("SFTP remote saved on rclone 1.60: %s", firstLines(body))
+	}
+	if n := len(p.app.remotes.List()); n != 0 {
+		t.Errorf("%d remotes saved", n)
+	}
+	p.addTestRemote(t) // S3 remotes still work on 1.60
+}
+
 func TestSFTPRemoteFormRefusesBadInput(t *testing.T) {
 	p := newTestPanel(t)
 	base := url.Values{"type": {"sftp"}, "name": {"vps"}, "host": {"127.0.0.1"}, "port": {"22"}, "user": {"root"}, "auth": {"password"}, "password": {"pw"},

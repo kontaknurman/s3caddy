@@ -329,8 +329,9 @@ rclone version        # harus: rclone v1.59 atau lebih baru
 ```
 
 Distro yang paketnya lebih tua dari 1.59 (Ubuntu 22.04 punya 1.53 — terlalu
-lama, panel menolaknya karena butuh `--metadata`): pakai skrip resmi, yang
-memasang binary statis ke `/usr/bin/rclone`:
+lama, panel menolaknya karena butuh `--metadata`) — dan siapa pun yang memakai
+remote VPS lewat SSH, yang butuh **1.63+** (paket apt Ubuntu 24.04 masih 1.60):
+pakai skrip resmi, yang memasang binary statis ke `/usr/bin/rclone`:
 
 ```bash
 curl -fsSL https://rclone.org/install.sh | sudo bash
@@ -1321,7 +1322,12 @@ Garage di belakang Cloudflare menolak tanda tangan rclone? Tambahkan
 Remote juga bisa berupa **folder di VPS atau server lain** yang bisa di-SSH:
 misalnya server web lama yang gambarnya mau dipindah ke Garage, atau VPS
 cadangan yang harus menerima salinan bucket. Di VPS tidak perlu memasang apa
-pun — SFTP sudah bagian dari OpenSSH (`sshd`).
+pun — SFTP sudah bagian dari OpenSSH (`sshd`). Di server panel, rclone harus
+**v1.63 atau lebih baru** (skrip resmi di
+[rclone (di server, untuk Sync)](#rclone-di-server-untuk-sync)): versi lama
+tidak bisa dipaksa memakai jenis host key yang disematkan, sehingga koneksi
+gagal dengan "key mismatch". Dengan rclone lama, form menampilkan alasannya
+dan remote VPS tidak bisa disimpan; remote S3 tetap jalan.
 
 **Menambah remote VPS.** Klik **+ Tambah remote**, pilih **VPS lewat SSH**:
 
@@ -1420,8 +1426,11 @@ Bedanya dengan remote S3:
   120000 file …"). Disk sementara ±150 MB per sejuta file. Memori panel tetap
   kecil, tapi rclone membaca satu direktori utuh sekaligus: ±0,7 KB RAM per
   file di direktori terbesar (folder datar 2 juta file ±1,5 GB di server
-  panel). Listing sejuta file lewat SSH bisa makan beberapa menit sebelum
-  transfer pertama dimulai.
+  panel). Unit systemd memberi `MemoryMax=4G`; kalau tetap kurang, rclone
+  dihentikan kernel, job gagal dengan pesan "dihentikan paksa (SIGKILL)", dan
+  batasnya bisa dinaikkan dengan `sudo systemctl edit garagepanel` (isi
+  `[Service]` lalu `MemoryMax=8G`). Listing sejuta file lewat SSH bisa makan
+  beberapa menit sebelum transfer pertama dimulai.
 - **Symlink tidak diikuti.** Link di dalam folder — ke file, ke folder lain,
   atau balik ke atas — dilewati saat listing, begitu juga FIFO, socket, dan
   device. Diikuti, link balik ke atas menyalin folder yang sama berulang-ulang
@@ -1437,6 +1446,11 @@ Bedanya dengan remote S3:
   penyalinan, dan job yang login sebagai root akan menyalin isinya. Untuk
   folder yang bisa ditulis aplikasi, pakai user SSH yang hanya boleh membaca
   folder itu (user aplikasinya, atau user khusus), bukan root.
+  Di **folder tujuan ekspor** aturan yang sama membuat isi folder yang berupa
+  link tidak terlihat oleh listing: file di bawahnya dianggap belum ada, jadi
+  disalin ulang setiap run, dan karena server mengikuti link, tertulis ke
+  target link itu. Ekspor langsung ke folder targetnya (misalnya job terpisah
+  ke `/mnt/disk2/videos`), jangan lewat link di dalam folder tujuan.
 - **Metadata.** Tanpa `-M`, karena file system tidak punya metadata S3. Saat
   impor, Content-Type ditebak rclone dari ekstensi (`.jpg` → `image/jpeg`,
   `.webp` → `image/webp`); pemilik dan izin file tidak dibawa. Saat ekspor,
@@ -1446,12 +1460,17 @@ Bedanya dengan remote S3:
   `chown -R www-data: /var/www/uploads`.
 - **Folder kosong** tidak ikut di kedua arah: di file system folder ada karena
   isinya, dan objek marker `nama/` tidak dijadikan folder kosong di VPS.
+- **Nama file yang bukan UTF-8** (misalnya Latin-1 dari server lama) tidak bisa
+  disebut rclone lewat daftar file: file itu dicatat di "key yang gagal"
+  beserta alasannya, bukan dilewati diam-diam. Ubah namanya di VPS, misalnya
+  `convmv -f latin1 -t utf8 -r --notest /var/www/uploads`, lalu jalankan job
+  lagi.
 - **Verifikasi MD5.** Di kedua arah rclone menjalankan `md5sum <file>` lewat
   SSH di VPS untuk **setiap file** dan mencocokkannya dengan MD5 di sisi S3
   (kalau user itu punya shell): impor membaca tiap file di VPS dua kali, ekspor
   memeriksa file yang baru ditulis sebelum diberi nama akhirnya. Ekspor menulis
-  ke `<nama>.<acak>.partial` lalu me-rename-nya (rclone 1.63+), jadi web server
-  di VPS tidak pernah melayani file setengah jadi; kalau job dihentikan paksa,
+  ke `<nama>.<acak>.partial` lalu me-rename-nya, jadi web server di VPS tidak
+  pernah melayani file setengah jadi; kalau job dihentikan paksa,
   sisa `*.partial` aman dihapus. Untuk jutaan file kecil atau VPS lemah,
   verifikasi ini bisa dimatikan supaya lebih cepat (ukuran tetap dicek):
   `RCLONE_EXTRA_ARGS="--sftp-disable-hashcheck"`. Server lama yang hanya bicara
@@ -1653,7 +1672,10 @@ ulang systemd sebelum restart. **Versi dengan fitur Sync mengubahnya**: ada
 baris `StateDirectory=garagepanel` (membuat `/var/lib/garagepanel`),
 `MemoryMax=1G`, dan `TimeoutStopSec=30`. Tanpa unit baru, halaman Sync
 menampilkan notice "direktori state tidak bisa dipakai" beserta perintah
-`install -d` untuk membuatnya manual.
+`install -d` untuk membuatnya manual. **Versi dengan remote VPS (SFTP)**
+menaikkan `MemoryMax` ke 4G (listing folder datar besar) dan menambah
+`OOMPolicy=continue`, supaya rclone yang kehabisan memori tidak ikut
+menghentikan panel.
 
 ```bash
 sudo install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
@@ -2086,6 +2108,16 @@ berubah di VPS, jangan diterima — ada yang menyadap jalurnya.
 **Tes koneksi VPS: `connection refused` / `i/o timeout` / "tidak bisa
 menghubungi"** — port SSH salah, sshd mati, atau firewall VPS (ufw, security
 group penyedia) tidak menerima IP server panel.
+
+**Remote VPS: "butuh rclone v1.63 atau lebih baru"** — paket apt Ubuntu 24.04
+masih 1.60. Pasang versi resmi dengan
+`curl -fsSL https://rclone.org/install.sh | sudo bash`, lalu
+`sudo systemctl restart garagepanel`.
+
+**Job VPS gagal "rclone dihentikan paksa (SIGKILL)"** — kehabisan memori saat
+men-list folder datar yang sangat besar (±0,7 KB per file). Naikkan
+`MemoryMax` lewat `sudo systemctl edit garagepanel`, atau bagi folder itu ke
+beberapa subfolder.
 
 **Job VPS lama di "mendaftar isi …"** — folder besar sedang di-list lewat SSH,
 direktori demi direktori; jumlah filenya bertambah di kartu job. Kalau listing

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // The panel decides *what* to copy; rclone copies it. Both sides of a job are
@@ -192,7 +193,15 @@ type chunkBuilder struct {
 	max int
 	// onInvalid is told about keys that cannot be handed to rclone.
 	onInvalid func(key, reason string)
+	// folderSource: the source is a folder on an SFTP server. rclone prints
+	// its listing as JSON, which turns a name that is not valid UTF-8 into
+	// one with U+FFFD; that name does not exist on the server, and rclone
+	// would skip it without a word when told to copy it.
+	folderSource bool
 }
+
+// badFolderNameReason is recorded for such a name.
+const badFolderNameReason = "nama file di VPS bukan UTF-8 yang valid (misalnya Latin-1 dari server lama), jadi rclone tidak bisa menyebutnya dan file ini tidak disalin. Ubah namanya ke UTF-8 di VPS, misalnya: convmv -f latin1 -t utf8 -r --notest <folder>"
 
 // unsupportedKeyReason explains why a key cannot go into a chunk file. rclone
 // reads the file line by line and cleans paths, so a key with a newline, a
@@ -249,7 +258,11 @@ func (b *chunkBuilder) next(ctx context.Context, path string) (chunkResult, bool
 			res.Markers = append(res.Markers, rel)
 			continue
 		}
-		if reason := unsupportedKeyReason(rel); reason != "" {
+		reason := unsupportedKeyReason(rel)
+		if reason == "" && b.folderSource && strings.ContainsRune(rel, utf8.RuneError) {
+			reason = badFolderNameReason
+		}
+		if reason != "" {
 			res.Invalid++
 			if b.onInvalid != nil {
 				b.onInvalid(obj.Key, reason)

@@ -115,6 +115,9 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	data["HasActive"] = active > 0
 	data["ActiveCount"] = active
 	data["RcloneVersion"] = a.rcloneVersion()
+	if err := a.jobs.rclone.sftpSupport(); err != nil {
+		data["SFTPUnsupported"] = err.Error()
+	}
 	data["ChunkKeys"] = syncChunkKeys
 	a.render(w, r, "sync.html", data)
 }
@@ -284,6 +287,10 @@ func (a *App) handleRemoteAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.PostFormValue("type") == RemoteTypeSFTP {
+		if err := a.jobs.rclone.sftpSupport(); err != nil {
+			a.redirectErr(w, r, "/sync", fmt.Errorf("remote tidak disimpan: %w", err))
+			return
+		}
 		remote, notes, err := sftpRemoteFromForm(r.Context(), r, nil)
 		if err == nil {
 			err = a.remotes.Add(remote)

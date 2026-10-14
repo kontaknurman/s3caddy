@@ -64,9 +64,16 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # Batas memori: panel sendiri kecil (upload disangga maksimal 50 MB), tapi job
 # sync menjalankan rclone sebagai proses anak di cgroup yang sama. Satu rclone
 # memakai ~100-250 MB (transfers × 2 × 8 MiB buffer multipart + baseline), dan
-# panel membatasi 2 job berjalan bersamaan.
+# panel membatasi 2 job berjalan bersamaan. Listing folder di VPS (SFTP) lain:
+# rclone membaca satu direktori utuh sekaligus, ±0,7 KB per file, jadi folder
+# datar berisi 2 juta file butuh ±1,5 GB. 4G memberi ruang untuk itu.
 LimitNOFILE=4096
-MemoryMax=1G
+MemoryMax=4G
+# Kalau rclone tetap dibunuh karena kehabisan memori, hanya rclone yang mati:
+# job-nya gagal dengan pesan yang jelas dan panel tetap jalan. Dengan bawaan
+# systemd (stop) seluruh panel dihentikan, Restart= menyalakannya lagi, dan
+# job yang sama mengulang listing yang sama, terus-menerus.
+OOMPolicy=continue
 
 # Saat stop/restart, panel memberi job yang sedang berjalan waktu untuk
 # menyimpan checkpoint dan menghentikan rclone dengan rapi. Job lanjut

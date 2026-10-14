@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // The merge-join needs both sides in byte order. An S3 listing already comes
@@ -135,10 +136,21 @@ func (r *rcloneRunner) streamLsjson(ctx context.Context, env []string, args []st
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
+		// The panel stops rclone with SIGINT; a SIGKILL from elsewhere is the
+		// kernel's OOM killer (or an operator).
+		if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+			return -1, lines, errors.New(rcloneKilledMessage)
+		}
 		return exitErr.ExitCode(), lines, nil
 	}
 	return -1, lines, fmt.Errorf("rclone: %w", waitErr)
 }
+
+// rcloneKilledMessage explains an rclone listing killed by SIGKILL.
+const rcloneKilledMessage = "rclone dihentikan paksa (SIGKILL) saat men-list folder di VPS; hampir selalu karena kehabisan memori. " +
+	"rclone membaca satu direktori utuh sekaligus, ±0,7 KB per file, jadi folder datar dengan jutaan file butuh RAM besar. " +
+	"Naikkan batas memori panel: sudo systemctl edit garagepanel, isi [Service] lalu MemoryMax=8G, kemudian sudo systemctl restart garagepanel. " +
+	"Atau bagi folder itu ke beberapa subfolder."
 
 // sortedListingWriter collects entries and writes them, sorted, to disk.
 type sortedListingWriter struct {
@@ -179,6 +191,7 @@ func (w *sortedListingWriter) flushRun() error {
 		}
 		return nil
 	}); err != nil {
+		_ = os.Remove(path)
 		return err
 	}
 	w.runs = append(w.runs, path)
@@ -187,8 +200,9 @@ func (w *sortedListingWriter) flushRun() error {
 }
 
 // finish merges the runs into one sorted file, without duplicates, and
-// returns its path.
-func (w *sortedListingWriter) finish() (string, error) {
+// returns its path. A cancelled ctx stops the merge (tens of millions of
+// entries take a while; pause and shutdown should not wait for them).
+func (w *sortedListingWriter) finish(ctx context.Context) (string, error) {
 	if err := w.flushRun(); err != nil {
 		return "", err
 	}
@@ -223,7 +237,12 @@ func (w *sortedListingWriter) finish() (string, error) {
 	}
 	err := writeListingFile(out, func(emit func(listingEntry) error) error {
 		last, first := "", true
-		for h.Len() > 0 {
+		for n := 0; h.Len() > 0; n++ {
+			if n%65536 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			item := heap.Pop(h).(heapItem)
 			if first || item.entry.rel != last {
 				if err := emit(item.entry); err != nil {
@@ -241,6 +260,9 @@ func (w *sortedListingWriter) finish() (string, error) {
 		}
 		return nil
 	})
+	if err != nil {
+		_ = os.Remove(out)
+	}
 	return out, err
 }
 

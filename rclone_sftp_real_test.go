@@ -77,6 +77,16 @@ func TestRealRcloneSFTPImportExport(t *testing.T) {
 		t.Fatal(err)
 	}
 	mgr.chunkKeys = 100
+	if err := rc.sftpSupport(); err != nil {
+		// Too old to pin host key types: refused up front, with the reason.
+		if err := e.remotes.Add(Remote{Name: "vps", Type: RemoteTypeSFTP, Host: "127.0.0.1", Port: 22, User: "u", Password: "p", HostKeys: []string{testHostKey(t)}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.remotes.Probe(t.Context(), "vps", "/srv", false); err == nil || !strings.Contains(err.Error(), "butuh rclone v1.63") {
+			t.Errorf("rclone v%s: probe = %v", rc.version, err)
+		}
+		t.Skipf("rclone v%s cannot serve SFTP remotes; the refusal is checked", rc.version)
+	}
 
 	dir := t.TempDir()
 	root := filepath.Join(dir, "root")

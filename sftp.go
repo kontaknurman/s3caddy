@@ -42,7 +42,38 @@ const (
 	maxPrivateKeyLen  = 16 << 10
 	knownHostsDirName = "known_hosts"
 	sftpProbeTimeout  = 90 * time.Second
+
+	// rclone 1.63 is the oldest that can be told which host key types to
+	// accept (host_key_algorithms). Older ones pick ECDSA when they can, so a
+	// pinned ed25519 key alone fails as "key mismatch". 1.63 also uploads to
+	// a temporary name and renames, so a reader never sees half a file and a
+	// symlink in the way is replaced instead of written through.
+	rcloneSFTPMinMajor = 1
+	rcloneSFTPMinMinor = 63
 )
+
+// sftpParentBudget bounds the parent listing of a probe: a parent with
+// millions of entries falls back to asking the folder itself. A variable so
+// tests can shorten it.
+var sftpParentBudget = 20 * time.Second
+
+// sftpSupport says why this rclone cannot serve SFTP remotes, or nil.
+func (r *rcloneRunner) sftpSupport() error {
+	if r == nil {
+		return errors.New("rclone tidak tersedia, jadi remote SFTP tidak bisa dihubungi")
+	}
+	parts := strings.SplitN(r.version, ".", 3)
+	major, _ := strconv.Atoi(parts[0])
+	minor := 0
+	if len(parts) > 1 {
+		minor, _ = strconv.Atoi(parts[1])
+	}
+	if major > rcloneSFTPMinMajor || (major == rcloneSFTPMinMajor && minor >= rcloneSFTPMinMinor) {
+		return nil
+	}
+	return fmt.Errorf("remote VPS (SFTP) butuh rclone v%d.%d atau lebih baru; yang terpasang v%s (paket apt Ubuntu 24.04 masih 1.60). Pasang versi resmi: curl -fsSL https://rclone.org/install.sh | sudo bash, lalu restart panel",
+		rcloneSFTPMinMajor, rcloneSFTPMinMinor, r.version)
+}
 
 // rcloneObscureKey is rclone's fixed key for obscured config values. It is no
 // secret — rclone documents obscuring as a guard against casual glances only
@@ -455,8 +486,8 @@ func sftpError(r Remote, what string, lines []string) error {
 // the user may not read shows up when the job lists it.
 func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, write bool) (ProbeReport, error) {
 	var report ProbeReport
-	if rc == nil {
-		return report, errors.New("rclone tidak tersedia, jadi remote SFTP tidak bisa dihubungi")
+	if err := rc.sftpSupport(); err != nil {
+		return report, err
 	}
 	if len(r.HostKeys) == 0 {
 		return report, fmt.Errorf("remote %s: host key server belum disematkan. Klik Tes koneksi di kartu remote dulu", r.Name)
@@ -467,6 +498,9 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 	target := "probe:/" + folder
 	display := r.Name + ":/" + folder
 	exists, err := sftpFolderExists(ctx, rc, env, r, folder)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return report, fmt.Errorf("%s: pemeriksaan melewati %v; folder dan folder induknya berisi sangat banyak file, atau koneksi ke VPS lambat", display, sftpProbeTimeout)
+	}
 	if err != nil {
 		return report, err
 	}
@@ -505,35 +539,46 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 // disk). Listing the folder itself would cost one round trip per ~100 names,
 // minutes for a flat folder of millions of files, and the probe runs inside
 // an HTTP request. The parent listing also proves the login and the pinned
-// host key. If the parent cannot be read (mode 711), the folder's own
-// listing is the fallback.
+// host key. When the parent cannot be read (mode 711) or is itself huge
+// (still listing after sftpParentBudget), the folder is asked directly.
 func sftpFolderExists(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string) (bool, error) {
 	parent, base := path.Split(strings.TrimSuffix(folder, "/"))
 	found := false
-	code, lines, err := rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+parent, "--max-depth", "1", "--dirs-only", "--sftp-skip-links=false"),
+	pctx, cancel := context.WithTimeout(ctx, sftpParentBudget)
+	code, lines, err := rc.streamLsjson(pctx, env, probeLsjsonArgs("probe:/"+parent, "--max-depth", "1", "--dirs-only", "--sftp-skip-links=false"),
 		func(it lsjsonItem) error {
 			if it.IsDir && it.Path == base {
 				found = true
 			}
 			return nil
 		})
-	if err != nil {
-		return false, err
-	}
+	cancel()
 	switch {
+	case err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		// A huge parent: ask the folder itself.
+	case err != nil:
+		return false, err
 	case code == 0:
 		return found, nil
 	case code == 3:
 		return false, nil // the parent does not exist either
-	case strings.Contains(strings.ToLower(rcloneProblem(lines)), "permission denied"):
-		code, lines, err = rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+folder, "--max-depth", "1"),
-			func(lsjsonItem) error { return nil })
-		if err != nil {
-			return false, err
-		}
-		if code == 0 || code == 3 {
-			return code == 0, nil
-		}
+	case !strings.Contains(strings.ToLower(rcloneProblem(lines)), "permission denied"):
+		return false, sftpError(r, r.Name+":/"+folder, lines)
+	}
+	return sftpFolderListable(ctx, rc, env, r, folder)
+}
+
+// sftpFolderListable is the fallback of sftpFolderExists: list the folder
+// itself, one level. The path ends in "/", so a file of that name is
+// "directory not found" (exit 3), like a missing folder.
+func sftpFolderListable(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string) (bool, error) {
+	code, lines, err := rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+folder, "--max-depth", "1"),
+		func(lsjsonItem) error { return nil })
+	switch {
+	case err != nil:
+		return false, err
+	case code == 0 || code == 3:
+		return code == 0, nil
 	}
 	return false, sftpError(r, r.Name+":/"+folder, lines)
 }

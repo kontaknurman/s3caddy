@@ -558,6 +558,151 @@ func TestResumeAndRerunCheckTheSpecAgain(t *testing.T) {
 	}
 }
 
+func TestSFTPNeedsAnRcloneThatPinsHostKeyTypes(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"a.txt": "a"})
+	spec := JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/data/"}, Dst: Endpoint{Bucket: "masuk"}}
+	st, err := e.mgr.Create(t.Context(), spec) // v1.66: fine
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitJob(t, e.mgr, st.ID, terminal)
+
+	// Ubuntu 24.04's apt rclone.
+	e.knob(t, "version", "rclone v1.60.1")
+	old := e.open(t)
+	r, _ := e.remotes.Get("vps")
+	if _, err := probeSFTP(t.Context(), old.rclone, r, "srv/data/", false); err == nil || !strings.Contains(err.Error(), "butuh rclone v1.63") {
+		t.Errorf("probe on 1.60 = %v", err)
+	}
+	if _, err := old.Create(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "butuh rclone v1.63") {
+		t.Errorf("job on 1.60 = %v", err)
+	}
+	// A job resumed after rclone was downgraded stops with the same reason.
+	if err := old.Rerun(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s := waitJob(t, old, st.ID, terminal); s.Status != JobFailed || !strings.Contains(s.Error, "butuh rclone v1.63") {
+		t.Errorf("rerun on 1.60: %s %q", s.Status, s.Error)
+	}
+	for v, ok := range map[string]bool{"1.62.2": false, "1.63": true, "1.63.0": true, "1.75.1": true, "2.0": true, "0.99": false} {
+		if got := (&rcloneRunner{version: v}).sftpSupport() == nil; got != ok {
+			t.Errorf("sftpSupport(%s) = %v", v, got)
+		}
+	}
+}
+
+func TestSFTPNamesThatAreNotUTF8AreReportedNotLost(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	dir := filepath.Join(root, "srv/lama")
+	writeTree(t, dir, map[string]string{"ok.jpg": "ok"})
+	if err := os.WriteFile(filepath.Join(dir, "caf\xe9.jpg"), []byte("latin-1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/lama/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Transferred != 1 || s.Counters.Failed != 1 {
+		t.Errorf("status=%s counters=%+v", s.Status, s.Counters)
+	}
+	failed, _, err := e.mgr.FailedKeys(st.ID, 10)
+	if err != nil || len(failed) != 1 || failed[0].Key != "/srv/lama/caf�.jpg" || !strings.Contains(failed[0].Error, "bukan UTF-8") {
+		t.Errorf("failed = %+v %v", failed, err)
+	}
+}
+
+func TestSFTPListingKilledForMemoryExplainsItself(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/datar"), map[string]string{"a.jpg": "a"})
+	e.knob(t, "lsjson-oom", "1")
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/datar/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobFailed || !strings.Contains(s.Error, "SIGKILL") || !strings.Contains(s.Error, "MemoryMax") {
+		t.Errorf("status=%s err=%q", s.Status, s.Error)
+	}
+	if left, _ := filepath.Glob(filepath.Join(e.stateDir, "jobs", st.ID, "listing-*")); len(left) != 0 {
+		t.Errorf("listing files left behind: %v", left)
+	}
+}
+
+func TestSFTPListingCleansUpAfterCrashesAndCancels(t *testing.T) {
+	// A crashed earlier run left listing files: the next run removes them.
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"a.txt": "a"})
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/data/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitJob(t, e.mgr, st.ID, terminal)
+	jobDir := filepath.Join(e.stateDir, "jobs", st.ID)
+	for _, f := range []string{"listing-src.run7", "listing-src.sorted", "listing-dst.run2"} {
+		if err := os.WriteFile(filepath.Join(jobDir, f), []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.mgr.Rerun(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s := waitJob(t, e.mgr, st.ID, terminal); s.Status != JobDone {
+		t.Fatalf("rerun: %s %q", s.Status, s.Error)
+	}
+	if left, _ := filepath.Glob(filepath.Join(jobDir, "listing-*")); len(left) != 0 {
+		t.Errorf("stale listing files survived: %v", left)
+	}
+
+	// A cancelled merge stops at once and leaves nothing.
+	old := sortRunEntries
+	sortRunEntries = 2
+	t.Cleanup(func() { sortRunEntries = old })
+	dir := t.TempDir()
+	w := newSortedListingWriter(dir, "listing-src")
+	for i := 0; i < 9; i++ {
+		_ = w.add(fmt.Sprintf("f%02d", 9-i), 1)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := w.finish(ctx); err == nil {
+		t.Error("a cancelled merge finished")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "*")); len(left) != 0 {
+		t.Errorf("files left after a cancelled merge: %v", left)
+	}
+}
+
+func TestSFTPProbeFallsBackWhenTheParentIsHuge(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/images/thumbs"), map[string]string{"a.jpg": "a"})
+	old := sftpParentBudget
+	sftpParentBudget = 300 * time.Millisecond
+	t.Cleanup(func() { sftpParentBudget = old })
+	e.knob(t, "sftp-slow", "/srv/images") // millions of entries next to thumbs/
+	r, _ := e.remotes.Get("vps")
+	start := time.Now()
+	if _, err := probeSFTP(t.Context(), e.mgr.rclone, r, "srv/images/thumbs/", false); err != nil {
+		t.Errorf("small folder in a huge parent: %v", err)
+	}
+	if _, err := probeSFTP(t.Context(), e.mgr.rclone, r, "srv/images/hilang/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
+		t.Errorf("missing folder in a huge parent: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("probes took %v; the slow parent listing must be abandoned", d)
+	}
+}
+
 func TestSFTPImportResumesFromCheckpoint(t *testing.T) {
 	e := newJobTestEnv(t)
 	root := e.addSFTPRemote(t, "vps")

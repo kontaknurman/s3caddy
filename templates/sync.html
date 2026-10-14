@@ -203,6 +203,7 @@
       </div>
 
       <fieldset class="plain" data-for-type="sftp" hidden disabled>
+        {{with .SFTPUnsupported}}<p class="small warn-text" style="margin: 0 0 12px;">{{.}}</p>{{end}}
         <div class="row">
           <div class="field">
             <label for="r-host">Host (nama atau IP VPS)</label>

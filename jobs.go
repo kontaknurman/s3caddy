@@ -644,6 +644,11 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 	if err != nil {
 		return err
 	}
+	if srcRemote.IsSFTP() || dstRemote.IsSFTP() {
+		if err := m.rclone.sftpSupport(); err != nil {
+			return err
+		}
+	}
 	// The panel's own S3 client lists S3 sides; SFTP sides are listed by
 	// rclone below.
 	var srcC, dstC *S3
@@ -678,6 +683,13 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 	}
 	chunkPath := filepath.Join(jobDir, "chunk.txt")
 	defer os.Remove(chunkPath)
+	// Listing files of a run that died mid-listing (a crash, a full disk)
+	// would only take space; every run lists afresh.
+	if stale, _ := filepath.Glob(filepath.Join(jobDir, "listing-*")); len(stale) > 0 {
+		for _, f := range stale {
+			_ = os.Remove(f)
+		}
+	}
 
 	checkpoint := h.snapshot().Checkpoint
 	startAfter := func(prefix string) string {
@@ -698,9 +710,10 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		failedPrefix = "/"
 	}
 	builder := &chunkBuilder{
-		src:  srcIt,
-		mode: spec.Mode,
-		max:  m.chunkKeys,
+		src:          srcIt,
+		mode:         spec.Mode,
+		max:          m.chunkKeys,
+		folderSource: spec.Src.IsFolder(),
 		onInvalid: func(key, reason string) {
 			h.mu.Lock()
 			h.addFailedLocked(FailedKey{Key: failedPrefix + key, Error: reason, At: m.now()})
@@ -884,7 +897,7 @@ func (m *JobManager) openListing(ctx context.Context, h *jobHandle, side, alias 
 		return nil, nil, err
 	}
 	h.setPhase(fmt.Sprintf("mengurutkan %d file dari %s …", w.count, e))
-	sorted, err := w.finish()
+	sorted, err := w.finish(ctx)
 	if err != nil {
 		h.setPhase("")
 		return nil, nil, err

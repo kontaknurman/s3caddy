@@ -434,6 +434,17 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 			logf("ERROR", "private: error listing: permission denied")
 			return code
 		}
+		// Knob "sftp-slow": absolute paths whose listing takes 10 s (a
+		// directory with millions of entries). SIGINT ends it, as rclone.
+		for _, p := range strings.Split(readKnob(dir, "sftp-slow"), "\n") {
+			if p = strings.TrimSpace(p); p != "" && filepath.Clean(side.dir) == filepath.Join(side.root, filepath.FromSlash(p)) {
+				time.Sleep(10 * time.Second)
+			}
+		}
+		// Knob "lsjson-oom": the kernel's OOM killer ends a job's listing.
+		if readKnob(dir, "lsjson-oom") != "" && flags["-R"] {
+			_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		}
 		// Knob "sftp-unreadable": absolute paths on the fake server, one per
 		// line, whose listing is refused (directories with mode 711).
 		for _, p := range strings.Split(readKnob(dir, "sftp-unreadable"), "\n") {

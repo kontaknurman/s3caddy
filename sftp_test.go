@@ -322,7 +322,7 @@ func TestSortedListingMergesRunsInByteOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	path, err := w.finish()
+	path, err := w.finish(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +370,7 @@ func TestSortedListingMergesRunsInByteOrder(t *testing.T) {
 	for _, rel := range []string{"b", "a", "b"} {
 		_ = w.add(rel, 1)
 	}
-	one, err := w.finish()
+	one, err := w.finish(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestSortedListingMergesRunsInByteOrder(t *testing.T) {
 	}
 
 	// Nothing listed: an empty file, an iterator that is done at once.
-	empty, err := newSortedListingWriter(dir, "listing-dst").finish()
+	empty, err := newSortedListingWriter(dir, "listing-dst").finish(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
