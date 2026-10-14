@@ -691,13 +691,19 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		return err
 	}
 	defer closeSrc()
+	// Failed keys of a folder on a VPS are shown as the absolute paths they
+	// are there ("/var/www/uploads/a.jpg").
+	failedPrefix := ""
+	if spec.Src.IsFolder() {
+		failedPrefix = "/"
+	}
 	builder := &chunkBuilder{
 		src:  srcIt,
 		mode: spec.Mode,
 		max:  m.chunkKeys,
 		onInvalid: func(key, reason string) {
 			h.mu.Lock()
-			h.addFailedLocked(FailedKey{Key: key, Error: reason, At: m.now()})
+			h.addFailedLocked(FailedKey{Key: failedPrefix + key, Error: reason, At: m.now()})
 			h.mu.Unlock()
 		},
 	}
@@ -741,7 +747,7 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 				Env:        env,
 				Transfers:  spec.Transfers,
 				NoMetadata: noMetadata,
-			}, h.onRcloneEvent(spec.Src.Prefix, m.now))
+			}, h.onRcloneEvent(failedPrefix+spec.Src.Prefix, m.now))
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()

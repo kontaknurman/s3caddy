@@ -426,12 +426,16 @@ func (a *App) sftpTest(w http.ResponseWriter, r *http.Request, name, folder stri
 		a.redirectErr(w, r, "/sync", fmt.Errorf("tes koneksi gagal: %w%s", err, pinned))
 		return
 	}
-	msg := fmt.Sprintf("Remote %q bisa login dan membaca folder %s", name, folder)
-	if write {
-		msg += "; menulis dan menghapus file uji juga berhasil"
+	var msg string
+	switch {
+	case write && report.Created:
+		msg = fmt.Sprintf("Remote %q bisa login; folder %s belum ada, jadi dibuat, lalu menulis dan menghapus file uji di sana berhasil. Login, host key, dan izin tulisnya benar.", name, folder)
+	case write:
+		msg = fmt.Sprintf("Remote %q bisa login, folder %s ada, dan menulis lalu menghapus file uji di sana berhasil. Login, host key, dan izin tulisnya benar.", name, folder)
+	default:
+		msg = fmt.Sprintf("Remote %q bisa login dan folder %s ada. Login dan host key-nya benar; isi folder dibaca saat job berjalan.", name, folder)
 	}
-	msg += ". Login, host key, dan izin foldernya benar." + pinned
-	a.redirectOK(w, r, "/sync", msg)
+	a.redirectOK(w, r, "/sync", msg+pinned)
 }
 
 // syncSpecFromForm reads the shared job/schedule form. On an SFTP remote the

@@ -583,26 +583,37 @@ func (s *RemoteStore) Delete(name string) error {
 	return nil
 }
 
-// setHostKeys pins the host keys a probe fetched.
-func (s *RemoteStore) setHostKeys(name string, keys []string) error {
+// pinHostKeys pins the host keys a probe fetched from host:port on first
+// contact. The fetch takes seconds without the lock held, so the remote may
+// have changed meanwhile: keys from a server the remote no longer points at
+// are refused, and keys pinned in between (by an edit or another test) are
+// kept. pinned reports whether these keys were stored.
+func (s *RemoteStore) pinHostKeys(name, host string, port int, keys []string) (pinned bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	updated := append([]Remote{}, s.remotes...)
 	for i := range updated {
-		if updated[i].Name == name {
-			updated[i].HostKeys = keys
-			updated[i].HostKeysAt = time.Now().UTC().Truncate(time.Second)
-			if err := s.writeKnownHosts(updated[i]); err != nil {
-				return err
-			}
-			if err := s.saveLocked(updated); err != nil {
-				return err
-			}
-			s.remotes = updated
-			return nil
+		if updated[i].Name != name {
+			continue
 		}
+		if !updated[i].IsSFTP() || updated[i].Host != host || updated[i].Port != port {
+			return false, fmt.Errorf("remote %q diubah selama tes koneksi; jalankan tesnya lagi", name)
+		}
+		if len(updated[i].HostKeys) > 0 {
+			return false, nil
+		}
+		updated[i].HostKeys = keys
+		updated[i].HostKeysAt = time.Now().UTC().Truncate(time.Second)
+		if err := s.writeKnownHosts(updated[i]); err != nil {
+			return false, err
+		}
+		if err := s.saveLocked(updated); err != nil {
+			return false, err
+		}
+		s.remotes = updated
+		return true, nil
 	}
-	return fmt.Errorf("remote %q tidak ada", name)
+	return false, fmt.Errorf("remote %q tidak ada", name)
 }
 
 func (s *RemoteStore) saveLocked(remotes []Remote) error {
@@ -629,6 +640,8 @@ type ProbeReport struct {
 	Leftover string // key of a test object that could not be deleted
 	// PinnedKeys are the SFTP host keys this probe fetched and pinned.
 	PinnedKeys []string
+	// Created: the SFTP folder did not exist and the write test made it.
+	Created bool
 }
 
 // Probe checks a bucket on the remote: read (list one key), and when write is
@@ -654,11 +667,16 @@ func (s *RemoteStore) Probe(ctx context.Context, name, bucket string, write bool
 			if err != nil {
 				return ProbeReport{}, fmt.Errorf("remote %s: %w", r.Name, err)
 			}
-			if err := s.setHostKeys(name, keys); err != nil {
+			stored, err := s.pinHostKeys(name, r.Host, r.Port, keys)
+			if err != nil {
 				return ProbeReport{}, err
 			}
-			r, _ = s.Get(name)
-			pinned = keys
+			if stored {
+				pinned = keys
+			}
+			if r, ok = s.Get(name); !ok {
+				return ProbeReport{}, fmt.Errorf("remote %q tidak ada", name)
+			}
 		}
 		s.mu.Lock()
 		rc := s.rclone

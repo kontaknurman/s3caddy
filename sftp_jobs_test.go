@@ -90,6 +90,10 @@ func TestSFTPImportCopiesAFolderTreeIntoABucket(t *testing.T) {
 	if s.Direction() != "Impor" || s.Src.String() != "vps:/var/www/uploads/" || s.Phase != "" {
 		t.Errorf("direction %q src %q phase %q", s.Direction(), s.Src.String(), s.Phase)
 	}
+	// A failed file is listed as the absolute path it has on the VPS.
+	if failed, total, err := e.mgr.FailedKeys(st.ID, 10); err != nil || total != 1 || failed[0].Key != "/var/www/uploads/komik-b/fail-broken.jpg" {
+		t.Errorf("failed keys = %+v (%d) %v", failed, total, err)
+	}
 
 	// Two copy runs (chunks of 3 keys), source as an absolute sftp path,
 	// no -M (a file system has no S3 metadata), password only obscured.
@@ -367,6 +371,129 @@ func TestSFTPMissingDestinationFolderIsAnEmptyListing(t *testing.T) {
 	}
 	if h.state.Phase != "" {
 		t.Errorf("phase = %q", h.state.Phase)
+	}
+}
+
+func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	r, _ := e.remotes.Get("vps")
+	rc := e.mgr.rclone
+	// A big flat folder: listing it would cost a round trip per ~100 names.
+	files := map[string]string{}
+	for i := 0; i < 300; i++ {
+		files[fmt.Sprintf("img-%04d.jpg", i)] = "x"
+	}
+	writeTree(t, filepath.Join(root, "srv/komik/flat"), files)
+
+	before := len(readFakeRcloneCommands(t, e.rcDir))
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
+		t.Fatal(err)
+	}
+	cmds := readFakeRcloneCommands(t, e.rcDir)[before:]
+	if len(cmds) != 1 {
+		t.Fatalf("probe ran %d commands", len(cmds))
+	}
+	if args := strings.Join(cmds[0].Args, " "); !strings.HasPrefix(args, "lsjson probe:/srv/komik/ ") || !strings.Contains(args, "--dirs-only") || !strings.Contains(args, "--max-depth 1") {
+		t.Errorf("probe listed %s; it must look the folder up in its parent", args)
+	}
+
+	// A folder that is itself a link (data on another disk) is found, and a
+	// job lists what it points to.
+	writeTree(t, filepath.Join(root, "mnt/disk2/uploads"), map[string]string{"a.jpg": "aaa", "sub/b.jpg": "bb"})
+	if err := os.MkdirAll(filepath.Join(root, "var/www"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "mnt/disk2/uploads"), filepath.Join(root, "var/www/uploads")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := probeSFTP(t.Context(), rc, r, "var/www/uploads/", false); err != nil {
+		t.Errorf("symlinked folder: %v", err)
+	}
+	// A file with the folder's name is not a folder.
+	writeTree(t, filepath.Join(root, "srv"), map[string]string{"bukan-folder": "x"})
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/bukan-folder/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
+		t.Errorf("file taken for a folder: %v", err)
+	}
+	// Parent missing too.
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/tidak/ada/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
+		t.Errorf("missing parent: %v", err)
+	}
+
+	// A parent that may be entered but not read (mode 711): the folder's
+	// own listing is asked instead.
+	e.knob(t, "sftp-unreadable", "/srv/komik")
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
+		t.Errorf("unreadable parent: %v", err)
+	}
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/hilang/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
+		t.Errorf("unreadable parent, missing folder: %v", err)
+	}
+	// The folder itself unreadable too: the error says so.
+	e.knob(t, "sftp-unreadable", "/srv\n/srv/komik")
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/", false); err == nil || !strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("unreadable folder: %v", err)
+	}
+}
+
+func TestSFTPListingSkipsSymlinks(t *testing.T) {
+	e := newJobTestEnv(t)
+	root := e.addSFTPRemote(t, "vps")
+	src := filepath.Join(root, "srv/web/uploads")
+	writeTree(t, src, map[string]string{"a.jpg": "aaa", "komik/001.jpg": "1"})
+	writeTree(t, filepath.Join(root, "root/.ssh"), map[string]string{"id_ed25519": "PRIVATE"})
+	// A loop back up the tree and a link out of the folder.
+	if err := os.Symlink("..", filepath.Join(src, "komik/loop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "root/.ssh/id_ed25519"), filepath.Join(src, "kunci")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "root/.ssh"), filepath.Join(src, "ssh")); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 2,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/web/uploads/"}, Dst: Endpoint{Bucket: "web"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Listed != 2 || s.Counters.Transferred != 2 {
+		t.Errorf("status=%s counters=%+v err=%q", s.Status, s.Counters, s.Error)
+	}
+	if keys := strings.Join(e.garage.keys("web"), ","); keys != "a.jpg,komik/001.jpg" {
+		t.Errorf("bucket holds %s; links must not be followed", keys)
+	}
+	r, _ := e.remotes.Get("vps")
+	if got := envValue(strings.Join(r.rcloneEnv("src"), "\n"), "RCLONE_CONFIG_SRC_SKIP_LINKS"); got != "true" {
+		t.Errorf("SKIP_LINKS = %q", got)
+	}
+}
+
+func TestSFTPRemoteWithAnIPv6Host(t *testing.T) {
+	e := newJobTestEnv(t)
+	if err := e.remotes.Add(Remote{Name: "vps6", Type: RemoteTypeSFTP, Host: "[2001:DB8::10]", Port: 2222, User: "root",
+		Password: testSFTPPassword, HostKeys: []string{testHostKey(t)}}); err != nil {
+		t.Fatal(err)
+	}
+	e.knob(t, "sftp-password", testSFTPPassword)
+	r, _ := e.remotes.Get("vps6")
+	if r.Host != "2001:db8::10" || r.View().Endpoint != "sftp://root@[2001:db8::10]:2222" {
+		t.Errorf("stored host %q, shown as %q", r.Host, r.View().Endpoint)
+	}
+	if got := envValue(strings.Join(r.rcloneEnv("src"), "\n"), "RCLONE_CONFIG_SRC_HOST"); got != "[2001:db8::10]" {
+		t.Errorf("HOST = %q; rclone appends :port as is, so an IPv6 address needs brackets", got)
+	}
+	root := filepath.Join(e.rcDir, "sftp", "2001:db8::10")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"a.txt": "a"})
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps6", Prefix: "srv/data/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := waitJob(t, e.mgr, st.ID, terminal); s.Status != JobDone || s.Counters.Transferred != 1 {
+		t.Errorf("status=%s counters=%+v err=%q", s.Status, s.Counters, s.Error)
 	}
 }
 

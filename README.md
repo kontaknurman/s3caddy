@@ -1328,7 +1328,7 @@ pun — SFTP sudah bagian dari OpenSSH (`sshd`).
 | Kolom | Isi |
 |---|---|
 | Nama | seperti remote S3, misalnya `vps-lama` |
-| Host | IP atau nama DNS VPS saja — tanpa `root@`, tanpa `sftp://`, tanpa `:22` |
+| Host | IP (IPv4 atau IPv6) atau nama DNS VPS saja — tanpa `root@`, tanpa `sftp://`, tanpa `:22` |
 | Port SSH | bawaan `22` |
 | User SSH | `root`, atau user lain yang boleh membaca (impor) atau menulis (ekspor) folder itu |
 | Login dengan | **password**, atau **kunci SSH** (disarankan) |
@@ -1385,11 +1385,16 @@ berubah)? Tes koneksi dan job gagal dengan "Host key server TIDAK SAMA …"; kli
 **Edit**, centang **ambil ulang host key**, dan cocokkan sidik jari yang baru.
 
 **Tes koneksi.** Di kartu remote VPS, isi folder (path absolut, misalnya
-`/var/www/uploads`): panel login, membaca isi folder itu satu tingkat, lalu —
-kecuali "hanya baca" dipilih — menulis dan menghapus file
-`.garagepanel-probe-<acak>`. Folder yang belum ada dibuat dulu, karena tujuan
-ekspor memang boleh belum ada; pada tes "hanya baca" folder yang tidak ada
-dilaporkan sebagai error.
+`/var/www/uploads`): panel login dan mencari folder itu di folder induknya,
+lalu — kecuali "hanya baca" dipilih — menulis dan menghapus file
+`.garagepanel-probe-<acak>` di dalamnya. Isi folder sengaja tidak di-list:
+SFTP butuh satu round trip per ±100 nama, jadi folder datar berisi jutaan file
+bisa makan menit, sedangkan tes ini (dan pemeriksaan yang sama setiap kali job
+dibuat) berjalan di dalam request halaman. Folder yang belum ada dibuat dulu,
+karena tujuan ekspor memang boleh belum ada; pada tes "hanya baca" folder yang
+tidak ada dilaporkan sebagai error. Izin membaca isi folder baru teruji saat
+job men-list-nya: kalau ditolak, job berhenti dengan `permission denied`
+sebelum menyalin apa pun.
 
 **Job.** Pilih remote VPS di form job: kolom bucket dan folder remote berganti
 jadi **Folder di VPS**. Folder itu beserta seluruh subfoldernya yang disalin,
@@ -1412,13 +1417,26 @@ Bedanya dengan remote S3:
   di disk (merge sort eksternal per 100.000 entri; file sementara di
   `/var/lib/garagepanel/jobs/<id>/listing-*`, dihapus setelah run), baru
   merge-join seperti biasa. Kartu job menampilkan progresnya ("mendaftar isi …:
-  120000 file …"). Memori tetap kecil; disk sementara ±150 MB per sejuta file.
-  Listing sejuta file lewat SSH bisa makan beberapa menit sebelum transfer
-  pertama dimulai.
+  120000 file …"). Disk sementara ±150 MB per sejuta file. Memori panel tetap
+  kecil, tapi rclone membaca satu direktori utuh sekaligus: ±0,7 KB RAM per
+  file di direktori terbesar (folder datar 2 juta file ±1,5 GB di server
+  panel). Listing sejuta file lewat SSH bisa makan beberapa menit sebelum
+  transfer pertama dimulai.
+- **Symlink tidak diikuti.** Link di dalam folder — ke file, ke folder lain,
+  atau balik ke atas — dilewati saat listing, begitu juga FIFO, socket, dan
+  device. Diikuti, link balik ke atas menyalin folder yang sama berulang-ulang
+  sampai kernel menyerah (sekitar 40 tingkat), dan link ke `/etc` atau
+  `~/.ssh` membawa persis file yang ditolak aturan folder di bawah ke dalam
+  bucket. Folder yang dipilih sendiri boleh berupa link (misalnya
+  `/var/www/uploads` yang menunjuk ke `/mnt/disk2/uploads`). Kalau memang perlu
+  mengikuti link: `RCLONE_EXTRA_ARGS="--sftp-skip-links=false"`.
 - **Metadata.** Tanpa `-M`, karena file system tidak punya metadata S3. Saat
   impor, Content-Type ditebak rclone dari ekstensi (`.jpg` → `image/jpeg`,
   `.webp` → `image/webp`); pemilik dan izin file tidak dibawa. Saat ekspor,
-  yang ditulis adalah isi file beserta waktu modifikasinya.
+  yang ditulis adalah isi file beserta waktu modifikasinya; pemiliknya user SSH
+  tadi (misalnya root) dengan izin bawaan server (biasanya 644, folder 755).
+  Kalau aplikasi di VPS perlu menulis ke sana, sesuaikan sesudahnya, misalnya
+  `chown -R www-data: /var/www/uploads`.
 - **Folder kosong** tidak ikut di kedua arah: di file system folder ada karena
   isinya, dan objek marker `nama/` tidak dijadikan folder kosong di VPS.
 - **Verifikasi MD5.** Di kedua arah rclone menjalankan `md5sum <file>` lewat
@@ -1448,6 +1466,7 @@ folder berikut ditolak di kedua arah, sebelum ada koneksi ke VPS:
 | tepat `/root`, `/home`, atau `/var` | terlalu umum; subfoldernya boleh (`/root/backup`, `/var/www`) |
 | tepat `/home/<user>` | home directory memuat `.ssh`; subfoldernya boleh (`/home/budi/public_html`) |
 | `/var/lib/…`, `/var/spool/…` | state layanan: database, cron, kredensial |
+| `/var/backups/…` | cadangan file sistem Debian/Ubuntu, termasuk `shadow` |
 | path apa pun yang memuat segmen `.ssh` atau `.gnupg` | kunci rahasia |
 
 Path juga harus absolut, tanpa `//`, tanpa segmen `.`/`..`, dan tanpa karakter
@@ -1817,7 +1836,9 @@ host key-nya belum disematkan diberi file tanpa key, jadi rclone menolak
 server itu alih-alih melewati pemeriksaan. Host key diambil dengan klien SSH
 kecil di dalam panel yang hanya melakukan pertukaran kunci — tanpa login dan
 tanpa kredensial. Folder sistem, home directory, dan `.ssh` ditolak sebelum
-ada koneksi (lihat [daftarnya](#sync-dengan-vps-lewat-ssh-sftp)).
+ada koneksi (lihat [daftarnya](#sync-dengan-vps-lewat-ssh-sftp)), dan listing
+tidak mengikuti symlink, jadi link di dalam folder tidak bisa membawa file dari
+luar folder itu ke bucket.
 
 **Status.** Halaman Status hanya membaca file teks kernel di `/proc` dan
 `/sys` serta memanggil dua operasi baca Admin API; tidak ada perintah shell,

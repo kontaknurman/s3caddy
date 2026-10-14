@@ -318,6 +318,13 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Jobs started through the UI may still run when a test ends: stop
+	// them before the temp dirs are removed (cleanups run last-in, first-out).
+	t.Cleanup(func() {
+		if app.jobs != nil {
+			app.jobs.Shutdown(context.Background())
+		}
+	})
 	srv := httptest.NewServer(app.routes())
 	t.Cleanup(srv.Close)
 

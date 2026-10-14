@@ -540,6 +540,8 @@ func ValidateSFTPFolder(prefix string) error {
 		return fmt.Errorf("folder %s adalah home directory (memuat .ssh); pilih subfoldernya, misalnya %s/public_html", display, display)
 	case joined == "var/lib" || strings.HasPrefix(joined, "var/lib/") || joined == "var/spool" || strings.HasPrefix(joined, "var/spool/"):
 		return fmt.Errorf("folder %s berisi state layanan (database, cron, kredensial); panel tidak menyalin dari atau ke sana", display)
+	case joined == "var/backups" || strings.HasPrefix(joined, "var/backups/"):
+		return fmt.Errorf("folder %s berisi cadangan file sistem Debian/Ubuntu (passwd, shadow); panel tidak menyalin dari atau ke sana", display)
 	}
 	return nil
 }

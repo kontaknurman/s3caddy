@@ -65,6 +65,9 @@ func (e *jobTestEnv) open(t *testing.T) *JobManager {
 		t.Fatal(err)
 	}
 	mgr.chunkKeys = 3
+	// A test may end while a job it started still runs: stop the runners
+	// before the temp dirs are removed (cleanups run last-in, first-out).
+	t.Cleanup(func() { mgr.Shutdown(context.Background()) })
 	return mgr
 }
 

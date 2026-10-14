@@ -250,6 +250,7 @@ func TestSFTPFolderRules(t *testing.T) {
 		"/var/lib":         "state layanan",
 		"/var/lib/mysql":   "state layanan",
 		"/var/spool/cron":  "state layanan",
+		"/var/backups":     "shadow",
 		"/srv/../etc":      `".."`,
 		"/srv/./data":      `"."`,
 		"/srv/a\nb":        "karakter kontrol",
@@ -650,18 +651,6 @@ func TestRemoteStorePinsHostKeysInPrivateKnownHostsFiles(t *testing.T) {
 		t.Errorf("timestamps: created %v→%v updated %v", got.CreatedAt, after.CreatedAt, after.UpdatedAt)
 	}
 
-	// Pinning replaces the keys, as Tes koneksi does on first contact.
-	other := testHostKey(t)
-	if err := store.setHostKeys("vps", []string{other}); err != nil {
-		t.Fatal(err)
-	}
-	if raw, _ = os.ReadFile(kh); strings.Contains(string(raw), r.HostKeys[0]) || !strings.Contains(string(raw), other) {
-		t.Errorf("known_hosts after re-pin:\n%s", raw)
-	}
-	if after, _ := store.Get("vps"); after.HostKeysAt.IsZero() || len(after.HostKeys) != 1 {
-		t.Errorf("pin not recorded: %+v", after.HostKeys)
-	}
-
 	// Without pinned keys the file holds no key: rclone refuses the server.
 	upd.HostKeys = nil
 	if err := store.Update("vps", upd); err != nil {
@@ -672,6 +661,30 @@ func TestRemoteStorePinsHostKeysInPrivateKnownHostsFiles(t *testing.T) {
 		if line != "" && !strings.HasPrefix(line, "#") {
 			t.Errorf("unpinned remote has a known_hosts entry: %q", line)
 		}
+	}
+
+	// First contact (Tes koneksi) pins what the server presented…
+	other := testHostKey(t)
+	if pinned, err := store.pinHostKeys("vps", upd.Host, upd.Port, []string{other}); err != nil || !pinned {
+		t.Fatalf("first pin: %v %v", pinned, err)
+	}
+	if raw, _ = os.ReadFile(kh); !strings.Contains(string(raw), "\n* "+other+"\n") || strings.Contains(string(raw), r.HostKeys[0]) {
+		t.Errorf("known_hosts after pin:\n%s", raw)
+	}
+	if after, _ := store.Get("vps"); after.HostKeysAt.IsZero() || len(after.HostKeys) != 1 || after.HostKeys[0] != other {
+		t.Errorf("pin not recorded: %+v", after.HostKeys)
+	}
+	// …but a slower, concurrent test never replaces keys pinned meanwhile,
+	// and keys fetched from a server the remote no longer points at (it was
+	// edited during the test) are refused.
+	if pinned, err := store.pinHostKeys("vps", upd.Host, upd.Port, []string{r.HostKeys[0]}); err != nil || pinned {
+		t.Errorf("a second pin replaced the first: %v %v", pinned, err)
+	}
+	if _, err := store.pinHostKeys("vps", "198.51.100.7", upd.Port, []string{r.HostKeys[0]}); err == nil {
+		t.Error("keys fetched from another server were pinned")
+	}
+	if after, _ := store.Get("vps"); len(after.HostKeys) != 1 || after.HostKeys[0] != other {
+		t.Errorf("pinned keys changed: %v", after.HostKeys)
 	}
 
 	// Deleting the remote deletes its file.

@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -261,18 +262,30 @@ func normaliseSFTP(r Remote) (Remote, error) {
 // flattened to the one-line form, and the host key file is always set: with
 // no pinned key it is empty, and rclone then refuses the server instead of
 // skipping verification.
+//
+// Listings skip symlinks (and FIFOs, sockets, devices). Followed, a link
+// back up the tree copies the folder again at every level until the kernel
+// gives up, a link to /etc or ~/.ssh smuggles exactly the files the folder
+// rules keep out into a bucket, and a FIFO blocks the read forever. A
+// folder that is itself a link still works: only entries inside are
+// skipped.
 func (r Remote) sftpEnv(prefix string) []string {
 	known := r.knownHostsPath
 	if known == "" {
 		known = "/nonexistent/garagepanel-known-hosts" // fail closed
 	}
+	host := r.Host
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]" // rclone appends ":port" to the host as is
+	}
 	env := []string{
 		prefix + "TYPE=sftp",
-		prefix + "HOST=" + r.Host,
+		prefix + "HOST=" + host,
 		prefix + "PORT=" + strconv.Itoa(r.Port),
 		prefix + "USER=" + r.User,
 		prefix + "KNOWN_HOSTS_FILE=" + known,
 		prefix + "KEY_USE_AGENT=false",
+		prefix + "SKIP_LINKS=true",
 	}
 	if algos := hostKeyAlgorithms(r.HostKeys); algos != "" {
 		env = append(env, prefix+"HOST_KEY_ALGORITHMS="+algos)
@@ -435,9 +448,11 @@ func sftpError(r Remote, what string, lines []string) error {
 	return fmt.Errorf("%s: %s", what, msg)
 }
 
-// probeSFTP checks a folder on an SFTP remote: listing it, and when write is
-// set, creating it if needed and writing then deleting a tiny file. Unlike
+// probeSFTP checks a folder on an SFTP remote: that it exists, and when write
+// is set, creating it if needed and writing then deleting a tiny file. Unlike
 // an S3 bucket, a missing destination folder is fine — rclone creates it.
+// The folder's content is not listed here (see sftpFolderExists); a folder
+// the user may not read shows up when the job lists it.
 func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, write bool) (ProbeReport, error) {
 	var report ProbeReport
 	if rc == nil {
@@ -451,26 +466,23 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 	env := r.rcloneEnv("probe")
 	target := "probe:/" + folder
 	display := r.Name + ":/" + folder
-	_, lines, code, err := rc.command(ctx, env, nil, "lsjson", target, "--max-depth", "1", "--no-mimetype", "--no-modtime")
+	exists, err := sftpFolderExists(ctx, rc, env, r, folder)
 	if err != nil {
 		return report, err
 	}
-	missing := code == 3
-	if code != 0 && !missing {
-		return report, sftpError(r, display, lines)
-	}
 	if !write {
-		if missing {
+		if !exists {
 			return report, fmt.Errorf("%s: folder tidak ada di VPS", display)
 		}
 		return report, nil
 	}
-	if missing {
+	if !exists {
 		if _, lines, code, err := rc.command(ctx, env, nil, "mkdir", target); err != nil {
 			return report, err
 		} else if code != 0 {
 			return report, sftpError(r, display+" (membuat folder)", lines)
 		}
+		report.Created = true
 	}
 	name := ".garagepanel-probe-" + randomHex(4)
 	if _, lines, code, err := rc.command(ctx, env, strings.NewReader("garagepanel probe\n"), "rcat", target+name); err != nil {
@@ -486,4 +498,54 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 		return report, sftpError(r, "file uji /"+folder+name+" tertulis tapi tidak bisa dihapus", lines)
 	}
 	return report, nil
+}
+
+// sftpFolderExists looks the folder up in its parent's listing: one level,
+// directories only, symlinks followed (a folder may be a link to another
+// disk). Listing the folder itself would cost one round trip per ~100 names,
+// minutes for a flat folder of millions of files, and the probe runs inside
+// an HTTP request. The parent listing also proves the login and the pinned
+// host key. If the parent cannot be read (mode 711), the folder's own
+// listing is the fallback.
+func sftpFolderExists(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string) (bool, error) {
+	parent, base := path.Split(strings.TrimSuffix(folder, "/"))
+	found := false
+	code, lines, err := rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+parent, "--max-depth", "1", "--dirs-only", "--sftp-skip-links=false"),
+		func(it lsjsonItem) error {
+			if it.IsDir && it.Path == base {
+				found = true
+			}
+			return nil
+		})
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case code == 0:
+		return found, nil
+	case code == 3:
+		return false, nil // the parent does not exist either
+	case strings.Contains(strings.ToLower(rcloneProblem(lines)), "permission denied"):
+		code, lines, err = rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+folder, "--max-depth", "1"),
+			func(lsjsonItem) error { return nil })
+		if err != nil {
+			return false, err
+		}
+		if code == 0 || code == 3 {
+			return code == 0, nil
+		}
+	}
+	return false, sftpError(r, r.Name+":/"+folder, lines)
+}
+
+// probeLsjsonArgs is an lsjson command with the short timeouts of a probe.
+func probeLsjsonArgs(remotePath string, extra ...string) []string {
+	return append([]string{"lsjson", remotePath,
+		"--no-mimetype", "--no-modtime",
+		"--config", "",
+		"--contimeout", "15s",
+		"--timeout", "60s",
+		"--retries", "1",
+		"--low-level-retries", "2",
+	}, extra...)
 }

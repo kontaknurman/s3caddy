@@ -192,7 +192,10 @@ func TestRealRcloneSFTPImportExport(t *testing.T) {
 	keys := []string{wantKey}
 	add := func(r Remote) {
 		t.Helper()
-		r.Type, r.Host, r.Port, r.HostKeys = RemoteTypeSFTP, "127.0.0.1", port, keys
+		r.Type, r.Host, r.Port = RemoteTypeSFTP, "127.0.0.1", port
+		if r.HostKeys == nil {
+			r.HostKeys = keys
+		}
 		if err := e.remotes.Add(r); err != nil {
 			t.Fatal(err)
 		}
@@ -209,10 +212,7 @@ func TestRealRcloneSFTPImportExport(t *testing.T) {
 	}
 	add(Remote{Name: "vps-unknown-key", User: "deploy", PrivateKey: otherPriv})
 	add(Remote{Name: "vps-bad-pw", User: "root", Password: "salah"})
-	add(Remote{Name: "vps-mitm", User: "u", Password: testSFTPPassword})
-	if err := e.remotes.setHostKeys("vps-mitm", []string{testHostKey(t)}); err != nil {
-		t.Fatal(err)
-	}
+	add(Remote{Name: "vps-mitm", User: "u", Password: testSFTPPassword, HostKeys: []string{testHostKey(t)}})
 	for name, want := range map[string][]string{
 		"vps-unknown-key": {"unable to authenticate", "authorized_keys milik user deploy"},
 		"vps-bad-pw":      {"unable to authenticate", "PermitRootLogin prohibit-password"},

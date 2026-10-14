@@ -91,9 +91,13 @@ func fakeRcloneMain(args []string) int {
 			i++
 			chunkPath = args[i]
 		case strings.HasPrefix(a, "-"):
-			// Flags with a value: skip it unless it is boolean.
-			switch a {
-			case "--no-traverse", "--no-check-dest", "-M", "--use-json-log", "-R", "--files-only", "--no-mimetype", "--no-modtime":
+			// Flags with a value: skip it unless it is boolean or written
+			// as --flag=value.
+			switch {
+			case strings.Contains(a, "="):
+				flags[a] = true
+			case a == "--no-traverse", a == "--no-check-dest", a == "-M", a == "--use-json-log", a == "-R",
+				a == "--files-only", a == "--dirs-only", a == "--no-mimetype", a == "--no-modtime":
 				flags[a] = true
 			default:
 				i++
@@ -221,6 +225,9 @@ type fakeSide struct {
 	bucket string
 	prefix string
 	dir    string
+	root   string // the fake server's "/" (sftp)
+	// skipLinks is the remote's skip_links option (sftp).
+	skipLinks bool
 }
 
 // fakeResolve turns "alias:path" plus RCLONE_CONFIG_<ALIAS>_* into a side,
@@ -245,8 +252,12 @@ func fakeResolve(spec string) (fakeSide, error) {
 		if !strings.HasPrefix(rest, "/") {
 			return fakeSide{}, fmt.Errorf("fake rclone wants absolute sftp paths, got %q", rest)
 		}
-		root := filepath.Join(os.Getenv("FAKE_RCLONE_DIR"), "sftp", env["HOST"])
-		return fakeSide{dir: filepath.Join(root, filepath.FromSlash(rest))}, nil
+		if strings.Contains(env["HOST"], ":") && !strings.HasPrefix(env["HOST"], "[") {
+			// What real rclone does with a bare IPv6 address.
+			return fakeSide{}, fmt.Errorf("NewFs: couldn't connect SSH: dial tcp: address %s:%s: too many colons in address", env["HOST"], env["PORT"])
+		}
+		root := filepath.Join(os.Getenv("FAKE_RCLONE_DIR"), "sftp", strings.Trim(env["HOST"], "[]"))
+		return fakeSide{dir: filepath.Join(root, filepath.FromSlash(rest)), root: root, skipLinks: env["SKIP_LINKS"] == "true"}, nil
 	}
 	// The fake always talks path-style: <bucket>.127.0.0.1 would not
 	// resolve. FORCE_PATH_STYLE is still recorded for assertions.
@@ -407,35 +418,62 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 			logf("ERROR", "private: error listing: permission denied")
 			return code
 		}
-		info, err := os.Stat(side.dir)
+		// Knob "sftp-unreadable": absolute paths on the fake server, one per
+		// line, whose listing is refused (directories with mode 711).
+		for _, p := range strings.Split(readKnob(dir, "sftp-unreadable"), "\n") {
+			if p = strings.TrimSpace(p); p != "" && filepath.Clean(side.dir) == filepath.Join(side.root, filepath.FromSlash(p)) {
+				logf("ERROR", "error listing: permission denied")
+				return 1
+			}
+		}
+		info, err := os.Stat(side.dir) // the root itself may be a link
 		if err != nil || !info.IsDir() {
 			logf("ERROR", "error listing: directory not found")
 			logf("NOTICE", "Failed to lsjson with 2 errors: last error was: error in ListJSON: directory not found")
 			return 3
 		}
+		skipLinks := side.skipLinks && !flags["--sftp-skip-links=false"]
 		var items []string
+		add := func(rel, name string, size int64, isDir bool) {
+			if (isDir && flags["--files-only"]) || (!isDir && flags["--dirs-only"]) {
+				return
+			}
+			b, _ := json.Marshal(map[string]any{"Path": rel, "Name": name, "Size": size, "ModTime": "", "IsDir": isDir})
+			items = append(items, string(b))
+		}
+		walkRoot := side.dir
+		if resolved, err := filepath.EvalSymlinks(side.dir); err == nil {
+			walkRoot = resolved
+		}
 		walk := func(path string, d os.DirEntry, err error) error {
-			if err != nil || path == side.dir {
+			if err != nil || path == walkRoot {
 				return err
 			}
-			rel, _ := filepath.Rel(side.dir, path)
+			rel, _ := filepath.Rel(walkRoot, path)
 			rel = filepath.ToSlash(rel)
-			if d.IsDir() {
-				if !flags["--files-only"] {
-					b, _ := json.Marshal(map[string]any{"Path": rel, "Name": d.Name(), "Size": -1, "IsDir": true})
-					items = append(items, string(b))
+			if d.Type()&os.ModeSymlink != 0 {
+				// Like the sftp backend: skipped with skip_links, otherwise
+				// stat'ed and shown as what it points to (not descended into).
+				if skipLinks {
+					return nil
 				}
+				if fi, err := os.Stat(path); err == nil {
+					add(rel, d.Name(), fi.Size(), fi.IsDir())
+				}
+				return nil
+			}
+			if d.IsDir() {
+				add(rel, d.Name(), -1, true)
 				if !flags["-R"] {
 					return filepath.SkipDir
 				}
 				return nil
 			}
 			fi, _ := d.Info()
-			b, _ := json.Marshal(map[string]any{"Path": rel, "Name": d.Name(), "Size": fi.Size(), "ModTime": "", "IsDir": false})
-			items = append(items, string(b))
+			add(rel, d.Name(), fi.Size(), false)
 			return nil
 		}
-		if err := filepath.WalkDir(side.dir, walk); err != nil {
+		if err := filepath.WalkDir(walkRoot, walk); err != nil {
 			logf("ERROR", "%v", err)
 			return 1
 		}

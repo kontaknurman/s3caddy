@@ -48,6 +48,13 @@ type listingEntry struct {
 	size int64
 }
 
+// lsjsonItem is the part of one `rclone lsjson` entry the panel reads.
+type lsjsonItem struct {
+	Path  string `json:"Path"`
+	Size  int64  `json:"Size"`
+	IsDir bool   `json:"IsDir"`
+}
+
 // listFiles runs `rclone lsjson -R --files-only` on remotePath and calls fn
 // for every file, as rclone finds them. It returns rclone's exit code and
 // last log lines; a cancelled ctx stops rclone with SIGINT.
@@ -58,7 +65,19 @@ func (r *rcloneRunner) listFiles(ctx context.Context, env []string, remotePath s
 		"--contimeout", "15s", "--timeout", "5m",
 		"--retries", "3", "--low-level-retries", "10",
 	}
-	args = append(args, r.sharedArgs()...)
+	return r.streamLsjson(ctx, env, args, func(it lsjsonItem) error {
+		if it.IsDir || it.Path == "" {
+			return nil
+		}
+		return fn(it.Path, it.Size)
+	})
+}
+
+// streamLsjson runs rclone with args (an lsjson command) and calls fn for
+// every entry as rclone prints it, so a listing of any size is never held in
+// memory. It returns rclone's exit code and last log lines.
+func (r *rcloneRunner) streamLsjson(ctx context.Context, env []string, args []string, fn func(lsjsonItem) error) (int, []string, error) {
+	args = append(append([]string{}, args...), r.sharedArgs()...)
 	cmd := exec.CommandContext(ctx, r.bin, args...)
 	cmd.Env = append(minimalEnv(), env...)
 	var stderr cappedBuffer
@@ -85,19 +104,12 @@ func (r *rcloneRunner) listFiles(ctx context.Context, env []string, remotePath s
 		if !strings.HasPrefix(line, "{") {
 			continue
 		}
-		var item struct {
-			Path  string `json:"Path"`
-			Size  int64  `json:"Size"`
-			IsDir bool   `json:"IsDir"`
-		}
+		var item lsjsonItem
 		if err := json.Unmarshal([]byte(line), &item); err != nil {
 			fnErr = fmt.Errorf("output rclone lsjson tidak bisa dibaca: %w", err)
 			break
 		}
-		if item.IsDir || item.Path == "" {
-			continue
-		}
-		if err := fn(item.Path, item.Size); err != nil {
+		if err := fn(item); err != nil {
 			fnErr = err
 			break
 		}
