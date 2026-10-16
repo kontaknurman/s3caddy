@@ -52,10 +52,9 @@ const (
 	rcloneSFTPMinMinor = 63
 )
 
-// sftpParentBudget bounds the parent listing of a probe: a parent with
-// millions of entries falls back to asking the folder itself. A variable so
-// tests can shorten it.
-var sftpParentBudget = 20 * time.Second
+// sftpListBudget bounds each listing of a probe that may meet a huge folder
+// (see sftpFolderExists). A variable so tests can shorten it.
+var sftpListBudget = 10 * time.Second
 
 // sftpSupport says why this rclone cannot serve SFTP remotes, or nil.
 func (r *rcloneRunner) sftpSupport() error {
@@ -412,21 +411,24 @@ func rcloneLogTail(stderr string) []string {
 }
 
 // rcloneProblem picks the line that explains a failure (the last CRITICAL or
-// ERROR one) and strips rclone's wrapping, which repeats the remote path.
+// ERROR one) and strips rclone's wrapping, which repeats the remote path. It
+// reads plain log lines as well as a job's ("critical: …", from JSON).
 func rcloneProblem(lines []string) string {
 	pick := ""
 	for _, l := range lines {
-		if strings.HasPrefix(l, "CRITICAL:") || strings.HasPrefix(l, "ERROR") || strings.HasPrefix(l, "Failed") {
+		l = rcloneLogStamp.ReplaceAllString(l, "")
+		if strings.HasPrefix(l, "CRITICAL:") || strings.HasPrefix(l, "ERROR") || strings.HasPrefix(l, "Failed") ||
+			strings.HasPrefix(l, "critical:") || strings.HasPrefix(l, "error:") {
 			pick = l
 		}
 	}
 	if pick == "" && len(lines) > 0 {
-		pick = lines[len(lines)-1]
+		pick = rcloneLogStamp.ReplaceAllString(lines[len(lines)-1], "")
 	}
 	if pick == "" {
 		return "rclone tidak menulis alasan"
 	}
-	for _, p := range []string{"CRITICAL:", "ERROR :", "ERROR:"} {
+	for _, p := range []string{"CRITICAL:", "ERROR :", "ERROR:", "critical:", "error:"} {
 		pick = strings.TrimSpace(strings.TrimPrefix(pick, p))
 	}
 	if i := strings.Index(pick, `": `); strings.HasPrefix(pick, "Failed to create file system for") && i >= 0 {
@@ -479,11 +481,10 @@ func sftpError(r Remote, what string, lines []string) error {
 	return fmt.Errorf("%s: %s", what, msg)
 }
 
-// probeSFTP checks a folder on an SFTP remote: that it exists, and when write
-// is set, creating it if needed and writing then deleting a tiny file. Unlike
-// an S3 bucket, a missing destination folder is fine — rclone creates it.
-// The folder's content is not listed here (see sftpFolderExists); a folder
-// the user may not read shows up when the job lists it.
+// probeSFTP checks a folder on an SFTP remote: that it exists and may be
+// listed, and when write is set, creating it if needed and writing then
+// deleting a tiny file. Unlike an S3 bucket, a missing destination folder is
+// fine — rclone creates it.
 func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, write bool) (ProbeReport, error) {
 	var report ProbeReport
 	if err := rc.sftpSupport(); err != nil {
@@ -534,18 +535,31 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 	return report, nil
 }
 
-// sftpFolderExists looks the folder up in its parent's listing: one level,
-// directories only, symlinks followed (a folder may be a link to another
-// disk). Listing the folder itself would cost one round trip per ~100 names,
-// minutes for a flat folder of millions of files, and the probe runs inside
-// an HTTP request. The parent listing also proves the login and the pinned
-// host key. When the parent cannot be read (mode 711) or is itself huge
-// (still listing after sftpParentBudget), the folder is asked directly.
+// sftpFolderExists says whether the folder exists, and fails when the SSH
+// user may not list it, which the job's listing will need. It lists the
+// folder itself, one level. That proves the login and the pinned host key,
+// follows a folder that is a symlink, and finds the folder on a
+// case-insensitive mount whatever the case typed. A missing folder ends the
+// listing at once with exit 3 (so does a file of that name: the path ends in
+// "/"), an unreadable one with "permission denied".
+//
+// A flat folder of millions of files takes minutes to list over SFTP (one
+// round trip per ~100 names), and the probe runs inside an HTTP request, so
+// that listing gets sftpListBudget. Still running after it means a huge
+// folder, or a server slow to let anyone in. The folder's parent tells them
+// apart: a folder seen there was being listed, so it can be read. Not seen
+// there (another case of the name, a parent that may not be read, or no
+// folder at all), the folder's own listing gets the rest of the probe's time.
 func sftpFolderExists(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string) (bool, error) {
+	exists, err := sftpListFolder(ctx, rc, env, r, folder, sftpListBudget)
+	if !errors.Is(err, errStillListing) {
+		return exists, err
+	}
 	parent, base := path.Split(strings.TrimSuffix(folder, "/"))
 	found := false
-	pctx, cancel := context.WithTimeout(ctx, sftpParentBudget)
-	code, lines, err := rc.streamLsjson(pctx, env, probeLsjsonArgs("probe:/"+parent, "--max-depth", "1", "--dirs-only", "--sftp-skip-links=false"),
+	pctx, cancel := context.WithTimeout(ctx, sftpListBudget)
+	// Directories only, symlinks followed: the folder may be a link.
+	_, _, err = rc.streamLsjson(pctx, env, probeLsjsonArgs("probe:/"+parent, "--max-depth", "1", "--dirs-only", "--sftp-skip-links=false"),
 		func(it lsjsonItem) error {
 			if it.IsDir && it.Path == base {
 				found = true
@@ -554,31 +568,31 @@ func sftpFolderExists(ctx context.Context, rc *rcloneRunner, env []string, r Rem
 		})
 	cancel()
 	switch {
-	case err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
-		// A huge parent: ask the folder itself.
-	case err != nil:
-		return false, err
 	case found:
-		// Seen in the listing: an error about another entry of the parent
-		// (a link it could not follow, say) does not matter here.
 		return true, nil
-	case code == 0:
-		return false, nil
-	case code == 3:
-		return false, nil // the parent does not exist either
-	case !strings.Contains(strings.ToLower(rcloneProblem(lines)), "permission denied"):
-		return false, sftpError(r, r.Name+":/"+folder, lines)
+	case err != nil && (ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded)):
+		return false, err
 	}
-	return sftpFolderListable(ctx, rc, env, r, folder)
+	return sftpListFolder(ctx, rc, env, r, folder, 0)
 }
 
-// sftpFolderListable is the fallback of sftpFolderExists: list the folder
-// itself, one level. The path ends in "/", so a file of that name is
-// "directory not found" (exit 3), like a missing folder.
-func sftpFolderListable(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string) (bool, error) {
-	code, lines, err := rc.streamLsjson(ctx, env, probeLsjsonArgs("probe:/"+folder, "--max-depth", "1"),
+// errStillListing: a probe's listing ran out of its budget.
+var errStillListing = errors.New("folder masih di-list")
+
+// sftpListFolder lists the folder, one level, and reports whether it exists.
+// With a budget, a listing still running when it ends is errStillListing.
+func sftpListFolder(ctx context.Context, rc *rcloneRunner, env []string, r Remote, folder string, budget time.Duration) (bool, error) {
+	lctx := ctx
+	if budget > 0 {
+		var cancel context.CancelFunc
+		lctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
+	}
+	code, lines, err := rc.streamLsjson(lctx, env, probeLsjsonArgs("probe:/"+folder, "--max-depth", "1"),
 		func(lsjsonItem) error { return nil })
 	switch {
+	case err != nil && budget > 0 && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		return false, errStillListing
 	case err != nil:
 		return false, err
 	case code == 0 || code == 3:

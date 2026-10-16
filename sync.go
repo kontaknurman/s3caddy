@@ -181,6 +181,12 @@ type chunkResult struct {
 	Skipped int64  // already present at the destination
 	Invalid int64  // keys rclone cannot be given (reported through onInvalid)
 	Markers []string
+	// Names are the keys written to the file: rclone's error lines are only
+	// failed keys when they name one of them.
+	Names map[string]struct{}
+	// Suspect are keys of a folder source that may not exist under that
+	// name (see folderSource); the job checks that they arrived.
+	Suspect []string
 }
 
 // chunkBuilder runs the merge-join and writes chunk files.
@@ -196,12 +202,14 @@ type chunkBuilder struct {
 	// folderSource: the source is a folder on an SFTP server. rclone prints
 	// its listing as JSON, which turns a name that is not valid UTF-8 into
 	// one with U+FFFD; that name does not exist on the server, and rclone
-	// would skip it without a word when told to copy it.
+	// skips it without a word when told to copy it. A valid name may hold
+	// U+FFFD too (left over from an earlier lossy migration) and copies
+	// fine, so such keys are handed to rclone and checked afterwards.
 	folderSource bool
 }
 
-// badFolderNameReason is recorded for such a name.
-const badFolderNameReason = "nama file di VPS bukan UTF-8 yang valid (misalnya Latin-1 dari server lama), jadi rclone tidak bisa menyebutnya dan file ini tidak disalin. Ubah namanya ke UTF-8 di VPS, misalnya: convmv -f latin1 -t utf8 -r --notest <folder>"
+// badFolderNameReason is recorded for a suspect key that did not arrive.
+const badFolderNameReason = "file ini tidak sampai di tujuan. Namanya memuat karakter pengganti (�), biasanya karena nama di VPS bukan UTF-8 yang valid (misalnya Latin-1 dari server lama), jadi rclone tidak bisa menyebutnya. Ubah namanya ke UTF-8 di VPS, misalnya: convmv -f latin1 -t utf8 -r --notest <folder>"
 
 // unsupportedKeyReason explains why a key cannot go into a chunk file. rclone
 // reads the file line by line and cleans paths, so a key with a newline, a
@@ -228,7 +236,7 @@ func unsupportedKeyReason(rel string) string {
 // exhausted (the chunk may still hold keys). A chunk with zero keys and
 // done=false happens when a whole page was skipped; callers just loop.
 func (b *chunkBuilder) next(ctx context.Context, path string) (chunkResult, bool, error) {
-	var res chunkResult
+	res := chunkResult{Names: map[string]struct{}{}}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return res, false, fmt.Errorf("tidak bisa menulis file chunk: %w", err)
@@ -258,11 +266,7 @@ func (b *chunkBuilder) next(ctx context.Context, path string) (chunkResult, bool
 			res.Markers = append(res.Markers, rel)
 			continue
 		}
-		reason := unsupportedKeyReason(rel)
-		if reason == "" && b.folderSource && strings.ContainsRune(rel, utf8.RuneError) {
-			reason = badFolderNameReason
-		}
-		if reason != "" {
+		if reason := unsupportedKeyReason(rel); reason != "" {
 			res.Invalid++
 			if b.onInvalid != nil {
 				b.onInvalid(obj.Key, reason)
@@ -286,6 +290,10 @@ func (b *chunkBuilder) next(ctx context.Context, path string) (chunkResult, bool
 		}
 		res.Keys++
 		res.Bytes += obj.Size
+		res.Names[rel] = struct{}{}
+		if b.folderSource && strings.ContainsRune(rel, utf8.RuneError) {
+			res.Suspect = append(res.Suspect, rel)
+		}
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()

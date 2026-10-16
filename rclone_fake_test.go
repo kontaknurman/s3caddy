@@ -27,6 +27,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("GARAGEPANEL_FAKE_RCLONE") == "1" {
 		os.Exit(fakeRcloneMain(os.Args[1:]))
 	}
+	chunkRetryDelay = 0 // the fake fails fail-* keys every time; no need to wait
 	os.Exit(m.Run())
 }
 
@@ -137,6 +138,16 @@ func fakeRcloneMain(args []string) int {
 	if len(positional) == 0 {
 		return fail("no source")
 	}
+	// Knob "copy-refuse": the SSH port of an SFTP side is closed by the time
+	// the chunk runs.
+	if readKnob(dir, "copy-refuse") != "" {
+		for _, p := range positional {
+			alias, _, _ := strings.Cut(p, ":")
+			if os.Getenv("RCLONE_CONFIG_"+strings.ToUpper(alias)+"_TYPE") == "sftp" {
+				return fail("Failed to create file system for " + strconv.Quote(p) + ": NewFs: couldn't connect SSH: dial tcp 127.0.0.1:22: connect: connection refused")
+			}
+		}
+	}
 	src, err := fakeResolve(positional[0])
 	if err != nil {
 		return fail("Failed to create file system for " + strconv.Quote(positional[0]) + ": " + err.Error())
@@ -168,10 +179,23 @@ func fakeRcloneMain(args []string) int {
 		logJSON(map[string]any{"level": "notice", "msg": "stats", "stats": stats})
 	}
 	emitStats()
-	for _, key := range keys {
+	// Knob "fs-error": an error about a remote as a whole, which rclone logs
+	// with the remote as its object (a pooled SSH connection that died).
+	if obj := readKnob(dir, "fs-error"); obj != "" {
+		logJSON(map[string]any{"level": "error", "msg": "Discarding closed SSH connection: EOF", "object": obj, "objectType": "*sftp.Fs"})
+	}
+	abortAfter, _ := strconv.Atoi(readKnob(dir, "abort-after"))
+	var lastErr error
+	for i, key := range keys {
 		if ctx.Err() != nil {
 			logJSON(map[string]any{"level": "error", "msg": "signal received, aborting"})
 			return 143
+		}
+		// Knob "abort-after": rclone dies after that many keys without its
+		// closing summary, whatever failed before.
+		if abortAfter > 0 && i == abortAfter {
+			logJSON(map[string]any{"level": "critical", "msg": "fatal: run aborted"})
+			return 1
 		}
 		if sleepPerKey > 0 {
 			select {
@@ -184,6 +208,8 @@ func fakeRcloneMain(args []string) int {
 		switch {
 		case strings.HasPrefix(key, "fail-") || strings.Contains(key, "/fail-"):
 			opErr = fmt.Errorf("injected failure for %s", key)
+		case fakeFlakyOnce(dir, key):
+			opErr = errors.New("Update ReadFrom failed: connection lost")
 		case verb == "delete":
 			opErr = src.remove(ctx, key)
 		default:
@@ -209,7 +235,8 @@ func fakeRcloneMain(args []string) int {
 				continue
 			}
 			stats.Errors++
-			logJSON(map[string]any{"level": "error", "msg": opErr.Error(), "object": key, "objectType": "string"})
+			lastErr = opErr
+			logJSON(map[string]any{"level": "error", "msg": "Failed to copy: " + opErr.Error(), "object": key, "objectType": "*s3.Object"})
 			continue
 		}
 		if verb == "delete" {
@@ -221,9 +248,31 @@ func fakeRcloneMain(args []string) int {
 	}
 	emitStats()
 	if stats.Errors > 0 {
-		return 6
+		// The summary rclone prints once the operation returned, then the
+		// exit code: 1 for an error it has no category for (a file it may
+		// not read), which is what the injected failures stand for. Knob
+		// "error-exit" picks another one (5 retry errors, 6 no-retry).
+		logJSON(map[string]any{"level": "error", "msg": fmt.Sprintf("Attempt 1/1 failed with %d errors and: %v", stats.Errors, lastErr)})
+		if code, err := strconv.Atoi(readKnob(dir, "error-exit")); err == nil {
+			return code
+		}
+		return 1
 	}
 	return 0
+}
+
+// fakeFlakyOnce reports whether a key named flaky-* fails this time: the
+// first time it is copied, as when a connection drops mid-transfer.
+func fakeFlakyOnce(dir, key string) bool {
+	if !strings.HasPrefix(filepath.Base(key), "flaky-") {
+		return false
+	}
+	marker := filepath.Join(dir, "seen-"+strings.ReplaceAll(key, "/", "_"))
+	if _, err := os.Stat(marker); err == nil {
+		return false
+	}
+	_ = os.WriteFile(marker, nil, 0o600)
+	return true
 }
 
 // fakeSide is one side of a fake rclone run: a bucket/prefix on an S3 server,
@@ -434,11 +483,16 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 			logf("ERROR", "private: error listing: permission denied")
 			return code
 		}
-		// Knob "sftp-slow": absolute paths whose listing takes 10 s (a
-		// directory with millions of entries). SIGINT ends it, as rclone.
+		// Knob "sftp-slow": absolute paths whose listing takes 10 s, or
+		// "sftp-slow-seconds" (a directory with millions of entries). SIGINT
+		// ends it, as rclone.
+		slow := 10.0
+		if s, err := strconv.ParseFloat(readKnob(dir, "sftp-slow-seconds"), 64); err == nil {
+			slow = s
+		}
 		for _, p := range strings.Split(readKnob(dir, "sftp-slow"), "\n") {
 			if p = strings.TrimSpace(p); p != "" && filepath.Clean(side.dir) == filepath.Join(side.root, filepath.FromSlash(p)) {
-				time.Sleep(10 * time.Second)
+				time.Sleep(time.Duration(slow * float64(time.Second)))
 			}
 		}
 		// Knob "lsjson-oom": the kernel's OOM killer ends a job's listing.
@@ -459,10 +513,6 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 			logf("NOTICE", "Failed to lsjson with 2 errors: last error was: error in ListJSON: directory not found")
 			return 3
 		}
-		// Knob "lsjson-entry-error": a one-level listing also reports an
-		// entry it could not stat and exits 1, like rclone with a dangling
-		// link when links are followed.
-		entryError := readKnob(dir, "lsjson-entry-error") != "" && !flags["-R"]
 		skipLinks := side.skipLinks && !flags["--sftp-skip-links=false"]
 		var items []string
 		add := func(rel, name string, size int64, isDir bool) {
@@ -515,10 +565,6 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 		fmt.Println("[")
 		fmt.Println(strings.Join(items, ",\n"))
 		fmt.Println("]")
-		if entryError {
-			logf("ERROR", "rusak: stat of non-regular file failed: no such file or directory")
-			return 1
-		}
 	}
 	return 0
 }

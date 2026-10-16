@@ -119,6 +119,29 @@ func TestSyncPageManagesRemotesWithoutShowingSecrets(t *testing.T) {
 	}
 }
 
+// A paused job still holds its remote: resuming it after the credentials or
+// the server changed would copy from somewhere else. The refusal says so.
+func TestEditingARemoteOfAPausedJobIsRefusedWithTheRightAdvice(t *testing.T) {
+	p := newTestPanel(t)
+	p.garage.addBucket("arsip", 0, 0, false)
+	p.addTestRemote(t)
+	p.remote.put("backup", "in/a.txt", []byte("a"), "text/plain")
+	p.knob(t, "sleep", "30")
+	st, err := p.app.jobs.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "wasabi", Bucket: "backup", Prefix: "in/"}, Dst: Endpoint{Bucket: "arsip"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.app.jobs.Pause(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitJob(t, p.app.jobs, st.ID, func(s JobState) bool { return s.Status == JobPaused })
+	resp := p.post(t, "/sync/remotes/update", url.Values{"name": {"wasabi"}, "provider": {"Wasabi"}, "endpoint": {p.remote.URL()}, "region": {"us-east-1"}})
+	if body := p.followFlash(t, resp); !strings.Contains(body, "job yang dijeda juga") || !strings.Contains(body, "batalkan job itu dulu") {
+		t.Errorf("refusal: %s", firstLines(body))
+	}
+}
+
 func TestSyncJobFromFormRunsAndIsPolled(t *testing.T) {
 	p := newTestPanel(t)
 	p.garage.addBucket("arsip", 0, 0, false)

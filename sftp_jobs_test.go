@@ -95,10 +95,12 @@ func TestSFTPImportCopiesAFolderTreeIntoABucket(t *testing.T) {
 		t.Errorf("failed keys = %+v (%d) %v", failed, total, err)
 	}
 
-	// Two copy runs (chunks of 3 keys), source as an absolute sftp path,
-	// no -M (a file system has no S3 metadata), password only obscured.
+	// Two copy runs (chunks of 3 keys) and two more for the file that
+	// failed, source as an absolute sftp path, no -M (a file system has no
+	// S3 metadata), password only obscured.
 	recs := readFakeRcloneRecords(t, e.rcDir)
-	if len(recs) != 2 || strings.Join(recs[0].Keys, ",") != "a b+c.webp,index.html,komik-a/002.jpg" {
+	if len(recs) != 2+chunkRetries || strings.Join(recs[0].Keys, ",") != "a b+c.webp,index.html,komik-a/002.jpg" ||
+		strings.Join(recs[3].Keys, ",") != "komik-b/fail-broken.jpg" {
 		t.Fatalf("rclone runs = %+v", recs)
 	}
 	for _, rec := range recs {
@@ -374,17 +376,12 @@ func TestSFTPMissingDestinationFolderIsAnEmptyListing(t *testing.T) {
 	}
 }
 
-func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
+func TestSFTPProbeListsTheFolderItselfOneLevel(t *testing.T) {
 	e := newJobTestEnv(t)
 	root := e.addSFTPRemote(t, "vps")
 	r, _ := e.remotes.Get("vps")
 	rc := e.mgr.rclone
-	// A big flat folder: listing it would cost a round trip per ~100 names.
-	files := map[string]string{}
-	for i := 0; i < 300; i++ {
-		files[fmt.Sprintf("img-%04d.jpg", i)] = "x"
-	}
-	writeTree(t, filepath.Join(root, "srv/komik/flat"), files)
+	writeTree(t, filepath.Join(root, "srv/komik/flat"), map[string]string{"img-0001.jpg": "x", "sub/img-0002.jpg": "x"})
 
 	before := len(readFakeRcloneCommands(t, e.rcDir))
 	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
@@ -394,8 +391,8 @@ func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
 	if len(cmds) != 1 {
 		t.Fatalf("probe ran %d commands", len(cmds))
 	}
-	if args := strings.Join(cmds[0].Args, " "); !strings.HasPrefix(args, "lsjson probe:/srv/komik/ ") || !strings.Contains(args, "--dirs-only") || !strings.Contains(args, "--max-depth 1") {
-		t.Errorf("probe listed %s; it must look the folder up in its parent", args)
+	if args := " " + strings.Join(cmds[0].Args, " ") + " "; !strings.HasPrefix(args, " lsjson probe:/srv/komik/flat/ ") || !strings.Contains(args, " --max-depth 1 ") || strings.Contains(args, " -R ") {
+		t.Errorf("probe listed %s; it must list the folder itself, one level", args)
 	}
 
 	// A folder that is itself a link (data on another disk) is found, and a
@@ -420,19 +417,7 @@ func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
 		t.Errorf("missing parent: %v", err)
 	}
 
-	// The parent listing also complains about another entry and exits 1:
-	// a folder it did show is there; one it did not is an error to show.
-	e.knob(t, "lsjson-entry-error", "1")
-	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
-		t.Errorf("found despite an error on another entry: %v", err)
-	}
-	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/hilang/", false); err == nil || !strings.Contains(err.Error(), "stat of non-regular file failed") {
-		t.Errorf("missing folder with an entry error: %v", err)
-	}
-	e.knob(t, "lsjson-entry-error", "")
-
-	// A parent that may be entered but not read (mode 711): the folder's
-	// own listing is asked instead.
+	// A parent that may be entered but not read (mode 711) does not matter.
 	e.knob(t, "sftp-unreadable", "/srv/komik")
 	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
 		t.Errorf("unreadable parent: %v", err)
@@ -440,10 +425,19 @@ func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
 	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/hilang/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
 		t.Errorf("unreadable parent, missing folder: %v", err)
 	}
-	// The folder itself unreadable too: the error says so.
-	e.knob(t, "sftp-unreadable", "/srv\n/srv/komik")
-	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/", false); err == nil || !strings.Contains(err.Error(), "permission denied") {
-		t.Errorf("unreadable folder: %v", err)
+	// A folder the SSH user may not read is refused now, not when the job
+	// lists it: a schedule then skips its runs instead of piling up failed
+	// jobs.
+	e.knob(t, "sftp-unreadable", "/srv/komik/flat")
+	for _, write := range []bool{false, true} {
+		if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", write); err == nil || !strings.Contains(err.Error(), "permission denied") || !strings.Contains(err.Error(), "tidak punya izin") {
+			t.Errorf("unreadable folder (write=%v): %v", write, err)
+		}
+	}
+	_, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/komik/flat/"}, Dst: Endpoint{Bucket: "masuk"}})
+	if err == nil || !strings.Contains(err.Error(), "sumber tidak bisa diakses") {
+		t.Errorf("job from an unreadable folder: %v", err)
 	}
 }
 
@@ -616,9 +610,12 @@ func TestSFTPNeedsAnRcloneThatPinsHostKeyTypes(t *testing.T) {
 
 func TestSFTPNamesThatAreNotUTF8AreReportedNotLost(t *testing.T) {
 	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
 	root := e.addSFTPRemote(t, "vps")
 	dir := filepath.Join(root, "srv/lama")
-	writeTree(t, dir, map[string]string{"ok.jpg": "ok"})
+	// "�" in a valid UTF-8 name (an earlier lossy migration) copies like
+	// any other name; a failing one is reported once, with rclone's error.
+	writeTree(t, dir, map[string]string{"ok.jpg": "ok", "sisa�lama.jpg": "valid", "fail-�.jpg": "x"})
 	if err := os.WriteFile(filepath.Join(dir, "caf\xe9.jpg"), []byte("latin-1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -628,12 +625,76 @@ func TestSFTPNamesThatAreNotUTF8AreReportedNotLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := waitJob(t, e.mgr, st.ID, terminal)
-	if s.Status != JobDone || s.Counters.Transferred != 1 || s.Counters.Failed != 1 {
-		t.Errorf("status=%s counters=%+v", s.Status, s.Counters)
+	if s.Status != JobDone || s.Counters.Transferred != 2 || s.Counters.Failed != 2 {
+		t.Errorf("status=%s counters=%+v err=%q", s.Status, s.Counters, s.Error)
+	}
+	if got, ok := e.garage.get("masuk", "sisa�lama.jpg"); !ok || string(got) != "valid" {
+		t.Errorf("a valid name with U+FFFD was not copied: %q %v", got, ok)
 	}
 	failed, _, err := e.mgr.FailedKeys(st.ID, 10)
-	if err != nil || len(failed) != 1 || failed[0].Key != "/srv/lama/caf�.jpg" || !strings.Contains(failed[0].Error, "bukan UTF-8") {
-		t.Errorf("failed = %+v %v", failed, err)
+	if err != nil || len(failed) != 2 {
+		t.Fatalf("failed = %+v %v", failed, err)
+	}
+	if failed[0].Key != "/srv/lama/caf�.jpg" || !strings.Contains(failed[0].Error, "bukan UTF-8") {
+		t.Errorf("not UTF-8: %+v", failed[0])
+	}
+	if failed[1].Key != "/srv/lama/fail-�.jpg" || !strings.Contains(failed[1].Error, "injected") {
+		t.Errorf("failed by rclone: %+v", failed[1])
+	}
+}
+
+// A file the SSH user may not read makes rclone exit 1, like a VPS that
+// cannot be reached at all; only the second stops the job.
+func TestSFTPCopyErrorsAreToldApartFromAnUnreachableVPS(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"a.jpg": "a", "fail-rahasia.jpg": "b", "c.jpg": "c"})
+	// An error about a pooled connection names the remote, not a key.
+	e.knob(t, "fs-error", "sftp://root@vps.example.com:22//srv/data/")
+	spec := JobSpec{Kind: JobSync, Mode: "skip-existing", Transfers: 1,
+		Src: Endpoint{Remote: "vps", Prefix: "srv/data/"}, Dst: Endpoint{Bucket: "masuk"}}
+	st, err := e.mgr.Create(t.Context(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Transferred != 2 || s.Counters.Failed != 1 || s.Checkpoint != "fail-rahasia.jpg" {
+		t.Fatalf("status=%s counters=%+v checkpoint=%q err=%q", s.Status, s.Counters, s.Checkpoint, s.Error)
+	}
+	if failed, total, _ := e.mgr.FailedKeys(st.ID, 10); total != 1 || failed[0].Key != "/srv/data/fail-rahasia.jpg" {
+		t.Errorf("failed keys = %+v (%d)", failed, total)
+	}
+	// No whole-run retries in rclone; the failed file alone goes again.
+	recs := readFakeRcloneRecords(t, e.rcDir)
+	if len(recs) != 1+chunkRetries || !strings.Contains(strings.Join(recs[0].Args, " "), "--retries 1 ") || strings.Join(recs[2].Keys, ",") != "fail-rahasia.jpg" {
+		t.Errorf("rclone runs: %+v", recs)
+	}
+
+	// The SSH port is closed when the next run copies: the job stops with
+	// the hint the connection test gives, and nothing is written off.
+	e.knob(t, "fs-error", "")
+	e.knob(t, "copy-refuse", "1")
+	writeTree(t, filepath.Join(root, "srv/data"), map[string]string{"d.jpg": "d"})
+	if err := e.mgr.Rerun(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	s = waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobFailed || !strings.Contains(s.Error, "exit code 1") || !strings.Contains(s.Error, "Port SSH tertutup") {
+		t.Errorf("status=%s err=%q", s.Status, s.Error)
+	}
+	if _, total, _ := e.mgr.FailedKeys(st.ID, 10); total != 0 || s.Checkpoint != "" || s.Counters.Failed != 0 {
+		t.Errorf("an unreachable VPS must not write keys off: total=%d checkpoint=%q counters=%+v", total, s.Checkpoint, s.Counters)
+	}
+	e.knob(t, "copy-refuse", "")
+	if err := e.mgr.Resume(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s = waitJob(t, e.mgr, st.ID, terminal); s.Status != JobDone || s.Counters.Transferred != 1 || s.Counters.Failed != 1 {
+		t.Errorf("after resume: %s %+v %q", s.Status, s.Counters, s.Error)
+	}
+	if got, _ := e.garage.get("masuk", "d.jpg"); string(got) != "d" {
+		t.Errorf("d.jpg = %q", got)
 	}
 }
 
@@ -700,26 +761,69 @@ func TestSFTPListingCleansUpAfterCrashesAndCancels(t *testing.T) {
 	if left, _ := filepath.Glob(filepath.Join(dir, "*")); len(left) != 0 {
 		t.Errorf("files left after a cancelled merge: %v", left)
 	}
+
+	// The last run cannot be written (the disk is full): the earlier runs
+	// go too. A directory in its place stands in for the full disk, since
+	// the tests may run as root.
+	w = newSortedListingWriter(dir, "listing-src")
+	for i := 0; i < 5; i++ {
+		_ = w.add(fmt.Sprintf("f%02d", 5-i), 1)
+	}
+	if len(w.runs) != 2 {
+		t.Fatalf("runs = %v", w.runs)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "listing-src.run2"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.finish(t.Context()); err == nil {
+		t.Error("finish succeeded without its last run")
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "listing-src.run*")); len(left) != 0 {
+		t.Errorf("runs left after the last one failed: %v", left)
+	}
 }
 
-func TestSFTPProbeFallsBackWhenTheParentIsHuge(t *testing.T) {
+func TestSFTPProbeDoesNotWaitForAHugeFolder(t *testing.T) {
 	e := newJobTestEnv(t)
 	root := e.addSFTPRemote(t, "vps")
+	writeTree(t, filepath.Join(root, "srv/images/flat"), map[string]string{"a.jpg": "a"})
 	writeTree(t, filepath.Join(root, "srv/images/thumbs"), map[string]string{"a.jpg": "a"})
-	old := sftpParentBudget
-	sftpParentBudget = 300 * time.Millisecond
-	t.Cleanup(func() { sftpParentBudget = old })
-	e.knob(t, "sftp-slow", "/srv/images") // millions of entries next to thumbs/
+	old := sftpListBudget
+	sftpListBudget = 300 * time.Millisecond
+	t.Cleanup(func() { sftpListBudget = old })
 	r, _ := e.remotes.Get("vps")
-	start := time.Now()
-	if _, err := probeSFTP(t.Context(), e.mgr.rclone, r, "srv/images/thumbs/", false); err != nil {
-		t.Errorf("small folder in a huge parent: %v", err)
+	rc := e.mgr.rclone
+	probe := func(folder string, write bool) (time.Duration, error) {
+		start := time.Now()
+		_, err := probeSFTP(t.Context(), rc, r, folder, write)
+		return time.Since(start), err
 	}
-	if _, err := probeSFTP(t.Context(), e.mgr.rclone, r, "srv/images/hilang/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") {
-		t.Errorf("missing folder in a huge parent: %v", err)
+
+	// Millions of files (a listing of 30 s): still listing when the budget
+	// ends, and seen in its parent, so it is there and readable.
+	e.knob(t, "sftp-slow-seconds", "30")
+	e.knob(t, "sftp-slow", "/srv/images/flat")
+	for _, write := range []bool{false, true} {
+		if d, err := probe("srv/images/flat/", write); err != nil || d > 15*time.Second {
+			t.Errorf("huge folder (write=%v): %v after %v", write, err, d)
+		}
 	}
-	if d := time.Since(start); d > 5*time.Second {
-		t.Errorf("probes took %v; the slow parent listing must be abandoned", d)
+	// Next to it, a small folder is listed without waiting for the parent.
+	e.knob(t, "sftp-slow", "/srv/images")
+	if d, err := probe("srv/images/thumbs/", false); err != nil || d > 15*time.Second {
+		t.Errorf("small folder in a huge parent: %v after %v", err, d)
+	}
+	// A server slow to answer, here about a folder that is not there: not
+	// in the parent either, so the folder's own answer is waited for.
+	e.knob(t, "sftp-slow-seconds", "1.5")
+	e.knob(t, "sftp-slow", "/srv/images/hilang")
+	if d, err := probe("srv/images/hilang/", false); err == nil || !strings.Contains(err.Error(), "folder tidak ada") || d < 1500*time.Millisecond {
+		t.Errorf("slow missing folder: %v after %v", err, d)
+	}
+	// Huge folder in a huge parent: the answer comes from the folder too.
+	e.knob(t, "sftp-slow", "/srv/images\n/srv/images/flat")
+	if _, err := probe("srv/images/flat/", false); err != nil {
+		t.Errorf("huge folder in a huge parent: %v", err)
 	}
 }
 

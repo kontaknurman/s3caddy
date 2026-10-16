@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestDetectRcloneParsesVersionAndRejectsOldOnes(t *testing.T) {
@@ -74,8 +75,8 @@ func TestRcloneRunStreamsStatsAndPerObjectErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 6 {
-		t.Errorf("exit code = %d, want 6 (partial failure)", code)
+	if code != 1 || !chunkDone(code, 1, rcloneRanToEnd(last)) {
+		t.Errorf("exit code = %d, want 1 with the closing summary (partial failure)", code)
 	}
 	if got, _ := dst.get("arsip", "in/a.txt"); string(got) != "hello" {
 		t.Errorf("a.txt not copied: %q", got)
@@ -173,16 +174,107 @@ func TestRcloneRunReportsFatalExitWithLastLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code != 7 || chunkDone(code) {
+	if code != 7 || chunkDone(code, 0, rcloneRanToEnd(last)) {
 		t.Errorf("code = %d", code)
 	}
 	if !strings.Contains(strings.Join(last, "\n"), "forced exit 7") {
 		t.Errorf("last lines = %v", last)
 	}
-	for _, c := range []int{0, 5, 6} {
-		if !chunkDone(c) {
-			t.Errorf("exit %d should count as chunk done", c)
+}
+
+// The exit codes as measured with rclone 1.60.1 and 1.75.1: a file the SSH
+// user may not read makes `rclone copy` exit 1 after copying the rest, and so
+// does a VPS that refuses the connection before anything is copied.
+func TestChunkDoneTellsAFinishedChunkFromAnAbortedOne(t *testing.T) {
+	summary := []string{
+		`error: Failed to copy: failed to open source object: open /srv/x/b.txt: permission denied`,
+		`error: Attempt 1/1 failed with 1 errors and: failed to open source object: open /srv/x/b.txt: permission denied`,
+		`notice: Failed to copy: failed to open source object: open /srv/x/b.txt: permission denied`,
+	}
+	startup := []string{`critical: Failed to create file system for "src:/srv/x": NewFs: couldn't connect SSH: dial tcp 10.0.0.5:22: connect: connection refused`}
+	cases := []struct {
+		name     string
+		code     int
+		failed   int
+		lines    []string
+		wantDone bool
+	}{
+		{"clean", 0, 0, nil, true},
+		{"retry errors", 5, 3, summary, true},
+		{"no-retry errors", 6, 1, summary, true},
+		{"nothing transferred", 9, 0, nil, true},
+		{"unreadable file", 1, 1, summary, true},
+		{"cannot connect", 1, 0, startup, false},
+		{"failed keys but no closing summary", 1, 2, summary[:1], false},
+		{"closing summary but no key of the chunk failed", 1, 0, summary[1:], false},
+		{"usage error (rclone 1.6x+)", 2, 0, nil, false},
+		{"fatal", 7, 4, summary, false},
+		{"signal", 143, 1, summary, false},
+	}
+	for _, c := range cases {
+		if got := chunkDone(c.code, c.failed, rcloneRanToEnd(c.lines)); got != c.wantDone {
+			t.Errorf("%s: chunkDone = %v, want %v", c.name, got, c.wantDone)
 		}
+	}
+	if rcloneRanToEnd(startup) || !rcloneRanToEnd(summary) {
+		t.Error("rcloneRanToEnd misreads the log")
+	}
+	if !strings.Contains(rcloneExitMeaning(1), "tidak bisa dihubungi") || !strings.Contains(rcloneExitMeaning(2), "argumen") {
+		t.Errorf("exit meanings: 1=%q 2=%q", rcloneExitMeaning(1), rcloneExitMeaning(2))
+	}
+}
+
+func TestRcloneArgsRetryTheWholeRunOnlyForDeletes(t *testing.T) {
+	r := &rcloneRunner{bin: "rclone"}
+	for verb, want := range map[string]string{"copy": "--retries 1 ", "move": "--retries 1 ", "delete": "--retries 3 "} {
+		run := rcloneRun{Verb: verb, ChunkPath: "c", Src: "src:b/", Dst: "dst:b/"}
+		if verb == "delete" {
+			run.Dst = ""
+		}
+		if got := strings.Join(r.args(run), " "); !strings.Contains(got, want) {
+			t.Errorf("%s: want %q in %s", verb, want, got)
+		}
+	}
+}
+
+func TestLongErrorsAreShortenedWithoutLosingTheNextStep(t *testing.T) {
+	s := strings.Repeat("a", 9) + "→b" // "→" takes bytes 9 to 11
+	for n := 9; n <= 12; n++ {
+		if got := truncate(s, n); !utf8.ValidString(got) {
+			t.Errorf("truncate(%d) = %q splits a character", n, got)
+		}
+	}
+	if got := truncate(s, 11); got != strings.Repeat("a", 9)+"…" {
+		t.Errorf("truncate(11) = %q", got)
+	}
+	// The job card keeps the whole advice of a refused root login.
+	root := Remote{Name: "lama", Type: RemoteTypeSFTP, Host: "10.0.0.5", Port: 22, User: "root", Password: "x"}
+	err := rcloneStopped(1, []string{`critical: Failed to create file system for "src:/srv/x": NewFs: couldn't connect SSH: ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain`}, root, Remote{Name: "garage"})
+	if v := newJobView(JobState{Error: err.Error()}); !strings.Contains(v.ErrorShort, "menampilkan perintah untuk memasangnya di VPS") {
+		t.Errorf("job card: %q", v.ErrorShort)
+	}
+}
+
+func TestRcloneStoppedAddsTheSSHHintOnlyForTheVPSSide(t *testing.T) {
+	vps := Remote{Name: "lama", Type: RemoteTypeSFTP, Host: "10.0.0.5", Port: 22, User: "deploy", Password: "x"}
+	garage := Remote{Name: "garage"}
+	refused := []string{`critical: Failed to create file system for "src:/srv/x": NewFs: couldn't connect SSH: dial tcp 10.0.0.5:22: connect: connection refused`}
+	err := rcloneStopped(1, refused, vps, garage)
+	if !strings.Contains(err.Error(), "exit code 1") || !strings.Contains(err.Error(), "Port SSH tertutup") {
+		t.Errorf("import: %v", err)
+	}
+	// rclone 1.60 writes it as a plain line with a timestamp.
+	plain := []string{`2026/10/16 01:48:33 Failed to create file system for "dst:/srv/x": NewFs: couldn't connect SSH: ssh: handshake failed: ssh: unable to authenticate, attempted methods [none password], no supported methods remain`}
+	if err := rcloneStopped(1, plain, garage, vps); !strings.Contains(err.Error(), "Login ditolak") {
+		t.Errorf("export: %v", err)
+	}
+	// Garage refusing is not the VPS's doing.
+	garageDown := []string{`critical: Failed to create file system for "dst:media/": dial tcp 127.0.0.1:3900: connect: connection refused`}
+	if err := rcloneStopped(1, garageDown, vps, garage); strings.Contains(err.Error(), "SSH") {
+		t.Errorf("hint for the wrong side: %v", err)
+	}
+	if problem := rcloneProblem(refused); problem != "dial tcp 10.0.0.5:22: connect: connection refused" {
+		t.Errorf("rcloneProblem = %q", problem)
 	}
 }
 

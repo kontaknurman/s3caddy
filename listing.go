@@ -149,8 +149,8 @@ func (r *rcloneRunner) streamLsjson(ctx context.Context, env []string, args []st
 // rcloneKilledMessage explains an rclone listing killed by SIGKILL.
 const rcloneKilledMessage = "rclone dihentikan paksa (SIGKILL) saat men-list folder di VPS; hampir selalu karena kehabisan memori. " +
 	"rclone membaca satu direktori utuh sekaligus, ±0,7 KB per file, jadi folder datar dengan jutaan file butuh RAM besar. " +
-	"Naikkan batas memori panel: sudo systemctl edit garagepanel, isi [Service] lalu MemoryMax=8G, kemudian sudo systemctl restart garagepanel. " +
-	"Atau bagi folder itu ke beberapa subfolder."
+	"Kalau RAM server masih longgar, naikkan batas memori panel (bawaannya separuh RAM): sudo systemctl edit garagepanel, isi [Service] lalu MemoryMax=75%, kemudian sudo systemctl restart garagepanel. " +
+	"Kalau tidak, bagi folder itu ke beberapa subfolder dan buat satu job per subfolder."
 
 // sortedListingWriter collects entries and writes them, sorted, to disk.
 type sortedListingWriter struct {
@@ -201,16 +201,22 @@ func (w *sortedListingWriter) flushRun() error {
 
 // finish merges the runs into one sorted file, without duplicates, and
 // returns its path. A cancelled ctx stops the merge (tens of millions of
-// entries take a while; pause and shutdown should not wait for them).
+// entries take a while; pause and shutdown should not wait for them). The
+// runs are gone afterwards whatever happened, so a disk that filled up
+// while writing the last one is not kept full by the earlier ones.
 func (w *sortedListingWriter) finish(ctx context.Context) (string, error) {
+	defer w.removeRuns()
 	if err := w.flushRun(); err != nil {
 		return "", err
 	}
 	out := filepath.Join(w.dir, w.name+".sorted")
-	defer w.removeRuns()
 	switch len(w.runs) {
 	case 0:
-		return out, writeListingFile(out, func(func(listingEntry) error) error { return nil })
+		if err := writeListingFile(out, func(func(listingEntry) error) error { return nil }); err != nil {
+			_ = os.Remove(out)
+			return "", err
+		}
+		return out, nil
 	case 1:
 		return out, os.Rename(w.runs[0], out)
 	}

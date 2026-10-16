@@ -416,6 +416,7 @@ func TestFailedKeysAreRecordedAndAnOutagePausesTheJob(t *testing.T) {
 	spec := e.importSpec("overwrite")
 	spec.Src.Bucket = "backup3"
 	spec.Dst.Bucket = "arsip3"
+	runsBefore := len(readFakeRcloneRecords(t, e.rcDir))
 	st2, err := e.mgr.Create(t.Context(), spec)
 	if err != nil {
 		t.Fatal(err)
@@ -424,11 +425,163 @@ func TestFailedKeysAreRecordedAndAnOutagePausesTheJob(t *testing.T) {
 	if !strings.Contains(s2.PauseReason, "12 dari 13") {
 		t.Errorf("pause reason = %q", s2.PauseReason)
 	}
+	if runs := len(readFakeRcloneRecords(t, e.rcDir)) - runsBefore; runs != 1 {
+		t.Errorf("an outage is not retried key by key; rclone ran %d times", runs)
+	}
 	if s2.Checkpoint != "" || s2.Counters.Failed != 0 {
 		t.Errorf("an outage must not advance the checkpoint or count failures: %+v checkpoint=%q", s2.Counters, s2.Checkpoint)
 	}
 	if _, total, _ := e.mgr.FailedKeys(st2.ID, 10); total != 0 {
 		t.Errorf("failed.jsonl has %d lines, want 0", total)
+	}
+}
+
+// rclone 1.6x+ exits 1 for a file it may not read or write (or a 403 on one
+// object), 5 when retries ran out, 6 for errors it would not retry; in every
+// case the other keys of the chunk went through.
+func TestPerObjectFailuresFinishTheChunkWhateverTheExitCode(t *testing.T) {
+	for _, exit := range []string{"", "5", "6"} {
+		t.Run("exit"+exit, func(t *testing.T) {
+			e := newJobTestEnv(t)
+			e.mgr.chunkKeys = 100
+			e.knob(t, "error-exit", exit) // "" is rclone's 1
+			for _, k := range []string{"a.txt", "fail-b.txt", "c.txt"} {
+				e.remote.put("backup", "in/"+k, []byte("x"), "text/plain")
+			}
+			st, err := e.mgr.Create(t.Context(), e.importSpec("overwrite"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := waitJob(t, e.mgr, st.ID, terminal)
+			if s.Status != JobDone || s.Counters.Transferred != 2 || s.Counters.Failed != 1 || s.Checkpoint != "fail-b.txt" {
+				t.Fatalf("status=%s counters=%+v checkpoint=%q err=%q", s.Status, s.Counters, s.Checkpoint, s.Error)
+			}
+			if keys, total, _ := e.mgr.FailedKeys(st.ID, 10); total != 1 || keys[0].Key != "in/fail-b.txt" {
+				t.Errorf("failed keys = %+v (%d)", keys, total)
+			}
+			// The failed key alone was tried twice more; the others once.
+			recs := readFakeRcloneRecords(t, e.rcDir)
+			if len(recs) != 1+chunkRetries || strings.Join(recs[0].Keys, ",") != "a.txt,c.txt,fail-b.txt" {
+				t.Fatalf("rclone runs = %+v", recs)
+			}
+			for _, r := range recs[1:] {
+				if strings.Join(r.Keys, ",") != "fail-b.txt" {
+					t.Errorf("retry run copied %v", r.Keys)
+				}
+			}
+		})
+	}
+}
+
+// While the failed keys run again, the job still counts what the first run
+// of the chunk copied.
+func TestARetryRunKeepsTheChunkCountersOnScreen(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	for _, k := range []string{"a.txt", "flaky-b.txt", "c.txt"} {
+		e.remote.put("backup", "in/"+k, []byte("x"), "text/plain")
+	}
+	e.knob(t, "sleep", "0.5")
+	st, err := e.mgr.Create(t.Context(), e.importSpec("overwrite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		// Counted by name: a run file may be half written right now.
+		if runs, _ := filepath.Glob(filepath.Join(e.rcDir, "run-*.json")); len(runs) >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the failed key was not tried again")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s, _ := e.mgr.Get(st.ID); s.Status != JobRunning || s.Counters.Transferred < 2 {
+		t.Errorf("during the retry run: status=%s counters=%+v", s.Status, s.Counters)
+	}
+	if s := waitJob(t, e.mgr, st.ID, terminal); s.Counters.Transferred != 3 || s.Counters.Failed != 0 {
+		t.Errorf("final counters = %+v", s.Counters)
+	}
+}
+
+// rclone delete keeps its own --retries 3 (nothing is deleted twice), so the
+// panel does not try the keys again itself.
+func TestDeleteJobsLeaveRetriesToRclone(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	e.garage.put("media", "lama/a.txt", []byte("x"), "text/plain")
+	e.garage.put("media", "lama/fail-b.txt", []byte("x"), "text/plain")
+	st, err := e.mgr.Create(t.Context(), JobSpec{Kind: JobDeletePrefix, Transfers: 1, Src: Endpoint{Bucket: "media", Prefix: "lama/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Transferred != 1 || s.Counters.Failed != 1 {
+		t.Fatalf("status=%s counters=%+v err=%q", s.Status, s.Counters, s.Error)
+	}
+	recs := readFakeRcloneRecords(t, e.rcDir)
+	if len(recs) != 1 || !strings.Contains(strings.Join(recs[0].Args, " "), "--retries 3 ") {
+		t.Errorf("rclone runs = %+v", recs)
+	}
+}
+
+// A connection that drops mid-transfer fails the keys in flight; a run of
+// their own copies them, and nothing is recorded as failed.
+func TestKeysThatFailOnceAreCopiedByARetryOfTheirOwn(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	for _, k := range []string{"a.txt", "flaky-b.txt", "c.txt", "sub/flaky-d.txt"} {
+		e.remote.put("backup", "in/"+k, []byte("x-"+k), "text/plain")
+	}
+	st, err := e.mgr.Create(t.Context(), e.importSpec("overwrite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobDone || s.Counters.Transferred != 4 || s.Counters.Failed != 0 || s.Counters.Chunks != 1 {
+		t.Fatalf("status=%s counters=%+v err=%q", s.Status, s.Counters, s.Error)
+	}
+	for _, k := range []string{"flaky-b.txt", "sub/flaky-d.txt"} {
+		if got, _ := e.garage.get("arsip", "out/"+k); string(got) != "x-"+k {
+			t.Errorf("%s = %q", k, got)
+		}
+	}
+	recs := readFakeRcloneRecords(t, e.rcDir)
+	if len(recs) != 2 || strings.Join(recs[1].Keys, ",") != "flaky-b.txt,sub/flaky-d.txt" {
+		t.Errorf("rclone runs = %+v", recs)
+	}
+}
+
+// Exit 1 with failed keys but without rclone's closing summary is a run that
+// died half-way: the keys after the failure were never tried.
+func TestARunThatDiesHalfwayIsNotCommitted(t *testing.T) {
+	e := newJobTestEnv(t)
+	e.mgr.chunkKeys = 100
+	for _, k := range []string{"a.txt", "fail-b.txt", "c.txt", "d.txt"} {
+		e.remote.put("backup", "in/"+k, []byte("x"), "text/plain")
+	}
+	e.knob(t, "abort-after", "2")
+	st, err := e.mgr.Create(t.Context(), e.importSpec("overwrite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := waitJob(t, e.mgr, st.ID, terminal)
+	if s.Status != JobFailed || !strings.Contains(s.Error, "exit code 1") || s.Checkpoint != "" || s.Counters.Failed != 0 || s.Counters.Transferred != 0 {
+		t.Fatalf("status=%s counters=%+v checkpoint=%q err=%q", s.Status, s.Counters, s.Checkpoint, s.Error)
+	}
+	if _, total, _ := e.mgr.FailedKeys(st.ID, 10); total != 0 {
+		t.Errorf("%d keys written off for a run that died", total)
+	}
+	e.knob(t, "abort-after", "")
+	if err := e.mgr.Resume(st.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s = waitJob(t, e.mgr, st.ID, terminal); s.Status != JobDone || s.Counters.Transferred != 3 || s.Counters.Failed != 1 {
+		t.Errorf("after resume: %s %+v %q", s.Status, s.Counters, s.Error)
+	}
+	if _, ok := e.garage.get("arsip", "out/d.txt"); !ok {
+		t.Error("d.txt was never copied")
 	}
 }
 

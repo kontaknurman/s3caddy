@@ -182,7 +182,7 @@ Yang perlu ada di mesin mana:
 | Go 1.24+ | ✔ | — (binary statis) |
 | Garage | — | ✔ |
 | Caddy | — | ✔ |
-| rclone 1.59+ | — | ✔ hanya kalau fitur Sync dipakai |
+| rclone 1.59+ (1.63+ untuk remote VPS) | — | ✔ hanya kalau fitur Sync dipakai |
 | garagepanel | dibuat di sini | ✔ dijalankan di sini |
 
 ## Memasang Go, Caddy, dan rclone
@@ -359,7 +359,7 @@ dijelaskan, artinya di server).
 | Caddy sudah jalan | `systemctl is-active caddy` | `active` |
 | Akses `sudo` di server | `sudo -v` | tidak error |
 | Go 1.24+ di mesin build | `go version` | `go1.24` atau lebih baru |
-| rclone 1.59+ di server (opsional, untuk Sync) | `rclone version` | `rclone v1.59` atau lebih baru |
+| rclone 1.59+ di server (opsional, untuk Sync) | `rclone version` | `rclone v1.59` atau lebih baru; `v1.63` atau lebih baru untuk remote VPS (SFTP) |
 
 Belum ada Go atau Caddy? Lihat [Memasang Go dan Caddy](#memasang-go-caddy-dan-rclone)
 di atas.
@@ -1230,10 +1230,19 @@ Perintah rclone persisnya (bisa direproduksi manual untuk debugging):
 ```
 rclone copy --files-from-raw <chunk> --no-traverse --use-json-log --stats 5s \
   --stats-log-level NOTICE --log-level NOTICE --transfers <N> --checkers <N> \
-  --retries 3 --low-level-retries 10 --config "" --no-check-dest -M \
+  --retries 1 --low-level-retries 10 --config "" --no-check-dest -M \
   --s3-upload-cutoff 8M --s3-chunk-size 8M --s3-upload-concurrency 2 \
   --cache-dir /var/lib/garagepanel/cache src:<bucket>/<prefix> dst:<bucket>/<prefix>
 ```
+
+`--retries 1` karena `--no-check-dest`: retry seluruh run akan menyalin ulang
+setiap key di chunk itu, termasuk yang sudah berhasil, dan menghitungnya dua
+kali (dokumentasi rclone menyarankan hal yang sama). Tiap request tetap
+di-retry 10 kali (`--low-level-retries`). Key yang tetap gagal dicoba lagi
+oleh panel sampai dua kali, 2 detik kemudian, dalam run rclone tersendiri yang
+hanya berisi key-key itu; koneksi yang putus di tengah transfer biasanya
+berhasil di percobaan kedua. Yang masih gagal baru dicatat. Job hapus folder
+(`rclone delete`) tetap memakai `--retries 3` milik rclone.
 
 Remote `src` dan `dst` didefinisikan lewat environment proses anak
 (`RCLONE_CONFIG_SRC_TYPE=s3`, `..._PROVIDER`, `..._ENDPOINT`, `..._REGION`,
@@ -1278,13 +1287,25 @@ lagi dengan mode "Lewati": yang sudah tersalin dilewati, yang gagal dicoba lagi.
 
 **Jeda otomatis.** Kalau di satu chunk paling sedikit 10 key gagal dan itu
 separuh chunk atau lebih, panel menganggap salah satu sisi sedang tidak bisa
-dihubungi: job dijeda, chunk itu **tidak** dicatat selesai dan key-nya tidak
-dicatat gagal, jadi cukup klik Lanjutkan setelah koneksinya pulih. Job juga
-dijeda setelah 1.000.000 key gagal dicatat.
+dihubungi atau menolak akses: job dijeda, chunk itu **tidak** dicatat selesai
+dan key-nya tidak dicatat gagal, jadi cukup klik Lanjutkan setelah
+penyebabnya beres. Job juga dijeda setelah 1.000.000 key gagal dicatat.
 
-**rclone keluar dengan error** (exit code 1/2/3/4/7 — argumen, remote tidak
-ditemukan, fatal): job berstatus gagal dengan 20 baris log rclone terakhir.
-Chunk itu tidak dicatat selesai; setelah penyebabnya diperbaiki, Lanjutkan.
+**Exit code rclone.** Satu file yang tidak boleh dibaca atau ditulis (atau
+satu objek yang ditolak 403) membuat rclone keluar dengan exit 1 setelah
+menyalin sisanya; exit 5 dan 6 juga berarti sebagian key gagal. Di ketiganya
+key yang gagal dicoba lagi (lihat [Cara kerja job](#cara-kerja-job)), yang
+tetap gagal dicatat, dan job lanjut, asalkan error-nya menyebut key dari chunk
+itu dan rclone sampai ke ringkasan akhirnya ("Attempt 1/1 failed with N
+errors"). Error yang hanya menyebut remote-nya (misalnya koneksi SSH yang
+putus) tidak dicatat sebagai key.
+
+**rclone keluar dengan error lain** (exit 1 tanpa key yang gagal, artinya
+rclone tidak bisa mulai sama sekali: VPS tidak bisa dihubungi, login ditolak,
+remote salah; juga exit 2/3/4/7, sinyal, atau rclone yang mati di tengah
+chunk): job berstatus gagal dengan 20 baris log rclone terakhir, plus langkah
+berikutnya kalau penyebabnya di sisi VPS. Chunk itu tidak dicatat selesai;
+setelah penyebabnya diperbaiki, Lanjutkan.
 
 ### Biaya request dan batasan
 
@@ -1391,18 +1412,21 @@ berubah)? Tes koneksi dan job gagal dengan "Host key server TIDAK SAMA …"; kli
 **Edit**, centang **ambil ulang host key**, dan cocokkan sidik jari yang baru.
 
 **Tes koneksi.** Di kartu remote VPS, isi folder (path absolut, misalnya
-`/var/www/uploads`): panel login dan mencari folder itu di folder induknya,
-lalu — kecuali "hanya baca" dipilih — menulis dan menghapus file
-`.garagepanel-probe-<acak>` di dalamnya. Isi folder sengaja tidak di-list:
+`/var/www/uploads`): panel login dan me-list folder itu satu tingkat, lalu —
+kecuali "hanya baca" dipilih — menulis dan menghapus file
+`.garagepanel-probe-<acak>` di dalamnya. Listing itu membuktikan login, host
+key, bahwa folder ada (juga kalau folder itu symlink, atau di mount yang tidak
+membedakan huruf besar-kecil), dan bahwa user SSH boleh membacanya, yang nanti
+dibutuhkan job. Folder yang tidak boleh dibaca langsung ditolak dengan
+`permission denied`, jadi jadwal melewati run-nya alih-alih menumpuk job gagal.
 SFTP butuh satu round trip per ±100 nama, jadi folder datar berisi jutaan file
 bisa makan menit, sedangkan tes ini (dan pemeriksaan yang sama setiap kali job
-dibuat) berjalan di dalam request halaman. Hanya kalau folder induknya tidak
-boleh dibaca, atau terlalu besar untuk di-list dalam 20 detik, folder itu
-sendiri yang di-list; batas seluruh tes 90 detik. Folder yang belum ada dibuat dulu,
-karena tujuan ekspor memang boleh belum ada; pada tes "hanya baca" folder yang
-tidak ada dilaporkan sebagai error. Izin membaca isi folder baru teruji saat
-job men-list-nya: kalau ditolak, job berhenti dengan `permission denied`
-sebelum menyalin apa pun.
+dibuat) berjalan di dalam request halaman. Karena itu listing-nya dibatasi 10
+detik: folder yang masih di-list setelah itu memang ada dan terbaca (folder
+yang tidak ada atau tidak boleh dibaca langsung ditolak server), asalkan
+terlihat di folder induknya; batas seluruh tes 90 detik. Folder yang belum ada
+dibuat dulu, karena tujuan ekspor memang boleh belum ada; pada tes "hanya baca"
+folder yang tidak ada dilaporkan sebagai error.
 
 **Job.** Pilih remote VPS di form job: kolom bucket dan folder remote berganti
 jadi **Folder di VPS**. Folder itu beserta seluruh subfoldernya yang disalin,
@@ -1428,10 +1452,12 @@ Bedanya dengan remote S3:
   120000 file …"). Disk sementara ±150 MB per sejuta file. Memori panel tetap
   kecil, tapi rclone membaca satu direktori utuh sekaligus: ±0,7 KB RAM per
   file di direktori terbesar (folder datar 2 juta file ±1,5 GB di server
-  panel). Unit systemd memberi `MemoryMax=4G`; kalau tetap kurang, rclone
-  dihentikan kernel, job gagal dengan pesan "dihentikan paksa (SIGKILL)", dan
-  batasnya bisa dinaikkan dengan `sudo systemctl edit garagepanel` (isi
-  `[Service]` lalu `MemoryMax=8G`). Listing sejuta file lewat SSH bisa makan
+  panel). Unit systemd memberi `MemoryMax=50%` (separuh RAM server, jadi
+  batas ini yang kena lebih dulu, bukan OOM killer kernel yang bisa memilih
+  garage); kalau tetap kurang, rclone dihentikan kernel, job gagal dengan pesan
+  "dihentikan paksa (SIGKILL)", dan batasnya bisa dinaikkan dengan
+  `sudo systemctl edit garagepanel` (isi `[Service]` lalu `MemoryMax=75%`)
+  selama RAM-nya masih longgar. Listing sejuta file lewat SSH bisa makan
   beberapa menit sebelum transfer pertama dimulai.
 - **Symlink tidak diikuti.** Link di dalam folder — ke file, ke folder lain,
   atau balik ke atas — dilewati saat listing, begitu juga FIFO, socket, dan
@@ -1462,9 +1488,17 @@ Bedanya dengan remote S3:
   `chown -R www-data: /var/www/uploads`.
 - **Folder kosong** tidak ikut di kedua arah: di file system folder ada karena
   isinya, dan objek marker `nama/` tidak dijadikan folder kosong di VPS.
+- **File yang berubah sesudah listing.** Listing dibuat di awal run. File yang
+  dihapus di VPS sebelum chunk-nya disalin dilewati rclone tanpa pesan
+  (terhitung "diperiksa", tidak dicatat gagal), file yang berubah ukuran
+  disalin dengan isi terbarunya, dan file baru masuk di run berikutnya.
 - **Nama file yang bukan UTF-8** (misalnya Latin-1 dari server lama) tidak bisa
-  disebut rclone lewat daftar file: file itu dicatat di "key yang gagal"
-  beserta alasannya, bukan dilewati diam-diam. Ubah namanya di VPS, misalnya
+  disebut rclone lewat daftar file: listing-nya menampilkan nama itu dengan
+  karakter pengganti `�`, dan rclone melewati nama yang tidak ada di VPS tanpa
+  pesan. Karena itu setiap file bernama dengan `�` dicek di bucket setelah
+  chunk-nya selesai: yang tidak sampai dicatat di "key yang gagal" beserta
+  alasannya, bukan hilang diam-diam. Nama UTF-8 yang memang memuat `�` (sisa
+  migrasi lama) tersalin seperti biasa. Ubah nama yang gagal di VPS, misalnya
   `convmv -f latin1 -t utf8 -r --notest /var/www/uploads`, lalu jalankan job
   lagi.
 - **Verifikasi MD5.** Di kedua arah rclone menjalankan `md5sum <file>` lewat
@@ -1675,9 +1709,10 @@ baris `StateDirectory=garagepanel` (membuat `/var/lib/garagepanel`),
 `MemoryMax=1G`, dan `TimeoutStopSec=30`. Tanpa unit baru, halaman Sync
 menampilkan notice "direktori state tidak bisa dipakai" beserta perintah
 `install -d` untuk membuatnya manual. **Versi dengan remote VPS (SFTP)**
-menaikkan `MemoryMax` ke 4G (listing folder datar besar) dan menambah
-`OOMPolicy=continue`, supaya rclone yang kehabisan memori tidak ikut
-menghentikan panel.
+mengganti `MemoryMax` jadi `50%` (separuh RAM, untuk listing folder datar
+besar), menambah `OOMPolicy=continue` supaya rclone yang kehabisan memori
+tidak ikut menghentikan panel, dan `OOMScoreAdjust=500` supaya kalau RAM server
+tetap habis, kernel memilih panel dan rclone sebagai korban, bukan garage.
 
 ```bash
 sudo install -o root -g root -m 0644 garagepanel.service /etc/systemd/system/garagepanel.service
@@ -1784,7 +1819,7 @@ Semua lewat environment variable.
 | `PANEL_USERNAME` | `admin` | Username untuk login |
 | `PANEL_DOMAIN` | — | Domain untuk **UI panel** — bukan untuk S3 API. Wajib disertai `PANEL_PASSWORD_HASH` |
 | `STATE_DIR` | `$STATE_DIRECTORY` dari systemd, kalau tidak ada `/var/lib/garagepanel` | Remote dan checkpoint job Sync. Tidak bisa ditulis → halaman Sync nonaktif, sisanya jalan |
-| `RCLONE_BIN` | `rclone` (dicari di PATH) | Path rclone. Butuh v1.59+ |
+| `RCLONE_BIN` | `rclone` (dicari di PATH) | Path rclone. Butuh v1.59+, dan v1.63+ untuk remote VPS (SFTP) |
 | `RCLONE_EXTRA_ARGS` | — | Argumen tambahan untuk setiap rclone, dipecah per spasi, **tidak** lewat shell. Contoh: `--bwlimit 20M`, `--s3-sign-accept-encoding=false` |
 
 ## Keamanan
@@ -2052,7 +2087,8 @@ itu: `garage bucket allow --read --write <bucket> --key garagepanel`.
 
 **Halaman Sync bilang "Fitur Sync nonaktif"** — alasannya tertulis di notice.
 `rclone tidak ditemukan`: `sudo apt install rclone` lalu restart panel.
-`rclone vX terlalu lama`: butuh 1.59+, pakai skrip resmi rclone. `Direktori
+`rclone vX terlalu lama`: butuh 1.59+ (1.63+ untuk remote VPS), pakai skrip
+resmi rclone. `Direktori
 state … tidak bisa dipakai`: unit systemd lama tanpa `StateDirectory=` —
 salin ulang unit dari repo, `daemon-reload`, restart. Kalau `RCLONE_BIN`
 diisi manual, pastikan file itu bisa dieksekusi oleh user `garagepanel`.
@@ -2117,9 +2153,10 @@ masih 1.60. Pasang versi resmi dengan
 `sudo systemctl restart garagepanel`.
 
 **Job VPS gagal "rclone dihentikan paksa (SIGKILL)"** — kehabisan memori saat
-men-list folder datar yang sangat besar (±0,7 KB per file). Naikkan
-`MemoryMax` lewat `sudo systemctl edit garagepanel`, atau bagi folder itu ke
-beberapa subfolder.
+men-list folder datar yang sangat besar (±0,7 KB per file). Kalau RAM server
+masih longgar, naikkan `MemoryMax` (bawaannya `50%`, misalnya jadi `75%`)
+lewat `sudo systemctl edit garagepanel`; kalau tidak, bagi folder itu ke
+beberapa subfolder dan buat satu job per subfolder.
 
 **Job VPS lama di "mendaftar isi …"** — folder besar sedang di-list lewat SSH,
 direktori demi direktori; jumlah filenya bertambah di kartu job. Kalau listing
@@ -2127,9 +2164,11 @@ gagal (misalnya `permission denied` di salah satu subfolder), job berhenti
 sebelum menyalin apa pun — perbaiki izinnya atau pakai user yang berhak, lalu
 Lanjutkan.
 
-**Job gagal dengan `PutObject … 403 AccessDenied` padahal tes koneksi lulus** —
-izin key atau kebijakan bucket tujuan berubah di tengah jalan. Jalankan Tes
-koneksi lagi (dengan uji tulis) untuk melihat pesan aslinya, lalu Lanjutkan.
+**Key gagal, atau job dijeda otomatis, dengan `403 AccessDenied` padahal tes
+koneksi lulus** — izin key atau kebijakan bucket tujuan berubah di tengah
+jalan. Jalankan Tes koneksi lagi (dengan uji tulis) untuk melihat pesan
+aslinya; setelah dibereskan, Lanjutkan job yang dijeda, atau jalankan job lagi
+dengan mode "Lewati" untuk menyalin key yang gagal.
 
 **Jadwal tidak menjalankan apa-apa** — lihat kolom "Run terakhir".
 `dilewati: bucket … sedang dipakai job` berarti run sebelumnya belum selesai
@@ -2140,15 +2179,18 @@ remote-nya untuk melihat pesan lengkapnya. Jadwal hanya jalan selama
 jadwal berstatus "dijeda" tidak pernah jalan sampai diaktifkan lagi.
 
 **Job dijeda otomatis "… dari … objek di chunk terakhir gagal"** — salah satu
-sisi tidak bisa dihubungi selama satu chunk. Periksa koneksi ke remote (atau
-Garage), lalu klik Lanjutkan: chunk itu diulang, tidak ada yang dicatat gagal.
+sisi tidak bisa dihubungi, atau menolak akses (`403`, `permission denied` di
+baris log), selama satu chunk. Periksa koneksi ke remote (atau Garage) dan
+izinnya, lalu klik Lanjutkan: chunk itu diulang, tidak ada yang dicatat gagal.
 
 **Job gagal "rclone berhenti dengan exit code 1"** — baris log rclone terakhir
-ada di bawah statusnya. Exit 1 biasanya remote tidak terdefinisi atau argumen
-di `RCLONE_EXTRA_ARGS` salah; exit 5 berarti retry ke salah satu sisi habis;
-exit 7 error fatal rclone. Lihat log lengkap: `journalctl -u garagepanel`, dan
-kalau perlu jalankan perintah rclone yang tercantum di
-[Cara kerja job](#cara-kerja-job) secara manual.
+ada di bawah statusnya. Exit 1 tanpa key yang gagal berarti rclone tidak bisa
+mulai: salah satu sisi tidak bisa dihubungi atau menolak login (untuk VPS,
+langkah berikutnya tertulis di pesan job), atau remote tidak terdefinisi.
+Exit 2 berarti argumen di `RCLONE_EXTRA_ARGS` salah; exit 7 error fatal
+rclone. Lihat log lengkap: `journalctl -u garagepanel`, dan kalau perlu
+jalankan perintah rclone yang tercantum di [Cara kerja job](#cara-kerja-job)
+secara manual.
 
 **Banyak key gagal dengan `SlowDown` / 503 dari Wasabi atau AWS** — terlalu
 banyak transfer paralel untuk rate limit penyedia. Turunkan transfer paralel

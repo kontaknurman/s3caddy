@@ -65,10 +65,8 @@ func newJobView(s JobState) jobView {
 	if s.FinishedAt != nil {
 		v.FinishedH = humanTime(*s.FinishedAt)
 	}
-	v.ErrorShort = s.Error
-	if len(v.ErrorShort) > 300 {
-		v.ErrorShort = v.ErrorShort[:300] + "…"
-	}
+	// Room for rclone's reason plus the next step a VPS error carries.
+	v.ErrorShort = truncate(s.Error, 1000)
 	return v
 }
 
@@ -331,7 +329,7 @@ func (a *App) handleRemoteUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.jobs.UsesRemote(name) {
-		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q sedang dipakai job yang belum selesai; jeda atau batalkan job itu dulu sebelum mengubah kredensialnya", name))
+		a.redirectErr(w, r, "/sync", fmt.Errorf("remote %q sedang dipakai job yang belum selesai (job yang dijeda juga); tunggu sampai selesai atau batalkan job itu dulu sebelum mengubah kredensialnya", name))
 		return
 	}
 	old, ok := a.remotes.Get(name)
@@ -444,9 +442,9 @@ func (a *App) sftpTest(w http.ResponseWriter, r *http.Request, name, folder stri
 	case write && report.Created:
 		msg = fmt.Sprintf("Remote %q bisa login; folder %s belum ada, jadi dibuat, lalu menulis dan menghapus file uji di sana berhasil. Login, host key, dan izin tulisnya benar.", name, folder)
 	case write:
-		msg = fmt.Sprintf("Remote %q bisa login, folder %s ada, dan menulis lalu menghapus file uji di sana berhasil. Login, host key, dan izin tulisnya benar.", name, folder)
+		msg = fmt.Sprintf("Remote %q bisa login, folder %s ada dan bisa dibaca, dan menulis lalu menghapus file uji di sana berhasil. Login, host key, dan izin tulisnya benar.", name, folder)
 	default:
-		msg = fmt.Sprintf("Remote %q bisa login dan folder %s ada. Login dan host key-nya benar; isi folder dibaca saat job berjalan.", name, folder)
+		msg = fmt.Sprintf("Remote %q bisa login dan folder %s ada dan bisa dibaca. Login, host key, dan izin bacanya benar.", name, folder)
 	}
 	a.redirectOK(w, r, "/sync", msg+pinned)
 }

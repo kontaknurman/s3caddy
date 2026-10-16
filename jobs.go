@@ -247,13 +247,23 @@ const (
 	// so resuming after the outage simply retries them.
 	outageMinFailures = 10
 	jobLogEveryChunks = 100
+	// chunkRetries is how many more rclone runs the keys that failed in a
+	// chunk get, in runs of their own (see transferChunk).
+	chunkRetries = 2
 )
+
+// chunkRetryDelay is the pause before such a run: an SSH server that throttles
+// new connections (MaxStartups) gets a moment. A variable so tests skip it.
+var chunkRetryDelay = 2 * time.Second
 
 type jobHandle struct {
 	mu     sync.Mutex
 	state  JobState
 	cancel context.CancelFunc // non-nil while a runner goroutine is alive
 	live   rcloneStats        // the rclone run in progress
+	// liveBase sums the earlier runs of the chunk in progress (a retry of
+	// its failed keys), shown like live until the chunk is committed.
+	liveBase rcloneStats
 	// liveListed and liveSkipped are the listing numbers of the chunk in
 	// progress. They are shown while rclone works on it and folded into the
 	// counters for good once the chunk is committed.
@@ -281,11 +291,11 @@ func (h *jobHandle) snapshot() JobState {
 	// only counted for good once their chunk is committed, so an interrupted
 	// chunk (whose keys are examined again on resume) never counts twice.
 	if s.Kind == JobDeletePrefix {
-		s.Counters.Transferred += h.live.Deletes
+		s.Counters.Transferred += h.liveBase.Deletes + h.live.Deletes
 	} else {
-		s.Counters.Transferred += h.live.Transfers
+		s.Counters.Transferred += h.liveBase.Transfers + h.live.Transfers
 	}
-	s.Counters.Bytes += h.live.Bytes
+	s.Counters.Bytes += h.liveBase.Bytes + h.live.Bytes
 	s.Counters.Listed += h.liveListed
 	s.Counters.Skipped += h.liveSkipped
 	s.Counters.Failed += int64(len(h.chunkFailed) + len(h.pendingFailed))
@@ -571,6 +581,7 @@ func (m *JobManager) startLocked(h *jobHandle) {
 	h.mu.Lock()
 	h.cancel = cancel
 	h.live = rcloneStats{}
+	h.liveBase = rcloneStats{}
 	h.liveListed, h.liveSkipped = 0, 0
 	h.chunkFailed = nil
 	h.pendingFailed = nil
@@ -617,6 +628,7 @@ func (m *JobManager) finish(ctx context.Context, h *jobHandle, err error) {
 	h.state.Phase = ""
 	h.cancel = nil
 	h.live = rcloneStats{}
+	h.liveBase = rcloneStats{}
 	h.liveListed, h.liveSkipped = 0, 0
 	h.chunkFailed = nil
 	h.pendingFailed = nil
@@ -752,7 +764,7 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 		h.mu.Unlock()
 
 		if res.Keys > 0 {
-			code, last, err := m.rclone.run(ctx, rcloneRun{
+			live, failedNow, outage, err := m.transferChunk(ctx, h, rcloneRun{
 				Verb:       spec.Kind.rcloneVerb(),
 				ChunkPath:  chunkPath,
 				Src:        srcSpec,
@@ -760,32 +772,41 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 				Env:        env,
 				Transfers:  spec.Transfers,
 				NoMetadata: noMetadata,
-			}, h.onRcloneEvent(failedPrefix+spec.Src.Prefix, m.now))
+			}, res, failedPrefix+spec.Src.Prefix, secrets, srcRemote, dstRemote)
 			if err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				return err
 			}
-
-			h.mu.Lock()
-			h.state.LastLog = redactAll(last, secrets...)
-			live := h.live
-			failedNow := h.chunkFailed
-			h.live = rcloneStats{}
-			h.chunkFailed = nil
-			h.mu.Unlock()
-
-			if !chunkDone(code) {
-				return fmt.Errorf("rclone berhenti dengan exit code %d (%s). Baris log terakhir ada di bawah. Chunk ini akan diperiksa ulang saat job dilanjutkan.", code, rcloneExitMeaning(code))
-			}
-			failedCount := len(failedNow)
-			if failedCount >= outageMinFailures && failedCount*2 >= res.Keys {
+			if outage {
 				h.mu.Lock()
+				h.liveBase = rcloneStats{}
 				h.state.Status = JobPaused
-				h.state.PauseReason = fmt.Sprintf("%d dari %d objek di chunk terakhir gagal — kemungkinan salah satu sisi sedang tidak bisa dihubungi. Chunk ini belum dicatat sebagai selesai; periksa koneksi lalu Lanjutkan, objek yang gagal akan dicoba lagi.", failedCount, res.Keys)
+				h.state.PauseReason = fmt.Sprintf("%d dari %d objek di chunk terakhir gagal — kemungkinan salah satu sisi sedang tidak bisa dihubungi atau menolak akses. Chunk ini belum dicatat sebagai selesai; periksa koneksi dan izinnya (baris log di bawah), lalu Lanjutkan. Objek yang gagal akan dicoba lagi.", len(failedNow), res.Keys)
 				h.mu.Unlock()
 				return nil
+			}
+			// rclone skips a name it cannot find without a word, so a key
+			// whose name may not exist on the VPS is looked up in Garage.
+			for _, rel := range res.Suspect {
+				if _, failed := failedNow[rel]; failed {
+					continue
+				}
+				reason := badFolderNameReason
+				_, arrived, err := dstC.HeadObject(ctx, spec.Dst.Bucket, spec.Dst.Prefix+rel)
+				switch {
+				case err != nil && ctx.Err() != nil:
+					return ctx.Err()
+				case err != nil:
+					reason = "tidak bisa memeriksa apakah file ini sampai di tujuan: " + firstLine(err.Error())
+				case arrived:
+					continue
+				}
+				if failedNow == nil {
+					failedNow = map[string]FailedKey{}
+				}
+				failedNow[rel] = FailedKey{Key: failedPrefix + spec.Src.Prefix + rel, Error: reason, At: m.now()}
 			}
 			// Record in key order so the log reads like the listing.
 			failedKeys := make([]string, 0, len(failedNow))
@@ -805,6 +826,7 @@ func (m *JobManager) execute(ctx context.Context, h *jobHandle) error {
 			}
 			h.state.Counters.Transferred += done
 			h.state.Counters.Bytes += live.Bytes
+			h.liveBase = rcloneStats{}
 			h.mu.Unlock()
 		}
 
@@ -948,6 +970,85 @@ func (m *JobManager) handleMarkers(ctx context.Context, spec JobSpec, markers []
 	}
 }
 
+// transferChunk runs rclone over the chunk file, then the keys that failed
+// again in runs of their own, up to chunkRetries times: a connection that
+// dropped mid-transfer usually works the second time. rclone's own --retries
+// would copy every key of the chunk again (see rcloneRunner.args). It returns
+// the counters of all runs and the keys that failed in the last one. outage
+// is set, without retries, when the first run failed so many keys that a
+// side looks unreachable or refusing: then the chunk is not committed.
+func (m *JobManager) transferChunk(ctx context.Context, h *jobHandle, run rcloneRun, res chunkResult, keyPrefix string, secrets []string, src, dst Remote) (live rcloneStats, failed map[string]FailedKey, outage bool, err error) {
+	names := res.Names
+	for attempt := 0; ; attempt++ {
+		code, last, err := m.rclone.run(ctx, run, h.onRcloneEvent(keyPrefix, names, m.now))
+		if err != nil {
+			return live, nil, false, err
+		}
+		h.mu.Lock()
+		h.state.LastLog = redactAll(last, secrets...)
+		live.Transfers += h.live.Transfers
+		live.Deletes += h.live.Deletes
+		live.Bytes += h.live.Bytes
+		h.liveBase = live
+		failed = h.chunkFailed
+		h.live = rcloneStats{}
+		h.chunkFailed = nil
+		h.mu.Unlock()
+
+		switch {
+		case !chunkDone(code, len(failed), rcloneRanToEnd(last)):
+			return live, nil, false, rcloneStopped(code, last, src, dst)
+		case attempt == 0 && len(failed) >= outageMinFailures && len(failed)*2 >= res.Keys:
+			return live, failed, true, nil
+		case len(failed) == 0 || attempt == chunkRetries || run.Verb == "delete":
+			// rclone delete still retries itself; nothing is copied twice.
+			return live, failed, false, nil
+		}
+		retry := make([]string, 0, len(failed))
+		for k := range failed {
+			retry = append(retry, k)
+		}
+		sort.Strings(retry)
+		if err := os.WriteFile(run.ChunkPath, []byte(strings.Join(retry, "\n")+"\n"), 0o600); err != nil {
+			return live, nil, false, fmt.Errorf("tidak bisa menulis file chunk: %w", err)
+		}
+		names = make(map[string]struct{}, len(retry))
+		for _, k := range retry {
+			names[k] = struct{}{}
+		}
+		select {
+		case <-ctx.Done():
+			return live, nil, false, ctx.Err()
+		case <-time.After(chunkRetryDelay):
+		}
+	}
+}
+
+// rcloneStopped is the error for a run that did not get through its chunk.
+// When rclone could not set up the VPS side ("Failed to create file system
+// for "src:/srv/x": … connection refused"), the SSH next step the connection
+// test would give is added.
+func rcloneStopped(code int, last []string, src, dst Remote) error {
+	msg := fmt.Sprintf("rclone berhenti dengan exit code %d (%s). Baris log terakhir ada di bawah. Chunk ini akan diperiksa ulang saat job dilanjutkan.", code, rcloneExitMeaning(code))
+	for _, side := range []struct {
+		alias string
+		r     Remote
+	}{{"src", src}, {"dst", dst}} {
+		if !side.r.IsSFTP() {
+			continue
+		}
+		for _, l := range last {
+			if strings.Contains(l, `Failed to create file system for "`+side.alias+":") {
+				if hint := sftpHint(rcloneProblem([]string{l}), side.r); hint != "" {
+					msg += "\n" + hint
+				}
+				break
+			}
+		}
+	}
+	return errors.New(msg)
+}
+
 // redactAll scrubs secrets from log lines before they are kept anywhere.
 func redactAll(lines []string, secrets ...string) []string {
 	out := make([]string, 0, len(lines))
@@ -962,8 +1063,11 @@ func redactAll(lines []string, secrets ...string) []string {
 	return out
 }
 
-// onRcloneEvent folds rclone's log lines into the handle.
-func (h *jobHandle) onRcloneEvent(srcPrefix string, now func() time.Time) func(rcloneEvent) {
+// onRcloneEvent folds rclone's log lines into the handle. An error line is a
+// failed key only when it names a key of the chunk: rclone also logs errors
+// about a remote as a whole ("Discarding closed SSH connection: EOF" on
+// "sftp://user@host:22//srv/x/"), and those are no key to retry.
+func (h *jobHandle) onRcloneEvent(srcPrefix string, keys map[string]struct{}, now func() time.Time) func(rcloneEvent) {
 	return func(ev rcloneEvent) {
 		h.mu.Lock()
 		defer h.mu.Unlock()
@@ -973,7 +1077,7 @@ func (h *jobHandle) onRcloneEvent(srcPrefix string, now func() time.Time) func(r
 			h.state.UpdatedAt = now()
 			return
 		}
-		if ev.Level == "error" && ev.Object != "" {
+		if _, isKey := keys[ev.Object]; ev.Level == "error" && isKey {
 			if h.chunkFailed == nil {
 				h.chunkFailed = map[string]FailedKey{}
 			}

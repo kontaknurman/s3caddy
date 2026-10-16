@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // The panel pins an SFTP server's host key the first time it talks to it
@@ -508,9 +509,14 @@ func knownHostsContent(keys []string, port int) string {
 	return b.String()
 }
 
+// truncate shortens s to at most n bytes plus "…", never in the middle of a
+// UTF-8 character.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…"
 }

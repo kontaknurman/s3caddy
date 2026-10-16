@@ -136,6 +136,15 @@ func (r *rcloneRunner) args(spec rcloneRun) []string {
 	if transfers <= 0 {
 		transfers = 4
 	}
+	retries := "3"
+	if spec.Verb != "delete" {
+		// With --no-check-dest (below) a retry of the whole run copies every
+		// key of the chunk again, the ones that went through included, and
+		// counts them twice; rclone's docs advise --retries 1 with it. Each
+		// request is still retried 10 times, and the panel runs the keys
+		// that fail anyway again on their own (JobManager.transferChunk).
+		retries = "1"
+	}
 	args := []string{
 		spec.Verb,
 		"--files-from-raw", spec.ChunkPath,
@@ -146,7 +155,7 @@ func (r *rcloneRunner) args(spec rcloneRun) []string {
 		"--log-level", "NOTICE",
 		"--transfers", strconv.Itoa(transfers),
 		"--checkers", strconv.Itoa(transfers),
-		"--retries", "3",
+		"--retries", retries,
 		"--low-level-retries", "10",
 		"--config", "",
 	}
@@ -204,9 +213,7 @@ func (r *rcloneRunner) run(ctx context.Context, spec rcloneRun, onEvent func(rcl
 
 	var ring []string
 	keep := func(line string) {
-		if len(line) > rcloneMaxLineLen {
-			line = line[:rcloneMaxLineLen] + "…"
-		}
+		line = truncate(line, rcloneMaxLineLen)
 		ring = append(ring, line)
 		if len(ring) > rcloneLastLines {
 			ring = ring[len(ring)-rcloneLastLines:]
@@ -278,15 +285,17 @@ func parseRcloneLine(line string) (rcloneEvent, bool) {
 	return ev, true
 }
 
-// rcloneExitMeaning turns an exit code into words for the UI.
+// rcloneExitMeaning turns an exit code into words for the UI. rclone exits 1
+// for every error it has no category for, including a remote it cannot
+// reach; usage errors are 2 (1 before about v1.6x, where 2 is a crash).
 func rcloneExitMeaning(code int) string {
 	switch code {
 	case 0:
 		return "selesai"
 	case 1:
-		return "argumen atau konfigurasi rclone salah"
+		return "error umum: remote tidak bisa dihubungi atau ditolak, atau argumen rclone salah"
 	case 2:
-		return "error yang tidak terkategori"
+		return "argumen rclone salah (periksa RCLONE_EXTRA_ARGS), atau rclone crash"
 	case 3:
 		return "direktori/prefix tidak ditemukan"
 	case 4:
@@ -306,9 +315,35 @@ func rcloneExitMeaning(code int) string {
 	}
 }
 
-// chunkDone reports whether an exit code means the chunk was processed to the
-// end (possibly with per-object failures, which are already recorded) rather
-// than aborted.
-func chunkDone(code int) bool {
-	return code == 0 || code == 5 || code == 6 || code == 9
+// chunkDone reports whether a run processed its chunk to the end (possibly
+// with per-object failures, which are already recorded) rather than aborted.
+// failedKeys is how many keys of the chunk rclone reported as failed, and
+// ranToEnd whether its log has the closing "Attempt 1/1 failed" line.
+//
+// Exit 1 is ambiguous: rclone uses it for a file it may not read or a folder
+// it may not write — the other keys of the chunk did go through — but also
+// when it cannot start at all (no connection to the VPS, a bad remote). Only
+// the first is a finished chunk.
+func chunkDone(code, failedKeys int, ranToEnd bool) bool {
+	switch code {
+	case 0, 5, 6, 9:
+		return true
+	case 1:
+		return failedKeys > 0 && ranToEnd
+	}
+	return false
+}
+
+// rcloneRanToEnd reports whether rclone's log (as kept by run) closes with
+// the summary it prints after the whole operation returned with errors,
+// "Attempt 1/1 failed with 2 errors and: …". A run that stopped early, or
+// never started, does not print it.
+func rcloneRanToEnd(lines []string) bool {
+	for _, l := range lines {
+		l = strings.TrimPrefix(l, "error: ")
+		if strings.HasPrefix(l, "Attempt ") && strings.Contains(l, " failed with ") {
+			return true
+		}
+	}
+	return false
 }

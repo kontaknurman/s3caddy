@@ -90,13 +90,13 @@ func TestSyncPageAddsTestsAndUsesAnSFTPRemote(t *testing.T) {
 		form.Set("name", "vps-lama")
 		return p.followFlash(t, p.post(t, "/sync/remotes/test", form))
 	}
-	if body = test(url.Values{"path": {"/var/www/uploads"}}); !strings.Contains(body, "bisa login, folder /var/www/uploads ada, dan menulis lalu menghapus file uji di sana berhasil") {
+	if body = test(url.Values{"path": {"/var/www/uploads"}}); !strings.Contains(body, "bisa login, folder /var/www/uploads ada dan bisa dibaca, dan menulis lalu menghapus file uji di sana berhasil") {
 		t.Errorf("probe: %s", firstLines(body))
 	}
 	if entries, _ := os.ReadDir(uploads); len(entries) != 0 {
 		t.Errorf("the test file was left behind: %v", entries)
 	}
-	if body = test(url.Values{"path": {"/var/www/uploads"}, "write": {"0"}}); !strings.Contains(body, "bisa login dan folder /var/www/uploads ada") {
+	if body = test(url.Values{"path": {"/var/www/uploads"}, "write": {"0"}}); !strings.Contains(body, "bisa login dan folder /var/www/uploads ada dan bisa dibaca") {
 		t.Errorf("read probe: %s", firstLines(body))
 	}
 	if body = test(url.Values{"path": {"/srv/cadangan/baru"}}); !strings.Contains(body, "folder /srv/cadangan/baru belum ada, jadi dibuat") {
