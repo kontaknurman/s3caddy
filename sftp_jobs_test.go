@@ -420,6 +420,17 @@ func TestSFTPProbeFindsTheFolderWithoutListingIt(t *testing.T) {
 		t.Errorf("missing parent: %v", err)
 	}
 
+	// The parent listing also complains about another entry and exits 1:
+	// a folder it did show is there; one it did not is an error to show.
+	e.knob(t, "lsjson-entry-error", "1")
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/flat/", false); err != nil {
+		t.Errorf("found despite an error on another entry: %v", err)
+	}
+	if _, err := probeSFTP(t.Context(), rc, r, "srv/komik/hilang/", false); err == nil || !strings.Contains(err.Error(), "stat of non-regular file failed") {
+		t.Errorf("missing folder with an entry error: %v", err)
+	}
+	e.knob(t, "lsjson-entry-error", "")
+
 	// A parent that may be entered but not read (mode 711): the folder's
 	// own listing is asked instead.
 	e.knob(t, "sftp-unreadable", "/srv/komik")
@@ -579,6 +590,15 @@ func TestSFTPNeedsAnRcloneThatPinsHostKeyTypes(t *testing.T) {
 	}
 	if _, err := old.Create(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "butuh rclone v1.63") {
 		t.Errorf("job on 1.60 = %v", err)
+	}
+	// Tes koneksi of an unpinned remote: refused before the server is even
+	// asked for its host key.
+	e.remotes.SetRclone(old.rclone)
+	if err := e.remotes.Add(Remote{Name: "vps-baru", Type: RemoteTypeSFTP, Host: "127.0.0.1", Port: 1, User: "root", Password: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.remotes.Probe(t.Context(), "vps-baru", "/srv/data", false); err == nil || !strings.Contains(err.Error(), "butuh rclone v1.63") {
+		t.Errorf("probe of an unpinned remote on 1.60 = %v", err)
 	}
 	// A job resumed after rclone was downgraded stops with the same reason.
 	if err := old.Rerun(st.ID); err != nil {

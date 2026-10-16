@@ -459,6 +459,10 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 			logf("NOTICE", "Failed to lsjson with 2 errors: last error was: error in ListJSON: directory not found")
 			return 3
 		}
+		// Knob "lsjson-entry-error": a one-level listing also reports an
+		// entry it could not stat and exits 1, like rclone with a dangling
+		// link when links are followed.
+		entryError := readKnob(dir, "lsjson-entry-error") != "" && !flags["-R"]
 		skipLinks := side.skipLinks && !flags["--sftp-skip-links=false"]
 		var items []string
 		add := func(rel, name string, size int64, isDir bool) {
@@ -511,6 +515,10 @@ func fakeRcloneFileCommand(verb string, positional []string, flags map[string]bo
 		fmt.Println("[")
 		fmt.Println(strings.Join(items, ",\n"))
 		fmt.Println("]")
+		if entryError {
+			logf("ERROR", "rusak: stat of non-regular file failed: no such file or directory")
+			return 1
+		}
 	}
 	return 0
 }

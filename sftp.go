@@ -522,7 +522,7 @@ func probeSFTP(ctx context.Context, rc *rcloneRunner, r Remote, folder string, w
 	if _, lines, code, err := rc.command(ctx, env, strings.NewReader("garagepanel probe\n"), "rcat", target+name); err != nil {
 		return report, err
 	} else if code != 0 {
-		return report, sftpError(r, display+" bisa dibaca, tapi menulis file uji ditolak", lines)
+		return report, sftpError(r, display+" ada, tapi menulis file uji ditolak", lines)
 	}
 	report.WriteOK = true
 	if _, lines, code, err := rc.command(ctx, env, nil, "deletefile", target+name); err != nil {
@@ -558,8 +558,12 @@ func sftpFolderExists(ctx context.Context, rc *rcloneRunner, env []string, r Rem
 		// A huge parent: ask the folder itself.
 	case err != nil:
 		return false, err
+	case found:
+		// Seen in the listing: an error about another entry of the parent
+		// (a link it could not follow, say) does not matter here.
+		return true, nil
 	case code == 0:
-		return found, nil
+		return false, nil
 	case code == 3:
 		return false, nil // the parent does not exist either
 	case !strings.Contains(strings.ToLower(rcloneProblem(lines)), "permission denied"):

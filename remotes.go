@@ -661,6 +661,13 @@ func (s *RemoteStore) Probe(ctx context.Context, name, bucket string, write bool
 		if err != nil {
 			return ProbeReport{}, err
 		}
+		s.mu.Lock()
+		rc := s.rclone
+		s.mu.Unlock()
+		// Nothing is fetched or pinned for an rclone that could not use it.
+		if err := rc.sftpSupport(); err != nil {
+			return ProbeReport{}, err
+		}
 		var pinned []string
 		if len(r.HostKeys) == 0 {
 			keys, err := fetchHostKeys(ctx, r.Host, r.Port)
@@ -678,9 +685,6 @@ func (s *RemoteStore) Probe(ctx context.Context, name, bucket string, write bool
 				return ProbeReport{}, fmt.Errorf("remote %q tidak ada", name)
 			}
 		}
-		s.mu.Lock()
-		rc := s.rclone
-		s.mu.Unlock()
 		report, err := probeSFTP(ctx, rc, r, folder, write)
 		report.PinnedKeys = pinned
 		return report, err

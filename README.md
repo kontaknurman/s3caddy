@@ -1396,7 +1396,9 @@ lalu — kecuali "hanya baca" dipilih — menulis dan menghapus file
 `.garagepanel-probe-<acak>` di dalamnya. Isi folder sengaja tidak di-list:
 SFTP butuh satu round trip per ±100 nama, jadi folder datar berisi jutaan file
 bisa makan menit, sedangkan tes ini (dan pemeriksaan yang sama setiap kali job
-dibuat) berjalan di dalam request halaman. Folder yang belum ada dibuat dulu,
+dibuat) berjalan di dalam request halaman. Hanya kalau folder induknya tidak
+boleh dibaca, atau terlalu besar untuk di-list dalam 20 detik, folder itu
+sendiri yang di-list; batas seluruh tes 90 detik. Folder yang belum ada dibuat dulu,
 karena tujuan ekspor memang boleh belum ada; pada tes "hanya baca" folder yang
 tidak ada dilaporkan sebagai error. Izin membaca isi folder baru teruji saat
 job men-list-nya: kalau ditolak, job berhenti dengan `permission denied`
