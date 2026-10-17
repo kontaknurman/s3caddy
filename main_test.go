@@ -318,6 +318,7 @@ func newTestPanel(t *testing.T, opts ...func(*Config)) *testPanel {
 	if err != nil {
 		t.Fatal(err)
 	}
+	offlineDomainChecks(app.caddy)
 	// Jobs started through the UI may still run when a test ends: stop
 	// them before the temp dirs are removed (cleanups run last-in, first-out).
 	t.Cleanup(func() {

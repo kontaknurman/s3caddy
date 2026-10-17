@@ -16,7 +16,9 @@ var (
 
 func newTestCaddy(t *testing.T, reload []string) *CaddyManager {
 	t.Helper()
-	return NewCaddyManager(t.TempDir(), "127.0.0.1:3902", "127.0.0.1:3900", reload)
+	c := NewCaddyManager(t.TempDir(), "127.0.0.1:3902", "127.0.0.1:3900", reload)
+	offlineDomainChecks(c)
+	return c
 }
 
 func TestAddDomainWritesFileAndTag(t *testing.T) {

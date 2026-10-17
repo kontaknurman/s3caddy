@@ -68,7 +68,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 | Halaman | Isi |
 |---|---|
 | **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi |
-| **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback |
+| **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback. Setelah menambah, panel menunggu sertifikat HTTPS dan melaporkan DNS, sertifikat Caddy, dan mode SSL Cloudflare; tombol **Periksa HTTPS** mengulang pemeriksaan dan meminta ulang sertifikat yang belum ada |
 | **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
 | **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain — dan dari/ke folder di VPS lewat SSH (SFTP), login dengan password (mis. root) atau kunci SSH, host key server disematkan. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
@@ -113,6 +113,20 @@ setengah jadi), lalu menjalankan `sudo systemctl reload caddy`. Kalau exit code
 bukan 0, file dikembalikan persis seperti sebelumnya, reload dijalankan lagi,
 dan stderr Caddy ditampilkan ke user. Config yang sedang berjalan tidak pernah
 ditinggalkan dalam keadaan rusak.
+
+**Sertifikat diperiksa, bukan diasumsikan.** Caddy menerbitkan sertifikat di
+belakang layar dan tidak pernah berhenti karena satu sertifikat gagal: situs
+lain tetap jalan, dan sertifikat itu terus diminta dengan jeda yang makin
+panjang. Sampai sertifikatnya ada, domain itu tidak bisa dibuka, karena HTTP
+dialihkan ke HTTPS yang belum punya sertifikat. Jadi setelah menambah domain,
+panel menunggu sampai 45 detik sambil menanyai port 443 Caddy dengan nama domain
+itu (SNI), lalu melaporkan: ke mana DNS-nya mengarah, apakah Caddy sudah punya
+sertifikat (dan alasan dari Let's Encrypt kalau gagal, dibaca dari journal
+Caddy), dan, untuk domain di belakang proxy Cloudflare, apa yang didapat
+pengunjung lewat Cloudflare. Tombol **Periksa HTTPS** di daftar domain
+melakukan hal yang sama kapan saja; kalau sertifikatnya belum ada, Caddy
+di-reload supaya langsung memintanya lagi. Itu paling sering sekali semenit per
+domain, karena Let's Encrypt hanya mengizinkan 5 kegagalan per domain per jam.
 
 **SigV4 ditulis tangan** dengan `crypto/hmac` + `crypto/sha256`. Implementasinya
 diuji terhadap tiga test vector resmi AWS (lihat `s3_test.go` dan
@@ -657,7 +671,9 @@ sudo -u garagepanel sudo -n /bin/systemctl reload caddy && echo "sudoers OK"
 
 **Opsional tapi sangat berguna:** izinkan panel membaca journal Caddy, supaya
 saat reload gagal yang tampil di UI adalah pesan error Caddy yang asli, bukan
-sekadar "Job for caddy.service failed". Ini akses baca saja, bukan privilege
+sekadar "Job for caddy.service failed", dan saat sertifikat gagal terbit alasan
+dari Let's Encrypt ikut tampil. Tanpa itu panel menunggu 45 detik penuh lalu
+hanya bisa bilang sertifikatnya belum ada. Ini akses baca saja, bukan privilege
 escalation:
 
 ```bash
@@ -857,7 +873,9 @@ Caddy untuk domain sungguhan.
 
 **4. Pasang domain** (butuh DNS yang sudah mengarah ke server ini). Di halaman
 **Domains**, isi domain, pilih bucket `uji-panel`, klik **Tambah & reload Caddy**.
-Harus muncul pesan hijau. Cek filenya di server:
+Panel menunggu sertifikatnya, biasanya beberapa detik. Harus muncul pesan hijau
+dengan baris "Caddy punya sertifikat dari Let's Encrypt". Pesan kuning menyebut
+apa yang belum beres, misalnya DNS. Cek filenya di server:
 
 ```bash
 cat /etc/caddy/sites/DOMAIN_KAMU.caddy
@@ -1967,6 +1985,29 @@ scope-nya kurang. Panel memakai sembilan operasi:
 sama muncul kalau token ber-`--expires-in` sudah kedaluwarsa. Khusus
 `GetClusterStatus` (halaman Status, daftar node Garage): tanpa scope itu
 halaman Status tetap tampil dan menyebutkan scope yang kurang.
+
+**Domain baru tidak bisa dibuka, `ERR_TOO_MANY_REDIRECTS`, atau Caddy terlihat
+"mati" setelah menambah domain** — Caddy tidak berhenti karena sertifikat gagal:
+situs lain tetap jalan dan sertifikat itu terus diminta di belakang layar
+(`systemctl is-active caddy` tetap `active`). Klik **Periksa HTTPS** di halaman
+Domains; hasilnya menunjuk penyebabnya:
+
+- **DNS belum mengarah ke server ini.** Buat record A ke IP server; sebelum itu
+  sertifikat tidak bisa terbit.
+- **Caddy belum punya sertifikat.** Alasan dari Let's Encrypt tampil kalau panel
+  boleh membaca journal Caddy (lihat [Langkah 5](#langkah-5--pasang-sudoers)).
+  Yang paling sering: port 80 tertutup di firewall, atau record AAAA lama yang
+  menunjuk ke server lain.
+- **Lewat Cloudflare dengan SSL/TLS mode Flexible.** Cloudflare menghubungi
+  server lewat HTTP, Caddy selalu mengalihkan HTTP ke HTTPS, dan pengunjung
+  berputar tanpa akhir. Ganti SSL/TLS encryption mode di dashboard Cloudflare ke
+  **Full (strict)**. Kode lain dari Cloudflare: 525 berarti Caddy belum punya
+  sertifikat, 526 berarti sertifikatnya tidak sah untuk mode strict, 521 dan 522
+  berarti port 443 tidak terjangkau dari IP Cloudflare.
+
+Kalau sertifikat tetap tidak terbit selama domain di-proxy Cloudflare, matikan
+proxy-nya sebentar (awan abu-abu) sampai Caddy mendapat sertifikat, lalu
+nyalakan lagi dengan mode Full (strict).
 
 **Caddy menolak reload karena pola `import` tidak cocok** — `/etc/caddy/sites`
 masih kosong. Isi placeholder:

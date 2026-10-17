@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -46,17 +48,35 @@ type CaddyManager struct {
 	s3Target  string   // host:port of the Garage S3 endpoint (3900)
 	reloadCmd []string // e.g. ["sudo", "-n", "/bin/systemctl", "reload", "caddy"]
 
+	// What a domain check talks to (domaincheck.go); tests replace them.
+	httpsAddr    string // Caddy's HTTPS port, asked with the domain as SNI
+	lookupHost   func(ctx context.Context, host string) ([]string, error)
+	checkCert    func(ctx context.Context, domain string) CertStatus
+	readLog      func(ctx context.Context, since time.Time) []string
+	edgeClient   *http.Client
+	isCloudflare func(net.IP) bool
+
 	mu sync.Mutex // serialises every mutation of the sites directory
+	// lastRetry is when each domain's certificate was last asked for.
+	lastRetry map[string]time.Time
 }
 
 // NewCaddyManager builds the manager.
 func NewCaddyManager(dir, webTarget, s3Target string, reloadCmd []string) *CaddyManager {
-	return &CaddyManager{
-		dir:       dir,
-		webTarget: webTarget,
-		s3Target:  s3Target,
-		reloadCmd: reloadCmd,
+	c := &CaddyManager{
+		dir:          dir,
+		webTarget:    webTarget,
+		s3Target:     s3Target,
+		reloadCmd:    reloadCmd,
+		httpsAddr:    "127.0.0.1:443",
+		lookupHost:   net.DefaultResolver.LookupHost,
+		readLog:      readCaddyLogSince,
+		edgeClient:   newEdgeClient(),
+		isCloudflare: isCloudflareIP,
+		lastRetry:    map[string]time.Time{},
 	}
+	c.checkCert = c.probeCertificate
+	return c
 }
 
 // ReloadError describes a failed "systemctl reload caddy", including whatever

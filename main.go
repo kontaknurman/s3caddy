@@ -661,6 +661,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /domains", a.handleDomains)
 	mux.HandleFunc("POST /domains/create", a.handleDomainCreate)
 	mux.HandleFunc("POST /domains/delete", a.handleDomainDelete)
+	mux.HandleFunc("POST /domains/check", a.handleDomainCheck)
 
 	mux.HandleFunc("GET /objects", a.handleObjects)
 	mux.HandleFunc("POST /objects/delete", a.handleObjectDelete)
@@ -1548,6 +1549,7 @@ func (a *App) handleDomains(w http.ResponseWriter, r *http.Request) {
 		"Buckets":   bucketNamesFrom(buckets),
 		"SitesDir":  a.cfg.SitesDir,
 		"WebTarget": a.cfg.webURL.Host,
+		"CertWait":  fmt.Sprintf("%d detik", int(certWait.Seconds())),
 	}
 	if bucketsErr != nil {
 		data["BucketsWarning"] = bucketsErr.Error()
@@ -1556,7 +1558,9 @@ func (a *App) handleDomains(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleDomainCreate(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	// A browser that gives up waiting must not cut a reload (and its
+	// rollback) in half.
+	ctx := context.WithoutCancel(r.Context())
 	domain := strings.ToLower(strings.TrimSpace(r.PostFormValue("domain")))
 	bucket := strings.TrimSpace(r.PostFormValue("bucket"))
 
@@ -1575,18 +1579,62 @@ func (a *App) handleDomainCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	since := time.Now()
 	if err := a.caddy.AddDomain(ctx, domain, bucket); err != nil {
 		a.redirectErr(w, r, "/domains", fmt.Errorf("gagal menambah domain %q: %w", domain, err))
 		return
 	}
 	log.Printf("domain %q -> bucket %q ditulis dan Caddy di-reload", domain, bucket)
-	a.redirectOK(w, r, "/domains", fmt.Sprintf(
-		"Domain %s sekarang menunjuk ke bucket %q dan Caddy sudah di-reload. Pastikan DNS %s mengarah ke server ini agar sertifikat bisa terbit.",
-		domain, bucket, domain))
+	// Wait for the certificate here, so a domain that cannot get one (or
+	// sits behind Cloudflare in Flexible mode) is explained right away.
+	rep, err := a.caddy.CheckDomain(ctx, domain, since, certWait, false)
+	if err != nil {
+		a.redirectErr(w, r, "/domains", err)
+		return
+	}
+	ok, lines := rep.Lines()
+	msg := fmt.Sprintf("Domain %s sekarang menunjuk ke bucket %q dan Caddy sudah di-reload.\n\n%s", domain, bucket, strings.Join(lines, "\n"))
+	if !ok {
+		a.redirectFlash(w, r, "/domains", "warn", msg)
+		return
+	}
+	a.redirectOK(w, r, "/domains", msg)
+}
+
+// handleDomainCheck is "Periksa HTTPS": where DNS points, whether Caddy has
+// the certificate (asking for it now when not), and, behind Cloudflare, what
+// visitors get through it.
+func (a *App) handleDomainCheck(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithoutCancel(r.Context())
+	domain := strings.ToLower(strings.TrimSpace(r.PostFormValue("domain")))
+	path, err := a.caddy.sitePath(domain)
+	if err != nil {
+		a.redirectErr(w, r, "/domains", err)
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		a.redirectErr(w, r, "/domains", fmt.Errorf("domain %s tidak terdaftar di Caddy", domain))
+		return
+	}
+	rep, err := a.caddy.CheckDomain(ctx, domain, time.Now(), 0, true)
+	if err != nil {
+		a.redirectErr(w, r, "/domains", fmt.Errorf("meminta ulang sertifikat %s gagal: %w", domain, err))
+		return
+	}
+	if rep.Retried {
+		log.Printf("domain %q: sertifikat diminta ulang (Caddy di-reload)", domain)
+	}
+	ok, lines := rep.Lines()
+	msg := "Pemeriksaan " + domain + ":\n\n" + strings.Join(lines, "\n")
+	if !ok {
+		a.redirectFlash(w, r, "/domains", "warn", msg)
+		return
+	}
+	a.redirectOK(w, r, "/domains", msg)
 }
 
 func (a *App) handleDomainDelete(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := context.WithoutCancel(r.Context())
 	domain := strings.ToLower(strings.TrimSpace(r.PostFormValue("domain")))
 	confirm := strings.TrimSpace(r.PostFormValue("confirm"))
 
@@ -2315,7 +2363,7 @@ func (a *App) handleWhitelist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleWhitelistAdd(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := context.WithoutCancel(r.Context()) // never cut a reload in half
 	if a.cfg.S3APIDomain == "" {
 		a.redirectErr(w, r, "/whitelist", errors.New("S3_API_DOMAIN belum diatur"))
 		return
@@ -2358,7 +2406,7 @@ func (a *App) handleWhitelistAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleWhitelistDelete(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := context.WithoutCancel(r.Context()) // never cut a reload in half
 	if a.cfg.S3APIDomain == "" {
 		a.redirectErr(w, r, "/whitelist", errors.New("S3_API_DOMAIN belum diatur"))
 		return
@@ -2407,7 +2455,7 @@ func (a *App) handleWhitelistDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleWhitelistRemoveFile(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := context.WithoutCancel(r.Context()) // never cut a reload in half
 	confirm := strings.TrimSpace(r.PostFormValue("confirm"))
 	if confirm != whitelistFileName {
 		a.redirectErr(w, r, "/whitelist", fmt.Errorf("konfirmasi tidak cocok: ketik ulang persis %q", whitelistFileName))

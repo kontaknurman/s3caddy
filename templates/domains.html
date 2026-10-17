@@ -14,9 +14,10 @@
     Panel menulis <code>{{.SitesDir}}/&lt;domain&gt;.caddy</code> yang mem-proxy ke
     <code>{{.WebTarget}}</code> sambil mengganti header <code>Host</code> menjadi nama bucket,
     lalu menjalankan <code>systemctl reload caddy</code>. Kalau reload gagal, file dikembalikan
-    seperti semula dan pesan error Caddy ditampilkan di sini.
+    seperti semula dan pesan error Caddy ditampilkan di sini. Setelah itu panel menunggu
+    sertifikat HTTPS-nya, paling lama {{.CertWait}}, lalu melaporkan hasilnya.
   </p>
-  <form method="post" action="/domains/create">
+  <form method="post" action="/domains/create" data-busy="Menambah, lalu menunggu sertifikat…">
     <input type="hidden" name="csrf" value="{{.CSRF}}">
     <div class="row">
       <div class="field">
@@ -39,7 +40,10 @@
   </form>
   <p class="small muted" style="margin-top: 10px;">
     Pastikan DNS domain sudah mengarah ke server ini sebelum menambah, supaya Caddy bisa
-    menerbitkan sertifikat TLS otomatis.
+    menerbitkan sertifikat TLS otomatis. Domain yang lewat proxy Cloudflare (awan oranye)
+    harus memakai SSL/TLS encryption mode <strong>Full (strict)</strong>: dengan Flexible,
+    Cloudflare menghubungi server lewat HTTP, Caddy mengalihkan ke HTTPS, dan pengunjung
+    terjebak redirect tanpa akhir.
   </p>
 </div>
 
@@ -87,6 +91,11 @@
         </td>
         <td>
           {{if .Managed}}
+          <form method="post" action="/domains/check" data-busy="Memeriksa…" style="margin-bottom: 6px;">
+            <input type="hidden" name="csrf" value="{{$.CSRF}}">
+            <input type="hidden" name="domain" value="{{.Domain}}">
+            <button type="submit" class="small" title="DNS, sertifikat Caddy, dan Cloudflare. Sertifikat yang belum ada diminta ulang.">Periksa HTTPS</button>
+          </form>
           <details class="confirm">
             <summary>Hapus</summary>
             <div class="confirm-body">

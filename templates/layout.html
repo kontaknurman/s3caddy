@@ -109,6 +109,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px
 .flash { border-radius: var(--radius); padding: 13px 16px; margin-bottom: 20px; border: 1px solid; }
 .flash.ok { background: rgba(67,192,138,.08); border-color: rgba(67,192,138,.4); }
 .flash.error { background: rgba(239,107,107,.08); border-color: rgba(239,107,107,.45); }
+.flash.warn { background: rgba(224,179,65,.08); border-color: rgba(224,179,65,.45); }
 .flash pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 13.5px; }
 .notice { border-radius: var(--radius); padding: 12px 15px; margin-bottom: 18px; border: 1px solid; font-size: 14px; }
 .notice.warn { background: rgba(224,179,65,.08); border-color: rgba(224,179,65,.4); }
@@ -462,7 +463,11 @@ textarea:focus { outline: 2px solid rgba(90,169,255,.45); outline-offset: 1px; }
   document.addEventListener('submit', function (ev) {
     var form = ev.target;
     var msg = form.getAttribute('data-confirm');
-    if (msg && !window.confirm(msg)) { ev.preventDefault(); }
+    if (msg && !window.confirm(msg)) { ev.preventDefault(); return; }
+    // A form that waits on the server (data-busy) says so and is not sent twice.
+    var busy = form.getAttribute('data-busy');
+    var btn = busy && form.querySelector('button[type=submit]');
+    if (btn) { btn.disabled = true; btn.textContent = busy; }
   });
 })();
 </script>
