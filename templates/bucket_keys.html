@@ -1,0 +1,80 @@
+{{define "content"}}
+
+{{with .ScopeHint}}
+<div class="notice warn">{{.}}</div>
+{{end}}
+
+<div class="card">
+  <h3>Access key yang punya izin di bucket <strong>{{.Bucket}}</strong></h3>
+  <p class="muted small">
+    <strong>Reset key</strong> membuat key baru dengan nama yang sama dan izin yang sama di semua
+    bucket yang bisa dijangkau key lama, lalu menghapus key lama. Aplikasi yang masih memakai key
+    lama langsung ditolak sampai diganti dengan key baru. Secret key baru hanya ditampilkan sekali.
+  </p>
+
+  {{if not .Keys}}
+    <div class="empty">Belum ada access key yang punya izin di bucket ini.</div>
+  {{else}}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Nama key</th>
+        <th>Access Key ID</th>
+        <th>Izin di bucket ini</th>
+        <th>Bucket lain</th>
+        <th>Aksi</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Keys}}
+      <tr>
+        <td>
+          <strong>{{.Name}}</strong>
+          {{if .Panel}}<span class="badge private">key panel</span>{{end}}
+        </td>
+        <td class="mono">{{.AccessKeyID}}</td>
+        <td>{{.Perm}}</td>
+        <td>
+          {{if .Others}}{{commaSep .Others}}{{else}}<span class="muted">tidak ada</span>{{end}}
+        </td>
+        <td>
+          {{if .Panel}}
+            <span class="muted small">Dipakai panel sendiri, tidak di-reset dari sini.</span>
+          {{else if .Blocker}}
+            <span class="small" style="color: var(--warn)">{{.Blocker}}</span>
+          {{else if not $.ScopeHint}}
+            <details class="confirm">
+              <summary>Reset key</summary>
+              <div class="confirm-body">
+                <p class="small" style="margin-bottom: 8px;">
+                  Key <strong>{{.AccessKeyID}}</strong> langsung tidak berlaku setelah reset.
+                  {{if .Others}}
+                    Key ini juga dipakai di bucket {{commaSep .Others}}; izinnya di sana ikut pindah
+                    ke key baru, jadi aplikasi untuk bucket itu juga harus diganti key-nya.
+                  {{end}}
+                </p>
+                <form method="post" action="/buckets/keys/reset" data-busy="Mereset…">
+                  <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                  <input type="hidden" name="bucket" value="{{$.Bucket}}">
+                  <input type="hidden" name="key" value="{{.AccessKeyID}}">
+                  <button type="submit" class="danger small">Reset sekarang</button>
+                </form>
+              </div>
+            </details>
+          {{end}}
+        </td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  </div>
+  {{end}}
+</div>
+
+<div class="row">
+  <a class="btn" href="/buckets">Kembali ke daftar bucket</a>
+  <a class="btn" href="/objects?bucket={{.Bucket}}">Buka browser objek</a>
+</div>
+
+{{end}}

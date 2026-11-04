@@ -1,0 +1,110 @@
+{{define "content"}}
+
+{{if .Done}}
+<div class="flash ok"><pre>Key {{.KeyName}} berhasil di-reset. Key lama {{.OldID}} sudah tidak berlaku.</pre></div>
+{{else}}
+<div class="flash error"><pre>{{.Err}}</pre></div>
+{{end}}
+
+<div class="card">
+  <h3>Langkah yang dijalankan</h3>
+  <ul class="steps">
+    {{range .Steps}}
+    <li>
+      {{if .OK}}<span class="mark ok">✓</span>{{else}}<span class="mark bad">✗</span>{{end}}
+      {{.Name}}
+      {{with .Err}}<div class="kv" style="color: var(--err); margin-left: 20px;">{{.}}</div>{{end}}
+    </li>
+    {{end}}
+  </ul>
+</div>
+
+{{if not .Done}}
+<div class="notice err">
+  Key lama <strong class="mono">{{.OldID}}</strong> <strong>masih aktif</strong>. Pasang key baru di
+  bawah di aplikasimu, lalu hapus key lama lewat CLI Garage:
+  <code class="mono">garage key delete --yes {{.OldID}}</code>
+</div>
+{{end}}
+
+<div class="card" style="border-color: rgba(224,179,65,.5);">
+  <h3>⚠ Secret key ditampilkan sekali saja</h3>
+  <p class="small">
+    Garage tidak akan pernah menunjukkan secret key ini lagi. Salin sekarang, lalu ganti key di
+    setiap aplikasi yang memakai key lama. Kalau hilang, reset lagi dari halaman key bucket.
+    <strong>Jangan refresh halaman ini.</strong>
+  </p>
+  <div class="creds">
+    <div class="pair">
+      <span class="key">Access Key ID</span>
+      <span class="val mono">{{.AccessKey}}</span>
+      <button type="button" class="small" data-copy="{{.AccessKey}}">Copy</button>
+    </div>
+    <div class="pair">
+      <span class="key">Secret Access Key</span>
+      <span class="val mono">{{.SecretKey}}</span>
+      <button type="button" class="small" data-copy="{{.SecretKey}}">Copy</button>
+    </div>
+    {{if .S3PublicURL}}
+    <div class="pair">
+      <span class="key">Endpoint</span>
+      <span class="val mono">{{.S3PublicURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3PublicURL}}">Copy</button>
+    </div>
+    <div class="pair">
+      <span class="key">Endpoint (dari server ini)</span>
+      <span class="val mono">{{.S3InternalURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3InternalURL}}">Copy</button>
+    </div>
+    {{else}}
+    <div class="pair">
+      <span class="key">Endpoint</span>
+      <span class="val mono">{{.S3InternalURL}}</span>
+      <button type="button" class="small" data-copy="{{.S3InternalURL}}">Copy</button>
+    </div>
+    {{end}}
+    <div class="pair">
+      <span class="key">Region</span>
+      <span class="val mono">{{.Region}}</span>
+      <button type="button" class="small" data-copy="{{.Region}}">Copy</button>
+    </div>
+  </div>
+
+  <p class="small muted" style="margin: 12px 0 6px;">Izin key baru, sama dengan key lama:</p>
+  <ul class="steps">
+    {{range .Grants}}
+    <li><strong>{{.Bucket}}</strong>: {{.Perm}}</li>
+    {{end}}
+  </ul>
+  {{if .CreateBucket}}
+  <p class="small muted" style="margin-top: 8px;">Key ini juga boleh membuat bucket baru, seperti key lama.</p>
+  {{end}}
+  {{with .Expiration}}
+  <p class="small muted" style="margin-top: 8px;">Kedaluwarsa pada <span class="mono">{{.}}</span>, sama seperti key lama.</p>
+  {{end}}
+
+  {{if .S3PublicURL}}
+    {{if not .S3PublicReady}}
+    <p class="small" style="color: var(--warn); margin: 10px 0 0;">
+      <strong>{{.S3PublicURL}}</strong> belum benar-benar dilayani Caddy: file
+      <code class="mono">_s3api.caddy</code> belum dibuat, jadi S3 API belum
+      diekspos ke luar. Tambahkan minimal satu IP di halaman
+      <a href="/whitelist">IP Whitelist</a> supaya endpoint itu hidup.
+    </p>
+    {{end}}
+  {{else}}
+    <p class="small" style="color: var(--warn); margin: 10px 0 0;">
+      Endpoint di atas adalah alamat <strong>loopback</strong>, jadi hanya bisa
+      dipakai dari dalam server ini atau lewat SSH tunnel. Untuk memakai key ini
+      dari mesin lain, isi <code class="mono">S3_API_DOMAIN</code>, restart panel,
+      lalu ekspos S3 API lewat halaman <a href="/whitelist">IP Whitelist</a>.
+    </p>
+  {{end}}
+</div>
+
+<div class="row">
+  <a class="btn" href="/buckets/keys?bucket={{.Bucket}}">Kembali ke daftar key</a>
+  <a class="btn" href="/buckets">Daftar bucket</a>
+</div>
+
+{{end}}

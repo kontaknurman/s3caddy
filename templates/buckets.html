@@ -21,7 +21,7 @@
         <label for="bucket-name">Nama bucket</label>
         <input type="text" id="bucket-name" name="name" required
                placeholder="media-produk" autocomplete="off" spellcheck="false"
-               pattern="[a-z0-9][a-z0-9-]{1,61}[a-z0-9]"
+               pattern="[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]"
                title="3-63 karakter: huruf kecil, angka, tanda hubung; tidak diawali/diakhiri tanda hubung">
       </div>
       <div class="field" style="flex: 0 1 auto;">
@@ -92,6 +92,7 @@
           {{if .Name}}
           <div class="row" style="gap: 6px; align-items: center;">
             <a class="btn small" href="/objects?bucket={{.Name}}">Objek</a>
+            <a class="btn small" href="/buckets/keys?bucket={{.Name}}">Key</a>
 
             <form method="post" action="/buckets/website" style="display:inline">
               <input type="hidden" name="csrf" value="{{$.CSRF}}">

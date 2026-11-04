@@ -243,6 +243,10 @@ type App struct {
 	// iterasi itu sengaja mahal, jadi request paralel tidak boleh dibiarkan
 	// menghabiskan CPU panel.
 	loginMu sync.Mutex
+	// keyResetMu menjalankan reset key satu per satu: klik kedua atau tab
+	// kedua mendapati key lama sudah tidak ada, alih-alih membuat key baru
+	// kedua.
+	keyResetMu sync.Mutex
 
 	// Sync dengan S3 lain. Semuanya nil kalau syncDisabled terisi.
 	remotes   *RemoteStore
@@ -609,7 +613,7 @@ func prepareStateDir(dir string) error {
 // shared layout. html/template is used throughout so every value is
 // contextually auto-escaped.
 func (a *App) parseTemplates() error {
-	pages := []string{"buckets.html", "bucket_created.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html", "sync.html", "sync_failed.html", "status.html"}
+	pages := []string{"buckets.html", "bucket_created.html", "bucket_keys.html", "key_reset.html", "domains.html", "objects.html", "whitelist.html", "error.html", "login.html", "sync.html", "sync_failed.html", "status.html"}
 	a.pages = make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.New("layout.html").Funcs(templateFuncs()).ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -657,6 +661,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /buckets/create", a.handleBucketCreate)
 	mux.HandleFunc("POST /buckets/website", a.handleBucketWebsite)
 	mux.HandleFunc("POST /buckets/delete", a.handleBucketDelete)
+	mux.HandleFunc("GET /buckets/keys", a.handleBucketKeys)
+	mux.HandleFunc("POST /buckets/keys/reset", a.handleBucketKeyReset)
 
 	mux.HandleFunc("GET /domains", a.handleDomains)
 	mux.HandleFunc("POST /domains/create", a.handleDomainCreate)

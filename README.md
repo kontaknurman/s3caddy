@@ -49,6 +49,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Biaya request dan batasan](#biaya-request-dan-batasan)
   - [Sync dengan VPS lewat SSH (SFTP)](#sync-dengan-vps-lewat-ssh-sftp)
 - [File manager di halaman Objek](#file-manager-di-halaman-objek)
+- [Key per bucket dan reset key](#key-per-bucket-dan-reset-key)
 - [Halaman Status](#halaman-status)
 - [Update ke versi baru](#update-ke-versi-baru)
   - [1. Catat versi yang sedang berjalan](#1-catat-versi-yang-sedang-berjalan)
@@ -67,7 +68,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 
 | Halaman | Isi |
 |---|---|
-| **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi |
+| **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi. Tombol **Key** per bucket: daftar access key yang punya izin di bucket itu, dan **reset key** (key baru dengan izin yang sama, key lama langsung tidak berlaku) |
 | **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback. Setelah menambah, panel menunggu sertifikat HTTPS dan melaporkan DNS, sertifikat Caddy, dan mode SSL Cloudflare; tombol **Periksa HTTPS** mengulang pemeriksaan dan meminta ulang sertifikat yang belum ada |
 | **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
 | **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain — dan dari/ke folder di VPS lewat SSH (SFTP), login dengan password (mis. root) atau kunci SSH, host key server disematkan. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
@@ -431,17 +432,21 @@ sudo grep '^admin_token' /etc/garage.toml
 ```
 
 *Pilihan B — token khusus panel (disarankan).* Bisa dibatasi scope-nya dan bisa
-dicabut tanpa mengganggu yang lain. Panel hanya memakai sembilan operasi:
+dicabut tanpa mengganggu yang lain. Panel hanya memakai sebelas operasi:
 
 ```bash
 garage admin-token create --expires-in 365d \
-  --scope GetClusterHealth,GetClusterStatus,ListBuckets,GetBucketInfo,CreateBucket,DeleteBucket,UpdateBucket,CreateKey,AllowBucketKey \
+  --scope GetClusterHealth,GetClusterStatus,ListBuckets,GetBucketInfo,CreateBucket,DeleteBucket,UpdateBucket,CreateKey,AllowBucketKey,GetKeyInfo,DeleteKey \
   garagepanel
 ```
 
 `GetClusterStatus` hanya dipakai halaman Status (daftar node dan pemakaian
 disk Garage); tanpa scope itu halaman lain tetap jalan dan kartu Garage di
-halaman Status menjelaskan scope yang kurang.
+halaman Status menjelaskan scope yang kurang. `GetKeyInfo` dan `DeleteKey`
+hanya dipakai [reset key](#key-per-bucket-dan-reset-key); tanpa keduanya
+halaman key bucket tetap tampil, tanpa tombol reset, dan menyebutkan scope
+yang kurang. Token yang sudah ada bisa ditambah scope-nya tanpa dibuat ulang:
+`garage admin-token set --scope=+GetKeyInfo,DeleteKey garagepanel`.
 
 > Garage menampilkan token ini **sekali saja** — salin sekarang.
 >
@@ -1588,6 +1593,56 @@ Halaman Objek adalah file manager per bucket:
   dan pindah memakai `CopyObject` server-side di dalam Garage (rclone dengan
   remote yang sama di kedua sisi), jadi datanya tidak keluar-masuk server.
 
+## Key per bucket dan reset key
+
+Tombol **Key** di setiap baris halaman Buckets membuka daftar access key yang
+punya izin di bucket itu: nama key, Access Key ID, izinnya di bucket ini
+(`read`, `write`, `owner`), dan bucket lain yang juga bisa dijangkau key itu.
+Key milik panel sendiri (`GARAGE_S3_ACCESS_KEY`) ditandai **key panel** dan
+tidak punya tombol reset.
+
+**Reset key** dipakai kalau secret key hilang atau bocor. Garage tidak bisa
+memberi secret baru pada key yang sudah ada, jadi panel menjalankan tiga
+langkah:
+
+1. `CreateKey` dengan nama yang sama. Izin membuat bucket dan tanggal
+   kedaluwarsa key lama ikut disalin.
+2. `AllowBucketKey` dengan izin yang persis sama di **setiap** bucket yang bisa
+   dijangkau key lama, bukan hanya bucket yang halamannya sedang dibuka.
+   Key upload-saja tetap upload-saja.
+3. `DeleteKey` untuk key lama.
+
+Access Key ID dan secret key baru ditampilkan **sekali** di halaman hasil,
+seperti saat bucket dibuat. Begitu langkah 3 selesai, aplikasi yang masih
+memakai key lama langsung ditolak Garage sampai diganti dengan key baru. Kalau
+key itu juga dipakai di bucket lain, konfirmasi reset menyebutkannya.
+
+Aturannya:
+
+- Semua yang bisa diperiksa diperiksa sebelum ada yang diubah: key harus
+  benar-benar punya izin di bucket itu menurut Garage (bukan sekadar menurut
+  form), bukan key panel, tidak punya alias lokal (alias lokal melekat pada
+  key lama dan tidak bisa dipindahkan), belum kedaluwarsa, dan token admin
+  punya scope yang dibutuhkan.
+- Kalau langkah 2 atau 3 gagal, key baru dihapus lagi. Key lama tetap aktif
+  dan pesannya mengatakan tidak ada yang berubah. Kalau penghapusan itu pun
+  gagal setelah key baru lengkap, halaman hasil tetap menampilkan key baru dan
+  memberi tahu bahwa key lama masih aktif, beserta perintah
+  `garage key delete --yes <id lama>`.
+- Refresh halaman hasil mengirim ulang form untuk key lama yang sudah tidak
+  ada, jadi ditolak, bukan me-reset dua kali. Reset berjalan satu per satu.
+- Reset butuh scope `GetKeyInfo` dan `DeleteKey` pada token admin ber-scope
+  (Pilihan B di [Langkah 0c](#langkah-0--periksa-garage-dan-caddy)). Tanpa
+  keduanya, halaman key tetap tampil tanpa tombol reset dan menyebutkan scope
+  yang kurang. Tambahkan dengan
+  `garage admin-token set --scope=+GetKeyInfo,DeleteKey garagepanel`; panel
+  tidak perlu di-restart.
+
+Yang tidak dilakukan halaman ini: membuat key tambahan, mengubah izin, atau
+menghapus key tanpa pengganti. Untuk itu pakai CLI Garage, misalnya
+`garage key create <nama>` lalu `garage bucket allow --write <bucket> --key <nama>`
+untuk key yang hanya boleh upload.
+
 ## Halaman Status
 
 Halaman **Status** menampilkan kondisi server dan cluster tanpa perlu SSH:
@@ -1752,6 +1807,21 @@ menambahkan variabel baru, itu bersifat opsional dan dicatat di
 [Konfigurasi](#konfigurasi). Panel menolak start dengan pesan yang jelas kalau
 ada yang benar-benar wajib.
 
+### Kalau fitur baru butuh scope token admin
+
+Ini hanya berlaku untuk token ber-scope (Pilihan B di
+[Langkah 0c](#langkah-0--periksa-garage-dan-caddy)); `admin_token` dari
+`garage.toml` sudah boleh semuanya. **Versi dengan reset key** memakai dua
+operasi baru, `GetKeyInfo` dan `DeleteKey`. Tambahkan ke token yang sudah ada:
+
+```bash
+garage admin-token set --scope=+GetKeyInfo,DeleteKey garagepanel
+```
+
+Panel membaca scope tokennya setiap kali halaman key dibuka, jadi tidak perlu
+restart. Tanpa langkah ini semua fitur lama tetap jalan; hanya tombol reset
+key yang tidak muncul, dan halaman key menyebutkan scope yang kurang.
+
 ## Backup dan pemulihan
 
 State panel kecil. Yang perlu di-backup:
@@ -1879,6 +1949,7 @@ divalidasi lebih dulu:
 | Password SSH | maks 1024 byte, tanpa baris baru atau NUL |
 | Nama folder / nama file | satu komponen: tanpa `/` `\`, bukan `.`/`..`, tanpa karakter kontrol, maks 255 byte; nama file juga lewat whitelist ekstensi |
 | ID job / ID jadwal | `^[0-9a-f]{16}$`, diperiksa sebelum dijadikan path di `STATE_DIR` |
+| Access Key ID (reset key) | `^[A-Za-z0-9_.-]{1,128}$`, lalu harus tercantum di daftar key bucket itu menurut Garage |
 | Interval jadwal | `<angka>` + `m`/`h`/`d`, 15 menit sampai 30 hari; run pertama harus berbentuk `YYYY-MM-DDTHH:MM` |
 
 Semua nilai yang dipakai sebagai komponen nama file juga ditolak kalau
@@ -1931,6 +2002,15 @@ diisi lagi, supaya password tidak bisa dialihkan ke server lain. Baris debug
 rclone yang mencetak setelan remote (`-vv` di `RCLONE_EXTRA_ARGS`; rclone
 lama mencetak nilainya apa adanya) dibuang sebelum log disimpan.
 
+**Reset key.** Secret key baru hanya ada di halaman hasil reset, yang dikirim
+dengan `Cache-Control: no-store`; tidak disimpan di disk, di flash message,
+atau di log (log hanya mencatat nama key dan Access Key ID lama serta baru).
+Access Key ID dari form hanya dipakai kalau Garage sendiri mencantumkannya di
+daftar key bucket itu, jadi form yang diubah tidak bisa me-reset key milik
+bucket lain. Key panel tidak pernah di-reset dari panel. Langkah-langkahnya
+berjalan terlepas dari request, jadi tab yang ditutup di tengah reset tidak
+meninggalkan key setengah jadi.
+
 **Status.** Halaman Status hanya membaca file teks kernel di `/proc` dan
 `/sys` serta memanggil dua operasi baca Admin API; tidak ada perintah shell,
 tidak ada `systemctl`, tidak ada akses `/dev`, dan tidak ada hak tambahan di
@@ -1978,13 +2058,17 @@ tokennya baru diubah. Uji tokennya langsung:
 
 **Sebagian halaman jalan, satu operasi menjawab 403** — kalau kamu memakai token
 ber-scope (Pilihan B di [Langkah 0c](#langkah-0--periksa-garage-dan-caddy)),
-scope-nya kurang. Panel memakai sembilan operasi:
+scope-nya kurang. Panel memakai sebelas operasi:
 `GetClusterHealth`, `GetClusterStatus`, `ListBuckets`, `GetBucketInfo`,
 `CreateBucket`, `DeleteBucket`, `UpdateBucket`, `CreateKey`,
-`AllowBucketKey`. Buat ulang tokennya dengan daftar lengkap itu. Gejala yang
-sama muncul kalau token ber-`--expires-in` sudah kedaluwarsa. Khusus
-`GetClusterStatus` (halaman Status, daftar node Garage): tanpa scope itu
-halaman Status tetap tampil dan menyebutkan scope yang kurang.
+`AllowBucketKey`, `GetKeyInfo`, `DeleteKey`. Tambahkan yang kurang dengan
+`garage admin-token set --scope=+<Operasi>,<Operasi> garagepanel`, atau buat
+ulang tokennya dengan daftar lengkap itu. Pesan Garage untuk scope yang kurang
+bisa berbunyi `Forbidden: Invalid bearer token` walaupun tokennya benar. Gejala
+yang sama muncul kalau token ber-`--expires-in` sudah kedaluwarsa. Khusus
+`GetClusterStatus` (halaman Status, daftar node Garage) dan `GetKeyInfo` +
+`DeleteKey` (reset key): tanpa scope itu halamannya tetap tampil dan
+menyebutkan scope yang kurang.
 
 **Domain baru tidak bisa dibuka, `ERR_TOO_MANY_REDIRECTS`, atau Caddy terlihat
 "mati" setelah menambah domain** — Caddy tidak berhenti karena sertifikat gagal:

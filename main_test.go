@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -32,10 +33,119 @@ type fakeGarage struct {
 	noScope map[string]bool   // operations the token is not allowed to call (403)
 	keys    map[string]string // access key id -> secret
 	nextID  int
+
+	// Key model for the key pages: keys created through CreateKey or addKey,
+	// with their permissions per bucket.
+	keyModel map[string]*fakeKey
+	// anyPerms lets AllowBucketKey grant any permission; otherwise it insists
+	// on the read + write that bucket creation grants.
+	anyPerms bool
+	// failAllow fails AllowBucketKey on a bucket id; failDelete fails
+	// DeleteKey on a key id, after deleting the key when deleteThenFail says so.
+	failAllow      map[string]string
+	failDelete     map[string]string
+	deleteThenFail map[string]bool
+	// noTokenInfo answers GetCurrentAdminTokenInfo with 404, like a Garage
+	// that does not know it.
+	noTokenInfo bool
 }
 
+// fakeKey is one access key in the fake's key model.
+type fakeKey struct {
+	ID, Name, Secret string
+	CreateBucket     bool
+	Expiration       *string
+	Expired          bool
+	Perms            map[string]BucketKeyPerm // bucket id -> permissions
+	LocalAliases     map[string][]string      // bucket id -> local aliases
+}
+
+// fakeAdminOps are the operations GetCurrentAdminTokenInfo lists for a token
+// that lacks the ones in noScope.
+var fakeAdminOps = []string{"GetClusterHealth", "GetClusterStatus", "ListBuckets", "GetBucketInfo", "CreateBucket",
+	"DeleteBucket", "UpdateBucket", "CreateKey", "AllowBucketKey", "GetKeyInfo", "DeleteKey"}
+
 func newFakeGarage() *fakeGarage {
-	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}, noScope: map[string]bool{}, keys: map[string]string{}}
+	return &fakeGarage{buckets: map[string]*BucketInfo{}, aliases: map[string]string{}, failOps: map[string]string{}, noScope: map[string]bool{}, keys: map[string]string{},
+		keyModel: map[string]*fakeKey{}, failAllow: map[string]string{}, failDelete: map[string]string{}, deleteThenFail: map[string]bool{}}
+}
+
+// addKey puts a key into the key model, with permissions per bucket name.
+func (f *fakeGarage) addKey(id, name string, perms map[string]BucketKeyPerm) *fakeKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := &fakeKey{ID: id, Name: name, Secret: "SECRET-" + id, Perms: map[string]BucketKeyPerm{}, LocalAliases: map[string][]string{}}
+	for bucket, p := range perms {
+		k.Perms[f.aliases[bucket]] = p
+	}
+	f.keyModel[id] = k
+	return k
+}
+
+// key returns a copy of a key in the model, or nil.
+func (f *fakeGarage) key(id string) *fakeKey {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.keyModel[id]
+	if !ok {
+		return nil
+	}
+	c := *k
+	return &c
+}
+
+// keyIDsLocked lists the key model's ids, sorted.
+func (f *fakeGarage) keyIDsLocked() []string {
+	ids := make([]string, 0, len(f.keyModel))
+	for id := range f.keyModel {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// bucketKeysLocked is the "keys" of GetBucketInfo for a bucket id.
+func (f *fakeGarage) bucketKeysLocked(bucketID string) []BucketKey {
+	var out []BucketKey
+	for _, id := range f.keyIDsLocked() {
+		k := f.keyModel[id]
+		p, aliases := k.Perms[bucketID], k.LocalAliases[bucketID]
+		if p.Read || p.Write || p.Owner || len(aliases) > 0 {
+			out = append(out, BucketKey{AccessKeyID: k.ID, Name: k.Name, Permissions: p, BucketLocalAliases: append([]string{}, aliases...)})
+		}
+	}
+	return out
+}
+
+// keyInfoLocked is GetKeyInfo for a key in the model.
+func (f *fakeGarage) keyInfoLocked(k *fakeKey, showSecret bool) map[string]any {
+	ids := map[string]bool{}
+	for id := range k.Perms {
+		ids[id] = true
+	}
+	for id := range k.LocalAliases {
+		ids[id] = true
+	}
+	sorted := make([]string, 0, len(ids))
+	for id := range ids {
+		sorted = append(sorted, id)
+	}
+	sort.Strings(sorted)
+	buckets := []map[string]any{}
+	for _, id := range sorted {
+		global := []string{}
+		if b, ok := f.buckets[id]; ok {
+			global = b.GlobalAliases
+		}
+		buckets = append(buckets, map[string]any{"id": id, "globalAliases": global,
+			"localAliases": append([]string{}, k.LocalAliases[id]...), "permissions": k.Perms[id]})
+	}
+	out := map[string]any{"accessKeyId": k.ID, "name": k.Name, "expired": k.Expired, "expiration": k.Expiration,
+		"permissions": map[string]bool{"createBucket": k.CreateBucket}, "buckets": buckets}
+	if showSecret {
+		out["secretAccessKey"] = k.Secret
+	}
+	return out
 }
 
 func (f *fakeGarage) addBucket(name string, objects, size int64, public bool) string {
@@ -133,7 +243,9 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 				fail(http.StatusNotFound, "bucket tidak ada")
 				return
 			}
-			writeJSON(b)
+			out := *b
+			out.Keys = f.bucketKeysLocked(id)
+			writeJSON(out)
 
 		case "CreateBucket":
 			var body struct {
@@ -192,6 +304,10 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 
 		case "GetKeyInfo":
 			id := r.URL.Query().Get("id")
+			if k, ok := f.keyModel[id]; ok {
+				writeJSON(f.keyInfoLocked(k, r.URL.Query().Get("showSecretKey") == "true"))
+				return
+			}
 			secret, ok := f.keys[id]
 			if !ok {
 				fail(http.StatusNotFound, "key tidak ada")
@@ -208,18 +324,28 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 
 		case "CreateKey":
 			var body struct {
-				Name string `json:"name"`
+				Name         string   `json:"name"`
+				Allow        *KeyPerm `json:"allow"`
+				Expiration   *string  `json:"expiration"`
+				NeverExpires bool     `json:"neverExpires"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			secret := "SECRET-" + body.Name
-			writeJSON(map[string]any{
-				"accessKeyId":     "GK" + body.Name,
-				"name":            body.Name,
-				"secretAccessKey": secret,
-				"expired":         false,
-				"permissions":     map[string]bool{"createBucket": false},
-				"buckets":         []any{},
-			})
+			if (body.Expiration == nil) != body.NeverExpires {
+				t.Errorf("CreateKey wants either an expiration or neverExpires, got %+v", body)
+			}
+			id, secret := "GK"+body.Name, "SECRET-"+body.Name
+			if _, taken := f.keyModel[id]; taken {
+				f.nextID++
+				id = fmt.Sprintf("GK%s-%d", body.Name, f.nextID)
+				secret = "SECRET-" + id
+			}
+			k := &fakeKey{ID: id, Name: body.Name, Secret: secret, Expiration: body.Expiration,
+				Perms: map[string]BucketKeyPerm{}, LocalAliases: map[string][]string{}}
+			if body.Allow != nil {
+				k.CreateBucket = body.Allow.CreateBucket
+			}
+			f.keyModel[id] = k
+			writeJSON(f.keyInfoLocked(k, true))
 
 		case "AllowBucketKey":
 			var body struct {
@@ -228,14 +354,60 @@ func (f *fakeGarage) server(t *testing.T) *httptest.Server {
 				Permissions BucketKeyPerm `json:"permissions"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if !body.Permissions.Read || !body.Permissions.Write {
-				t.Errorf("AllowBucketKey should grant read+write, got %+v", body.Permissions)
+			if !f.anyPerms {
+				if !body.Permissions.Read || !body.Permissions.Write {
+					t.Errorf("AllowBucketKey should grant read+write, got %+v", body.Permissions)
+				}
+				if body.Permissions.Owner {
+					t.Error("AllowBucketKey should not grant owner")
+				}
 			}
-			if body.Permissions.Owner {
-				t.Error("AllowBucketKey should not grant owner")
+			if msg, bad := f.failAllow[body.BucketID]; bad {
+				fail(http.StatusInternalServerError, msg)
+				return
 			}
 			f.allowed = append(f.allowed, body.AccessKeyID)
+			if k, ok := f.keyModel[body.AccessKeyID]; ok {
+				// Garage only switches flags on; the others keep their value.
+				p := k.Perms[body.BucketID]
+				p.Read = p.Read || body.Permissions.Read
+				p.Write = p.Write || body.Permissions.Write
+				p.Owner = p.Owner || body.Permissions.Owner
+				k.Perms[body.BucketID] = p
+			}
 			writeJSON(map[string]bool{"ok": true})
+
+		case "DeleteKey":
+			id := r.URL.Query().Get("id")
+			if msg, bad := f.failDelete[id]; bad {
+				if f.deleteThenFail[id] {
+					delete(f.keyModel, id)
+				}
+				fail(http.StatusInternalServerError, msg)
+				return
+			}
+			if _, ok := f.keyModel[id]; !ok {
+				fail(http.StatusNotFound, "Access key not found: "+id)
+				return
+			}
+			delete(f.keyModel, id)
+			io.WriteString(w, "null")
+
+		case "GetCurrentAdminTokenInfo":
+			if f.noTokenInfo {
+				fail(http.StatusNotFound, "operasi tidak dikenal: "+op)
+				return
+			}
+			scope := []string{"*"}
+			if len(f.noScope) > 0 {
+				scope = nil
+				for _, o := range fakeAdminOps {
+					if !f.noScope[o] {
+						scope = append(scope, o)
+					}
+				}
+			}
+			writeJSON(map[string]any{"name": "garagepanel", "expired": false, "scope": scope})
 
 		default:
 			fail(http.StatusNotFound, "operasi tidak dikenal: "+op)

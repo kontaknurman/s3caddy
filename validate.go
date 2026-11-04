@@ -59,6 +59,9 @@ var (
 	// SSH login names, as useradd accepts them (uppercase too, which some
 	// distributions allow).
 	sshUserRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
+	// Access key ids. Garage generates GK + 24 hex digits, but `garage key
+	// import` takes other spellings too.
+	accessKeyIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 )
 
 // sftpSystemTop are top-level folders an SFTP job may never touch: system
@@ -611,6 +614,15 @@ func ValidateObjectBaseName(s string) (ext, contentType string, err error) {
 func ValidateJobID(s string) error {
 	if !jobIDRe.MatchString(s) {
 		return fmt.Errorf("id job %q tidak valid", s)
+	}
+	return nil
+}
+
+// ValidateAccessKeyID checks a key id taken from a form. Whether that key may
+// be touched at all is decided against Garage's own list, not here.
+func ValidateAccessKeyID(s string) error {
+	if !accessKeyIDRe.MatchString(s) {
+		return errors.New("access key id tidak valid")
 	}
 	return nil
 }

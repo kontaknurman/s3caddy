@@ -185,14 +185,19 @@ type BucketInfo struct {
 		IndexDocument string  `json:"indexDocument"`
 		ErrorDocument *string `json:"errorDocument"`
 	} `json:"websiteConfig"`
-	Objects int64 `json:"objects"`
-	Bytes   int64 `json:"bytes"`
-	Keys    []struct {
-		AccessKeyID string        `json:"accessKeyId"`
-		Name        string        `json:"name"`
-		Permissions BucketKeyPerm `json:"permissions"`
-	} `json:"keys"`
-	UnfinishedUploads int64 `json:"unfinishedUploads"`
+	Objects           int64       `json:"objects"`
+	Bytes             int64       `json:"bytes"`
+	Keys              []BucketKey `json:"keys"`
+	UnfinishedUploads int64       `json:"unfinishedUploads"`
+}
+
+// BucketKey is one access key in GetBucketInfo: a key with some permission on
+// the bucket, or with a local alias for it.
+type BucketKey struct {
+	AccessKeyID        string        `json:"accessKeyId"`
+	Name               string        `json:"name"`
+	Permissions        BucketKeyPerm `json:"permissions"`
+	BucketLocalAliases []string      `json:"bucketLocalAliases"`
 }
 
 // Name returns the first global alias, or an empty string.
@@ -207,10 +212,34 @@ func (b *BucketInfo) Name() string {
 // SecretAccessKey is only populated when the key is created (or when
 // showSecretKey=true is requested).
 type KeyInfo struct {
-	AccessKeyID     string  `json:"accessKeyId"`
-	Name            string  `json:"name"`
-	SecretAccessKey *string `json:"secretAccessKey"`
-	Expired         bool    `json:"expired"`
+	AccessKeyID     string      `json:"accessKeyId"`
+	Name            string      `json:"name"`
+	SecretAccessKey *string     `json:"secretAccessKey"`
+	Expired         bool        `json:"expired"`
+	Expiration      *string     `json:"expiration"` // RFC 3339; nil: never expires
+	Permissions     KeyPerm     `json:"permissions"`
+	Buckets         []KeyBucket `json:"buckets"`
+}
+
+// KeyPerm mirrors KeyPerm: what a key may do outside any one bucket.
+type KeyPerm struct {
+	CreateBucket bool `json:"createBucket"`
+}
+
+// KeyBucket is one bucket in GetKeyInfo, with what the key may do there.
+type KeyBucket struct {
+	ID            string        `json:"id"`
+	GlobalAliases []string      `json:"globalAliases"`
+	LocalAliases  []string      `json:"localAliases"`
+	Permissions   BucketKeyPerm `json:"permissions"`
+}
+
+// Label names the bucket for people: its first global alias, else its id.
+func (b KeyBucket) Label() string {
+	if len(b.GlobalAliases) > 0 {
+		return b.GlobalAliases[0]
+	}
+	return b.ID
 }
 
 // Secret returns the secret access key, or "" when Garage did not send one.
@@ -306,6 +335,68 @@ func (g *Garage) CreateKey(ctx context.Context, name string) (*KeyInfo, error) {
 	body := map[string]any{"name": name, "neverExpires": true}
 	var out KeyInfo
 	if err := g.do(ctx, http.MethodPost, "CreateKey", nil, body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateKeyLike creates a key with the given name, key-level permissions and
+// expiration (nil or "": never expires). Key reset uses it to recreate a key
+// as it was.
+func (g *Garage) CreateKeyLike(ctx context.Context, name string, perm KeyPerm, expiration *string) (*KeyInfo, error) {
+	body := map[string]any{"name": name}
+	if perm.CreateBucket {
+		body["allow"] = perm
+	}
+	if expiration != nil && *expiration != "" {
+		body["expiration"] = *expiration
+	} else {
+		body["neverExpires"] = true
+	}
+	var out KeyInfo
+	if err := g.do(ctx, http.MethodPost, "CreateKey", nil, body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteKey removes an access key. Garage drops its permissions on every
+// bucket with it; the buckets stay.
+func (g *Garage) DeleteKey(ctx context.Context, accessKeyID string) error {
+	q := url.Values{"id": {accessKeyID}}
+	return g.do(ctx, http.MethodPost, "DeleteKey", q, nil, nil)
+}
+
+// AdminTokenInfo is the answer of GetCurrentAdminTokenInfo.
+type AdminTokenInfo struct {
+	Name    string   `json:"name"`
+	Expired bool     `json:"expired"`
+	Scope   []string `json:"scope"` // operation names, or "*" for all
+}
+
+// Missing returns the operations in ops that the token may not call.
+func (t *AdminTokenInfo) Missing(ops ...string) []string {
+	have := make(map[string]bool, len(t.Scope))
+	for _, s := range t.Scope {
+		if s == "*" {
+			return nil
+		}
+		have[s] = true
+	}
+	var out []string
+	for _, op := range ops {
+		if !have[op] {
+			out = append(out, op)
+		}
+	}
+	return out
+}
+
+// CurrentAdminToken asks Garage what the panel's own token may do. Garage
+// answers this for any valid token, whatever its scope.
+func (g *Garage) CurrentAdminToken(ctx context.Context) (*AdminTokenInfo, error) {
+	var out AdminTokenInfo
+	if err := g.do(ctx, http.MethodGet, "GetCurrentAdminTokenInfo", nil, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
