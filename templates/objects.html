@@ -39,7 +39,7 @@
 {{else if .Error}}
 {{else}}
 
-<div class="card" id="uploader" data-bucket="{{.Bucket}}" data-prefix="{{.Prefix}}" data-csrf="{{.CSRF}}">
+<div class="card" id="uploader" data-bucket="{{.Bucket}}" data-prefix="{{.Prefix}}" data-csrf="{{.CSRF}}" data-max="{{.MaxUpload}}" data-max-h="{{.MaxUploadH}}">
   <h3>Upload ke <span class="mono">{{.Bucket}}/{{.Prefix}}</span></h3>
   <div class="dropzone" id="dropzone">
     <p style="margin-bottom: 8px;"><strong>Tarik file ke sini</strong> atau
@@ -241,6 +241,8 @@
   var bucket = root.getAttribute('data-bucket');
   var prefix = root.getAttribute('data-prefix') || '';
   var csrf = root.getAttribute('data-csrf');
+  var maxSize = Number(root.getAttribute('data-max')) || 0;
+  var maxSizeH = root.getAttribute('data-max-h');
   var zone = document.getElementById('dropzone');
   var picker = document.getElementById('filepick');
   var list = document.getElementById('uplist');
@@ -316,12 +318,37 @@
     send(item, function () { busy = false; pump(); });
   }
 
+  // Before sending a file, ask the panel whether it would take it: a name
+  // that is taken or a size over the limit is better known before the
+  // upload than after gigabytes of it. The upload itself checks again.
   function send(item, done) {
+    if (maxSize && item.file.size > maxSize) {
+      fail(item, 'file lebih besar dari batas ' + maxSizeH);
+      done();
+      return;
+    }
+    var mode = naming();
+    var overwrite = overwriteBox.checked && mode === 'name';
+    var q = new URLSearchParams({ bucket: bucket, prefix: prefix, mode: mode, name: item.file.name, size: String(item.file.size) });
+    if (overwrite) { q.set('overwrite', '1'); }
+    item.status.textContent = 'memeriksa…';
+    fetch('/upload/check?' + q.toString(), { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' })
+      .then(function (resp) { return resp.json(); })
+      .then(function (res) {
+        if (!res.ok) { fail(item, res.error || 'ditolak'); done(); return; }
+        upload(item, mode, overwrite, done);
+      }, function () {
+        fail(item, 'panel tidak bisa ditanya sebelum upload');
+        done();
+      });
+  }
+
+  function upload(item, mode, overwrite, done) {
     var data = new FormData();
     data.append('bucket', bucket);
     data.append('prefix', prefix);
-    data.append('mode', naming());
-    if (overwriteBox.checked) { data.append('overwrite', '1'); }
+    data.append('mode', mode);
+    if (overwrite) { data.append('overwrite', '1'); }
     data.append('file', item.file);
 
     var xhr = new XMLHttpRequest();
@@ -331,7 +358,9 @@
       if (e.lengthComputable) {
         var pct = Math.round((e.loaded / e.total) * 100);
         item.fill.style.width = pct + '%';
-        item.status.textContent = 'mengunggah ' + pct + '%';
+        item.status.textContent = e.loaded >= e.total
+          ? 'menyimpan ke bucket…'
+          : 'mengunggah ' + pct + '% (' + formatSize(e.loaded) + ' dari ' + formatSize(e.total) + ')';
       }
     });
     xhr.addEventListener('load', function () {
@@ -388,6 +417,13 @@
       box.appendChild(note);
     }
     item.row.appendChild(box);
+    if (res.warning) {
+      var warn = document.createElement('div');
+      warn.className = 'small';
+      warn.style.color = 'var(--warn)';
+      warn.textContent = res.warning;
+      item.row.appendChild(warn);
+    }
   }
 
   // Bulk selection.

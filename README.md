@@ -49,6 +49,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
   - [Biaya request dan batasan](#biaya-request-dan-batasan)
   - [Sync dengan VPS lewat SSH (SFTP)](#sync-dengan-vps-lewat-ssh-sftp)
 - [File manager di halaman Objek](#file-manager-di-halaman-objek)
+  - [Upload file besar](#upload-file-besar)
 - [Key per bucket dan reset key](#key-per-bucket-dan-reset-key)
 - [Halaman Status](#halaman-status)
 - [Update ke versi baru](#update-ke-versi-baru)
@@ -70,7 +71,7 @@ github.com/kontaknurman/s3caddy       # tidak ada baris lain
 |---|---|
 | **Buckets** | Daftar bucket + ukuran, jumlah objek, status website, jumlah domain. Tambah bucket (4 langkah otomatis), toggle public/private, hapus dengan konfirmasi. Tombol **Key** per bucket: daftar access key yang punya izin di bucket itu, dan **reset key** (key baru dengan izin yang sama, key lama langsung tidak berlaku) |
 | **Domains** | Daftar domain → bucket, tambah/hapus domain, tulis file Caddy + reload otomatis dengan rollback. Setelah menambah, panel menunggu sertifikat HTTPS dan melaporkan DNS, sertifikat Caddy, dan mode SSL Cloudflare; tombol **Periksa HTTPS** mengulang pemeriksaan dan meminta ulang sertifikat yang belum ada |
-| **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
+| **Objek** | File manager per bucket: breadcrumb, tampilan grid/daftar, urut nama/ukuran/tanggal, folder baru, upload drag-and-drop (nama dari isi file atau nama asli; bawaan maksimal 50 MB per file, bisa dinaikkan sampai 100 GB lewat `UPLOAD_MAX_SIZE`), ganti nama, pindah/salin antar bucket, pilih banyak → hapus, unduh, copy URL publik, operasi folder (salin/pindah/hapus) sebagai job latar |
 | **Sync** | Impor/ekspor bucket dari/ke Wasabi, Amazon S3, Backblaze B2, Hetzner, Cloudflare R2, DigitalOcean, Scaleway, Ceph, MinIO, atau Garage lain — dan dari/ke folder di VPS lewat SSH (SFTP), login dengan password (mis. root) atau kunci SSH, host key server disematkan. Mode "hanya yang belum ada", tahan ratusan juta objek, jalan berhari-hari di server, lanjut otomatis setelah restart, bisa dijadwalkan berulang (setiap N menit/jam/hari). Tes koneksi menguji baca **dan** tulis. Transfer dikerjakan rclone |
 | **IP Whitelist** | Batasi operasi tulis ke S3 API per IP/CIDR; read (GET/HEAD) selalu terbuka |
 | **Status** | Kondisi server: CPU per core, load, memori/swap, disk dan inode, I/O disk, jaringan, suhu, proses garage/caddy/rclone; kesehatan cluster Garage dan pemakaian disk tiap node. Diperbarui tiap 5 detik |
@@ -1577,7 +1578,8 @@ Halaman Objek adalah file manager per bucket:
   anti-duplikat, seperti sebelumnya) atau **nama asli file** (hanya nama
   dasarnya; direktori dari client dibuang). Di mode nama asli, file yang sudah
   ada tidak ditimpa kecuali kotak "timpa yang sudah ada" dicentang. Whitelist
-  ekstensi dan batas 50 MB berlaku di kedua mode.
+  ekstensi dan batas ukuran berlaku di kedua mode. Batas bawaannya 50 MB per
+  file dan bisa dinaikkan, lihat [Upload file besar](#upload-file-besar).
 - **Ganti nama / pindah / salin** satu objek lewat menu `⋯`. S3 tidak punya
   operasi rename, jadi ini `CopyObject` (server-side, metadata ikut) lalu
   `DeleteObject`; kalau langkah hapusnya gagal, pesannya mengatakan objek sudah
@@ -1592,6 +1594,63 @@ Halaman Objek adalah file manager per bucket:
   berisi jutaan objek. Hapus folder minta nama foldernya diketik ulang. Salin
   dan pindah memakai `CopyObject` server-side di dalam Garage (rclone dengan
   remote yang sama di kedua sisi), jadi datanya tidak keluar-masuk server.
+
+### Upload file besar
+
+Batas bawaan upload adalah 50 MB per file. Untuk menaikkannya, misalnya ke
+5 GB, tambahkan baris ini ke `/etc/garagepanel/garagepanel.env`, lalu restart
+panel:
+
+```
+UPLOAD_MAX_SIZE=5G
+```
+
+```bash
+sudo systemctl restart garagepanel
+```
+
+Satuannya biner (`K`, `M`, `G`, `T`), dan nilainya harus antara `1M` dan
+`100G`. Nilai yang tidak bisa dibaca membuat panel menolak start dengan pesan
+yang menyebut `UPLOAD_MAX_SIZE`. Batas yang berlaku tertulis di kotak upload.
+
+Cara kerjanya:
+
+- **File sampai 50 MB** disimpan dengan satu `PutObject`, sama seperti
+  sebelumnya.
+- **File di atas 50 MB** dikirim ke Garage sebagai multipart upload, per bagian
+  50 MB, sambil body request dibaca. Panel menahan satu bagian di memori,
+  berapa pun ukuran filenya, dan tidak menulis apa pun ke disk. Objeknya baru
+  muncul di bucket setelah bagian terakhir masuk.
+- **Nama dari isi file** butuh sha256 seluruh file, yang baru diketahui di
+  akhir. Jadi file besar diunggah dulu sebagai `.garagepanel-upload-<acak>` di
+  root bucket, lalu disalin ke namanya di dalam Garage dan yang sementara
+  dihapus. Garage menyalin lewat referensi tanpa menulis ulang datanya, jadi
+  langkah ini sekejap, juga untuk 5 GB. Kalau isinya ternyata sudah ada,
+  salinan sementara itu langsung dihapus.
+- **Bagian yang gagal terkirim ke Garage**, karena tidak dijawab dalam 2 menit,
+  koneksi putus, atau error 5xx, dikirim lagi sampai tiga kali. Bagian itu
+  masih ada di memori, jadi satu gangguan sesaat tidak membuang gigabyte yang
+  sudah terkirim.
+- **Upload yang terputus**, karena tab ditutup, tunnel putus, atau file melewati
+  batas, dibatalkan di Garage, jadi tidak ada bagian setengah jadi yang
+  tertinggal. Upload tidak punya batas waktu total, tapi yang tidak mengirim
+  data sama sekali selama 2 menit diputus.
+- **Sebelum file dikirim**, browser menanyakan ke panel apakah file itu akan
+  diterima: ukurannya, ekstensinya, dan di mode nama asli apakah namanya sudah
+  dipakai. Penolakan muncul seketika, bukan setelah gigabyte terkirim.
+- Selama upload, baris file menampilkan berapa yang sudah terkirim. Setelah
+  100%, statusnya **menyimpan ke bucket…** sampai Garage selesai menyatukan
+  bagian-bagiannya.
+
+Kecepatannya ditentukan koneksi antara browser dan server panel. Lewat SSH
+tunnel tidak ada batas ukuran tambahan. Lewat `PANEL_DOMAIN` yang di-proxy
+Cloudflare (awan oranye), Cloudflare menolak request di atas 100 MB pada paket
+Free dan Pro dengan HTTP 413, berapa pun `UPLOAD_MAX_SIZE`-nya. Untuk upload
+besar, pakai SSH tunnel, atau jadikan record DNS domain panel **DNS only**.
+Caddy sendiri tidak membatasi ukuran request.
+
+Objek `.garagepanel-upload-*` hanya tertinggal kalau panel mati tepat di antara
+selesainya upload dan penyalinan ke namanya. Objek itu aman dihapus.
 
 ## Key per bucket dan reset key
 
@@ -1909,6 +1968,7 @@ Semua lewat environment variable.
 | `STATE_DIR` | `$STATE_DIRECTORY` dari systemd, kalau tidak ada `/var/lib/garagepanel` | Remote dan checkpoint job Sync. Tidak bisa ditulis → halaman Sync nonaktif, sisanya jalan |
 | `RCLONE_BIN` | `rclone` (dicari di PATH) | Path rclone. Butuh v1.59+, dan v1.63+ untuk remote VPS (SFTP) |
 | `RCLONE_EXTRA_ARGS` | — | Argumen tambahan untuk setiap rclone, dipecah per spasi, **tidak** lewat shell. Contoh: `--bwlimit 20M`, `--s3-sign-accept-encoding=false` |
+| `UPLOAD_MAX_SIZE` | `50M` | Batas ukuran satu file di upload halaman Objek, misalnya `5G`. Satuan biner (`K`, `M`, `G`, `T`), antara `1M` dan `100G`. Lihat [Upload file besar](#upload-file-besar) |
 
 ## Keamanan
 
@@ -1967,9 +2027,14 @@ lain — termasuk `.html` dan `.svg` yang bisa mengeksekusi script — dipaksa
 jadi `application/octet-stream` + `Content-Disposition: attachment`, ditambah
 `X-Content-Type-Options: nosniff` dan CSP `default-src 'none'; sandbox`.
 
-**Upload.** Maksimal 50 MB per file, whitelist ekstensi, dan nama objek
-sepenuhnya dibuat dari isi file (`sha256(isi)[:16] + ekstensi`) — nama asli dari
-client dibuang, jadi tidak ada jalur dari nama file user ke nama objek.
+**Upload.** Maksimal 50 MB per file kecuali dinaikkan lewat `UPLOAD_MAX_SIZE`
+(paling besar 100 GB), dan whitelist ekstensi. Body request dibaca sebagai
+aliran dan dibatasi: request yang mengaku lebih besar dari batas ditolak
+sebelum body-nya dibaca, file besar tidak pernah ditahan utuh di memori atau
+ditulis ke disk, dan file yang terpotong di tengah tidak pernah disimpan
+seolah utuh. Di mode nama dari isi file, nama objek sepenuhnya dibuat dari isi
+file (`sha256(isi)[:16] + ekstensi`) — nama asli dari client dibuang, jadi
+tidak ada jalur dari nama file user ke nama objek.
 
 **Sync.** Secret remote hanya ada di `remotes.json` (0600) dan di environment
 proses rclone — tidak di argumen (`ps` tidak menampilkannya), tidak di file
@@ -2050,6 +2115,17 @@ ada reset password mandiri. Satu username, satu password, satu operator.
 **`GARAGE_ADMIN_TOKEN belum diisi`** — panel sengaja tidak mau start. Cek
 `/etc/garagepanel/garagepanel.env` terbaca oleh systemd:
 `systemctl show garagepanel -p Environment`.
+
+**Upload gagal: `file lebih besar dari batas 50.0 MiB`** (versi lama menulis
+`upload ditolak (maksimal 50.0 MiB per file): http: request body too large`)
+— naikkan batasnya dengan `UPLOAD_MAX_SIZE`, misalnya `UPLOAD_MAX_SIZE=5G`,
+lalu restart panel. Lihat [Upload file besar](#upload-file-besar).
+
+**Upload besar gagal dengan HTTP 413 padahal di bawah `UPLOAD_MAX_SIZE`** —
+kalau panel dibuka lewat `PANEL_DOMAIN` yang di-proxy Cloudflare, Cloudflare
+menolak request di atas 100 MB (paket Free dan Pro) sebelum sampai ke server.
+Pakai SSH tunnel untuk upload besar, atau jadikan record DNS domain panel
+**DNS only**.
 
 **`token admin ditolak — periksa GARAGE_ADMIN_TOKEN`** — token tidak cocok
 dengan `admin_token` di `/etc/garage.toml`. Garage perlu di-restart kalau

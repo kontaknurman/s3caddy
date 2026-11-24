@@ -99,7 +99,7 @@ func NewS3With(endpoint, accessKey, secretKey, region string, o S3Options) (*S3,
 		label = u.Host
 	}
 	client := &http.Client{
-		Timeout: 5 * time.Minute, // uploads of up to 50 MB
+		Timeout: 5 * time.Minute, // one request carries at most 50 MB: a small upload or one part
 	}
 	if o.dialAddr != "" {
 		dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -678,6 +678,95 @@ func (c *S3) PutObject(ctx context.Context, bucket, key string, body []byte, con
 		return err
 	}
 	resp, err := c.do(req, "PutObject")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	return nil
+}
+
+// --- multipart upload -----------------------------------------------------
+
+// CompletedPart is one uploaded part, as CompleteMultipartUpload lists it.
+type CompletedPart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+// CreateMultipartUpload starts a multipart upload of bucket/key and returns
+// its id. Nothing shows up under key until the upload is completed.
+func (c *S3) CreateMultipartUpload(ctx context.Context, bucket, key, contentType string) (string, error) {
+	if err := ValidateObjectKey(key); err != nil {
+		return "", err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, bucket, key, [][2]string{{"uploads", ""}}, nil, contentType)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req, "CreateMultipartUpload")
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		UploadID string `xml:"UploadId"`
+	}
+	if err := c.decodeXMLResult(resp, "CreateMultipartUpload", &out); err != nil {
+		return "", err
+	}
+	if out.UploadID == "" {
+		return "", errors.New("CreateMultipartUpload: jawaban tanpa UploadId")
+	}
+	return out.UploadID, nil
+}
+
+// UploadPart sends one part and returns the ETag the server gave it.
+func (c *S3) UploadPart(ctx context.Context, bucket, key, uploadID string, partNumber int, body []byte) (string, error) {
+	params := [][2]string{{"partNumber", strconv.Itoa(partNumber)}, {"uploadId", uploadID}}
+	req, err := c.newRequest(ctx, http.MethodPut, bucket, key, params, body, "")
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.do(req, "UploadPart")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	etag := resp.Header.Get("ETag")
+	if etag == "" {
+		return "", fmt.Errorf("UploadPart %d: jawaban tanpa ETag", partNumber)
+	}
+	return etag, nil
+}
+
+// CompleteMultipartUpload joins the parts into the object.
+func (c *S3) CompleteMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []CompletedPart) error {
+	body, err := xml.Marshal(struct {
+		XMLName xml.Name        `xml:"CompleteMultipartUpload"`
+		Parts   []CompletedPart `xml:"Part"`
+	}{Parts: parts})
+	if err != nil {
+		return err
+	}
+	req, err := c.newRequest(ctx, http.MethodPost, bucket, key, [][2]string{{"uploadId", uploadID}}, body, "application/xml")
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req, "CompleteMultipartUpload")
+	if err != nil {
+		return err
+	}
+	return c.decodeXMLResult(resp, "CompleteMultipartUpload", nil)
+}
+
+// AbortMultipartUpload drops an unfinished upload and the parts sent so far.
+func (c *S3) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
+	req, err := c.newRequest(ctx, http.MethodDelete, bucket, key, [][2]string{{"uploadId", uploadID}}, nil, "")
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req, "AbortMultipartUpload")
 	if err != nil {
 		return err
 	}

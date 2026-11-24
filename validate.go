@@ -17,8 +17,14 @@ import (
 // this file first. Nothing here trusts the caller.
 
 const (
-	// MaxUploadSize is the hard per-file limit for uploads (50 MB).
+	// MaxUploadSize is the default per-file limit for uploads (50 MB).
+	// UPLOAD_MAX_SIZE changes it, between MinUploadLimit and MaxUploadLimit.
 	MaxUploadSize = 50 << 20
+	// MinUploadLimit and MaxUploadLimit bound UPLOAD_MAX_SIZE. Below 1 MiB is
+	// almost certainly a missing unit ("5000" meant as MB); 100 GiB stays well
+	// inside the 10,000 parts S3 allows a multipart upload.
+	MinUploadLimit = 1 << 20
+	MaxUploadLimit = 100 << 30
 	// MaxLabelLen bounds whitelist labels.
 	MaxLabelLen = 40
 	// MaxObjectKeyLen is the S3 limit for object keys.
@@ -62,7 +68,31 @@ var (
 	// Access key ids. Garage generates GK + 24 hex digits, but `garage key
 	// import` takes other spellings too.
 	accessKeyIDRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
+	// Byte sizes: a number with an optional binary unit, "5G", "500MiB", "512k".
+	byteSizeRe = regexp.MustCompile(`(?i)^([0-9]{1,15})\s*([kmgt]?)(i?b)?$`)
 )
+
+// ParseByteSize reads a size such as "5G", "500M", "512KiB" or "1048576".
+// Units are binary (K = 1024) and their case does not matter; a bare number
+// is bytes.
+func ParseByteSize(s string) (int64, error) {
+	m := byteSizeRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, fmt.Errorf("ukuran %q tidak bisa dibaca; tulis angka dengan satuan, misalnya 5G atau 500M", s)
+	}
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ukuran %q tidak bisa dibaca: %w", s, err)
+	}
+	if m[2] == "" && strings.EqualFold(m[3], "ib") {
+		return 0, fmt.Errorf("ukuran %q tidak bisa dibaca; tulis angka dengan satuan, misalnya 5G atau 500M", s)
+	}
+	shift := map[string]uint{"": 0, "k": 10, "m": 20, "g": 30, "t": 40}[strings.ToLower(m[2])]
+	if n > (1<<62)>>shift {
+		return 0, fmt.Errorf("ukuran %q terlalu besar", s)
+	}
+	return n << shift, nil
+}
 
 // sftpSystemTop are top-level folders an SFTP job may never touch: system
 // files, kernel pseudo-filesystems, and the boot loader.

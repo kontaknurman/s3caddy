@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -66,6 +65,10 @@ type Config struct {
 	StateDir        string
 	RcloneBin       string
 	RcloneExtraArgs []string
+
+	// UploadMax adalah batas ukuran satu file di upload halaman Objek
+	// (UPLOAD_MAX_SIZE, bawaan 50 MiB). Nol berarti bawaan.
+	UploadMax int64
 
 	webURL *url.URL
 	s3URL  *url.URL
@@ -149,6 +152,19 @@ func loadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	cfg.UploadMax = MaxUploadSize
+	if raw := strings.TrimSpace(os.Getenv("UPLOAD_MAX_SIZE")); raw != "" {
+		n, err := ParseByteSize(raw)
+		if err != nil {
+			return nil, fmt.Errorf("UPLOAD_MAX_SIZE: %w", err)
+		}
+		if n < MinUploadLimit || n > MaxUploadLimit {
+			return nil, fmt.Errorf("UPLOAD_MAX_SIZE harus antara %s dan %s (dapat %s); tulis dengan satuan, misalnya 5G",
+				humanBytes(MinUploadLimit), humanBytes(MaxUploadLimit), humanBytes(n))
+		}
+		cfg.UploadMax = n
+	}
+
 	if cfg.PasswordHash != "" {
 		if _, err := ParsePasswordHash(cfg.PasswordHash); err != nil {
 			return nil, fmt.Errorf("PANEL_PASSWORD_HASH tidak bisa dibaca: %w", err)
@@ -181,6 +197,14 @@ func loadConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// uploadMax adalah batas ukuran satu file upload yang berlaku.
+func (c *Config) uploadMax() int64 {
+	if c.UploadMax > 0 {
+		return c.UploadMax
+	}
+	return MaxUploadSize
 }
 
 // authEnabled melaporkan apakah halaman login dipasang. Tanpa
@@ -678,6 +702,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /objects/copy", a.handleObjectTransfer(false))
 	mux.HandleFunc("POST /objects/folder-job", a.handleFolderJob)
 	mux.HandleFunc("POST /upload", a.handleUpload)
+	mux.HandleFunc("GET /upload/check", a.handleUploadCheck)
 	mux.HandleFunc("GET /preview", a.handlePreview)
 
 	mux.HandleFunc("GET /login", a.handleLoginPage)
@@ -750,6 +775,10 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the connection underneath, which
+// uploads need for their own read and write deadlines.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (a *App) logMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -811,7 +840,7 @@ func (a *App) authMW(next http.Handler) http.Handler {
 
 		// Endpoint upload dipanggil dari JavaScript: halaman login HTML tidak
 		// ada gunanya di sana, jadi jawab dengan JSON yang bisa ditampilkan.
-		if r.URL.Path == "/upload" || strings.Contains(r.Header.Get("Accept"), "application/json") {
+		if r.URL.Path == "/upload" || r.URL.Path == "/upload/check" || strings.Contains(r.Header.Get("Accept"), "application/json") {
 			writeJSON(w, http.StatusUnauthorized, uploadResult{Error: "session habis — muat ulang halaman lalu login lagi"})
 			return
 		}
@@ -1761,7 +1790,8 @@ func (a *App) handleObjects(w http.ResponseWriter, r *http.Request) {
 		"Buckets":    bucketNamesFrom(buckets),
 		"Bucket":     bucket,
 		"Prefix":     prefix,
-		"MaxUploadH": humanBytes(MaxUploadSize),
+		"MaxUploadH": humanBytes(a.cfg.uploadMax()),
+		"MaxUpload":  a.cfg.uploadMax(),
 		"AllowedExt": strings.Join(AllowedExtensionList(), " "),
 		"Sort":       sortBy,
 		"Dir":        dir,
@@ -2075,6 +2105,9 @@ type uploadResult struct {
 	PublicURL   string `json:"publicUrl,omitempty"`
 	Preview     string `json:"preview,omitempty"`
 	Error       string `json:"error,omitempty"`
+	// Warning is set when the file was stored but something around it was not
+	// (a temporary object that could not be removed).
+	Warning string `json:"warning,omitempty"`
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -2082,137 +2115,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
-}
-
-func (a *App) handleUpload(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	if a.s3 == nil {
-		writeJSON(w, http.StatusServiceUnavailable, uploadResult{Error: "kredensial S3 panel belum diatur"})
-		return
-	}
-
-	// Hard cap on the whole request so a huge body can never be buffered.
-	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize+(1<<20))
-	// maxMemory sengaja kecil. Isi file tetap dibaca seluruhnya nanti untuk
-	// menghitung sha256, jadi kalau multipart juga menahannya di memori,
-	// puncak pemakaian jadi dua kali ukuran file. Dengan batas kecil ini file
-	// besar tumpah ke temp file (PrivateTmp di unit systemd) dan hanya
-	// tersalin sekali.
-	const multipartMemory = 4 << 20
-	if err := r.ParseMultipartForm(multipartMemory); err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{
-			Error: fmt.Sprintf("upload ditolak (maksimal %s per file): %v", humanBytes(MaxUploadSize), err),
-		})
-		return
-	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
-
-	bucket := strings.TrimSpace(r.FormValue("bucket"))
-	if err := ValidateBucketName(bucket); err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
-		return
-	}
-	// Files land in the folder being browsed. An empty prefix is the root.
-	prefix := r.FormValue("prefix")
-	if err := ValidateJobPrefix(prefix); err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
-		return
-	}
-	mode := r.FormValue("mode")
-	if mode == "" {
-		mode = "hash"
-	}
-	if mode != "hash" && mode != "name" {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: "mode penamaan harus hash atau name"})
-		return
-	}
-	overwrite := r.FormValue("overwrite") == "1"
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: "tidak ada file pada request: " + err.Error()})
-		return
-	}
-	defer file.Close()
-
-	// Only the base name is ever looked at; directories in the client's
-	// path are dropped before any validation.
-	baseName := path.Base(strings.ReplaceAll(header.Filename, `\`, `/`))
-	var ext, contentType string
-	if mode == "name" {
-		ext, contentType, err = ValidateObjectBaseName(baseName)
-	} else {
-		ext, contentType, err = ValidateUploadName(baseName)
-	}
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
-		return
-	}
-
-	content, err := io.ReadAll(io.LimitReader(file, MaxUploadSize+1))
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: "gagal membaca file: " + err.Error()})
-		return
-	}
-	if int64(len(content)) > MaxUploadSize {
-		writeJSON(w, http.StatusRequestEntityTooLarge, uploadResult{
-			Error: fmt.Sprintf("file lebih besar dari batas %s", humanBytes(MaxUploadSize)),
-		})
-		return
-	}
-	if len(content) == 0 {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: "file kosong"})
-		return
-	}
-
-	var key string
-	if mode == "name" {
-		key = prefix + baseName
-	} else {
-		// Content addressing: the name is derived from the bytes, so
-		// uploading the same file twice cannot create a duplicate.
-		sum := sha256.Sum256(content)
-		key = prefix + hex.EncodeToString(sum[:])[:16] + ext
-	}
-	if err := ValidateObjectKey(key); err != nil {
-		writeJSON(w, http.StatusBadRequest, uploadResult{Error: err.Error()})
-		return
-	}
-
-	res := uploadResult{Key: key, Size: int64(len(content))}
-
-	exists, _, err := a.s3.StatObject(ctx, bucket, key)
-	if err != nil {
-		writeJSON(w, http.StatusBadGateway, uploadResult{Key: key, Error: err.Error()})
-		return
-	}
-	switch {
-	case exists && mode == "hash":
-		// Same bytes, same name: nothing to store.
-		res.Deduped = true
-	case exists && !overwrite:
-		writeJSON(w, http.StatusConflict, uploadResult{Key: key, Error: fmt.Sprintf("%s sudah ada di folder ini — centang \"timpa yang sudah ada\" kalau memang mau menggantinya", baseName)})
-		return
-	default:
-		if err := a.s3.PutObject(ctx, bucket, key, content, contentType); err != nil {
-			writeJSON(w, http.StatusBadGateway, uploadResult{Key: key, Error: err.Error()})
-			return
-		}
-		res.Overwritten = exists
-	}
-
-	sites, _ := a.caddy.ListSites()
-	if domain := FirstDomainForBucket(sites, bucket); domain != "" {
-		res.PublicURL = publicURL(domain, key)
-	}
-	res.Preview = "/preview?bucket=" + url.QueryEscape(bucket) + "&key=" + url.QueryEscape(key)
-	res.OK = true
-	writeJSON(w, http.StatusOK, res)
 }
 
 // handlePreview streams an object through the panel itself.
