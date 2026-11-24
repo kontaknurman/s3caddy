@@ -163,6 +163,7 @@ func TestValidateUploadName(t *testing.T) {
 		{"a.b.png", ".png", "image/png"},
 		{`C:\Users\me\doc.pdf`, ".pdf", "application/pdf"},
 		{"evil.php.jpg", ".jpg", "image/jpeg"},
+		{"Episode 01 [1080p].MKV", ".mkv", "video/x-matroska"},
 	}
 	for _, tc := range cases {
 		ext, ct, err := ValidateUploadName(tc.in)

@@ -288,6 +288,7 @@ var allowedExtensions = map[string]string{
 	".mp4":  "video/mp4",
 	".webm": "video/webm",
 	".mov":  "video/quicktime",
+	".mkv":  "video/x-matroska",
 	".mp3":  "audio/mpeg",
 	".ogg":  "audio/ogg",
 	".wav":  "audio/wav",
